@@ -15,6 +15,12 @@ Architecture:
                                                       +-> LLM layers -> RMSNorm -> pool -> normalize
   Text:  tokens -> tok_embeddings --------------------+
 
+Pooling strategy (critical for quality):
+  - Video: mean-pool over image token positions only (excludes chat template
+    overhead), capturing the visual content as encoded by the LLM.
+  - Text: raw text encoding (no chat template), mean-pool over content tokens
+    (excluding BOS), so the embedding reflects the actual text semantics.
+
 Both paths produce L2-normalized embeddings of the same dimension (e.g., 3072
 for PLM-3B), enabling direct cosine similarity computation.
 
@@ -35,12 +41,6 @@ Usage:
     python extract_plm_features.py \
         --video path/to/video.mp4 \
         --text_file queries.txt
-
-    # Use mean pooling instead of last-token pooling
-    python extract_plm_features.py \
-        --video clip.mp4 \
-        --texts "a cat sleeping" \
-        --pool mean
 
 API Usage:
     from extract_plm_features import (
@@ -63,7 +63,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -143,36 +143,6 @@ def extract_hidden_states(
     return h
 
 
-def _build_text_prompt(tokenizer: PLMTokenizer, text: str) -> List[int]:
-    """Build a chat-formatted prompt for text-only encoding.
-
-    Uses the same conversation template as video encoding to ensure both
-    modalities produce hidden-state representations in a comparable format.
-
-    The resulting prompt follows the PLM chat structure:
-        <bos><system_header>system_msg<eot><user_header>{text}<eot><assistant_header>
-
-    Args:
-        tokenizer: The PLM tokenizer.
-        text: Input text string.
-
-    Returns:
-        List of token IDs.
-    """
-    conv = tokenizer.conversation_template.copy()
-    sys_text = (
-        conv.bos_token + conv.pre_system + conv.system + conv.sep_system
-    )
-    prompt = (
-        sys_text
-        + conv.pre_question
-        + text
-        + conv.sep_question
-        + conv.pre_answer
-    )
-    return tokenizer.encode(prompt, add_bos=False, add_eos=False)
-
-
 @torch.inference_mode()
 def encode_video(
     model: LMTransformer,
@@ -180,12 +150,16 @@ def encode_video(
     video_path: str,
     num_frames: int = 16,
     prompt: str = "",
-    pool: str = "last",
+    pool: str = "mean",
 ) -> torch.Tensor:
     """Extract a normalized video embedding from PLM.
 
     Processes video frames through the full PLM pipeline:
     VisionTransformer -> MLPProjector -> LLM layers -> embedding.
+
+    The default pooling ("mean") averages hidden states at image token
+    positions only, producing an embedding that captures the visual content
+    without noise from the surrounding chat template tokens.
 
     Args:
         model: The PLM model.
@@ -194,9 +168,13 @@ def encode_video(
         num_frames: Number of frames to uniformly sample.
         prompt: Optional text prompt appended after image tokens in the
             user message (e.g., "Describe this video."). Empty by default.
-        pool: Pooling strategy - "last" for last-token hidden state
-            (default, standard for decoder-only models) or "mean" for
-            mean pooling over all sequence positions.
+        pool: Pooling strategy:
+            - "mean" (default): mean over image token positions only.
+              Best for retrieval — captures visual content, ignores
+              chat template overhead.
+            - "mean_all": mean over all sequence positions.
+            - "last": last-token hidden state (includes chat template
+              context; less discriminative for retrieval).
 
     Returns:
         L2-normalized embedding tensor of shape (dim,).
@@ -236,10 +214,15 @@ def encode_video(
     )
 
     # Pool hidden states to a single vector
-    if pool == "last":
-        embedding = h[0, -1, :]
-    elif pool == "mean":
+    if pool == "mean":
+        # Mean over image token positions only — captures visual content
+        # without noise from system prompt, headers, and structural tokens.
+        img_positions = torch.tensor(image_pos, device=h.device)
+        embedding = h[0, img_positions].mean(dim=0)
+    elif pool == "mean_all":
         embedding = h[0].mean(dim=0)
+    elif pool == "last":
+        embedding = h[0, -1, :]
     else:
         raise ValueError(f"Unknown pool type: {pool}")
 
@@ -251,32 +234,46 @@ def encode_text(
     model: LMTransformer,
     tokenizer: PLMTokenizer,
     text: str,
-    pool: str = "last",
+    pool: str = "mean",
 ) -> torch.Tensor:
     """Extract a normalized text embedding from PLM.
 
-    Processes text through the LLM component of PLM using the same
-    conversation template as video encoding, ensuring comparable
-    hidden-state representations across modalities.
+    Encodes text directly through the LLM (BOS + raw text tokens, without
+    the chat template) so the embedding reflects the text content rather
+    than being dominated by shared structural tokens.
+
+    The default pooling ("mean") averages over content token positions
+    (excluding BOS), producing a content-focused embedding comparable
+    to the image-token-pooled video embedding.
 
     Args:
         model: The PLM model.
         tokenizer: The PLM tokenizer.
         text: Input text string.
-        pool: Pooling strategy - "last" or "mean".
+        pool: Pooling strategy:
+            - "mean" (default): mean over content token positions
+              (excludes BOS). Best for retrieval.
+            - "mean_all": mean over all positions including BOS.
+            - "last": last-token hidden state.
 
     Returns:
         L2-normalized embedding tensor of shape (dim,).
     """
-    text_ids = _build_text_prompt(tokenizer, text)
+    # Encode raw text without chat template — avoids the system prompt and
+    # header tokens that would dominate the representation and make all
+    # text embeddings look similar regardless of content.
+    text_ids = tokenizer.encode(text, add_bos=True, add_eos=False)
     token_values = torch.tensor([text_ids], dtype=torch.long, device="cuda")
 
     h = extract_hidden_states(model, token_values)
 
-    if pool == "last":
-        embedding = h[0, -1, :]
-    elif pool == "mean":
+    if pool == "mean":
+        # Skip BOS (position 0), pool over content tokens only
+        embedding = h[0, 1:].mean(dim=0)
+    elif pool == "mean_all":
         embedding = h[0].mean(dim=0)
+    elif pool == "last":
+        embedding = h[0, -1, :]
     else:
         raise ValueError(f"Unknown pool type: {pool}")
 
@@ -290,7 +287,7 @@ def encode_videos(
     video_paths: List[str],
     num_frames: int = 16,
     prompt: str = "",
-    pool: str = "last",
+    pool: str = "mean",
 ) -> torch.Tensor:
     """Encode multiple videos into a stacked embedding tensor.
 
@@ -317,7 +314,7 @@ def encode_texts(
     model: LMTransformer,
     tokenizer: PLMTokenizer,
     texts: List[str],
-    pool: str = "last",
+    pool: str = "mean",
 ) -> torch.Tensor:
     """Encode multiple texts into a stacked embedding tensor.
 
@@ -375,7 +372,7 @@ def main():
 Examples:
   %(prog)s --video clip.mp4 --texts "a cat" "a dog"
   %(prog)s --video_dir ./videos/ --texts "cooking" "sports" --output results.json
-  %(prog)s --video clip.mp4 --text_file queries.txt --pool mean
+  %(prog)s --video clip.mp4 --text_file queries.txt --pool last
         """,
     )
 
@@ -415,9 +412,14 @@ Examples:
     parser.add_argument(
         "--pool",
         type=str,
-        default="last",
-        choices=["last", "mean"],
-        help="Pooling strategy for hidden states (default: last).",
+        default="mean",
+        choices=["mean", "mean_all", "last"],
+        help=(
+            "Pooling strategy for hidden states (default: mean). "
+            "'mean' pools over content tokens only (image positions for video, "
+            "text tokens for text). 'mean_all' pools over all positions. "
+            "'last' uses the last token's hidden state."
+        ),
     )
     parser.add_argument(
         "--video_prompt",
