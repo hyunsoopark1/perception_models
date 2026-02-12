@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.distributed
+import torch.nn.functional as F
 import xformers.profiler
 from omegaconf import OmegaConf
 from torch.distributed._tensor import DTensor
@@ -173,6 +174,38 @@ def validate_train_args(args: TrainArgs, output_size: int):
         assert (
             args.distributed.selective_activation_checkpointing is False
         ), "Probing not supported with selective activation checkpointing"
+
+
+def compute_video_text_similarity(hidden_states, image_pos_index, loss_mask):
+    """Compute cosine similarity between video and text hidden states.
+
+    Averages hidden states at image-token positions (video features) and
+    at loss-mask positions (text response features) per sample, then
+    returns the batch-mean cosine similarity.
+
+    Args:
+        hidden_states: (bsz, seqlen, dim) — detached hidden states from
+            LMTransformer.forward(return_hidden_states=True).
+        image_pos_index: (bsz, seqlen) — positions >= 0 are image tokens.
+        loss_mask: (bsz, seqlen) — True at response/label positions.
+
+    Returns:
+        Scalar similarity averaged over the batch, or 0.0 if no valid
+        video+text pairs exist in the batch.
+    """
+    video_mask = image_pos_index >= 0
+    text_mask = loss_mask.bool()
+
+    similarities = []
+    for b in range(hidden_states.size(0)):
+        vid_pos = video_mask[b]
+        txt_pos = text_mask[b]
+        if vid_pos.any() and txt_pos.any():
+            vid_feat = F.normalize(hidden_states[b, vid_pos].mean(0), dim=-1)
+            txt_feat = F.normalize(hidden_states[b, txt_pos].mean(0), dim=-1)
+            similarities.append((vid_feat @ txt_feat).item())
+
+    return sum(similarities) / len(similarities) if similarities else 0.0
 
 
 preemption_flag = dict(flag=False)
@@ -415,16 +448,32 @@ def train(args: TrainArgs):
                     next(probe_mod.parameters()).grad is None
                 ), "Probe model shouldn't have grads at this point"
 
-            loss = model(
-                input_ids,
-                labels,
-                images=images,
-                image_pos_index=image_pos_index,
-                num_chunks=num_image_chunks,
-                media_type=media_type,
-                loss_mask=mask,
-                attn_impl=args.model.attn_impl,
-            )
+            # Request hidden states when images are present so we can
+            # compute video-text cosine similarity at logging steps.
+            hidden_states = None
+            if images is not None:
+                loss, hidden_states = model(
+                    input_ids,
+                    labels,
+                    images=images,
+                    image_pos_index=image_pos_index,
+                    num_chunks=num_image_chunks,
+                    media_type=media_type,
+                    loss_mask=mask,
+                    attn_impl=args.model.attn_impl,
+                    return_hidden_states=True,
+                )
+            else:
+                loss = model(
+                    input_ids,
+                    labels,
+                    images=images,
+                    image_pos_index=image_pos_index,
+                    num_chunks=num_image_chunks,
+                    media_type=media_type,
+                    loss_mask=mask,
+                    attn_impl=args.model.attn_impl,
+                )
 
             # We scale loss with grad_acc_steps so the gradient is the same
             # regardless of grad_acc_steps
@@ -517,6 +566,16 @@ def train(args: TrainArgs):
 
                 to_sync = {}
                 to_sync["loss/out"] = loss.item()
+
+                # Compute video-text cosine similarity from hidden states
+                vt_sim = 0.0
+                if hidden_states is not None:
+                    with torch.no_grad():
+                        vt_sim = compute_video_text_similarity(
+                            hidden_states, image_pos_index, mask,
+                        )
+                    to_sync["similarity/video_text"] = vt_sim
+
                 metrics.update(dist_mean_dict(to_sync))
 
                 if get_is_master():
@@ -537,6 +596,7 @@ def train(args: TrainArgs):
                     f"  lr: {curr_lr:.2e}"
                     f"  mem: {gpu_mem_stats.max_active_pct:.0f}%"
                     f"  pow: {gpu_mem_stats.power_draw/1000} W"
+                    f"  vt_sim: {vt_sim:.4f}"
                 )
 
             saved = False
