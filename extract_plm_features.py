@@ -70,7 +70,7 @@ import torch.nn.functional as F
 
 from apps.plm.generate import load_consolidated_model_and_tokenizer
 from apps.plm.tokenizer import PLMTokenizer
-from apps.plm.transformer import LMTransformer, create_causal_mask
+from apps.plm.transformer import LMTransformer
 from core.transforms.video_transform import get_video_transform
 
 logging.basicConfig(
@@ -93,9 +93,10 @@ def extract_hidden_states(
 ) -> torch.Tensor:
     """Run the PLM forward pass and return hidden states before the LM head.
 
-    This replicates the LMTransformer.forward() pipeline but returns the
-    RMSNorm-normalized hidden states instead of logits, making them suitable
-    as feature embeddings for similarity computation.
+    Delegates to LMTransformer.forward(return_hidden_states=True) which
+    returns the RMSNorm-normalized hidden states — the same forward path
+    used during training (tok_embeddings -> vision stitch -> transformer
+    layers -> RMSNorm), just without the final LM head projection.
 
     Args:
         model: The PLM LMTransformer model.
@@ -109,38 +110,15 @@ def extract_hidden_states(
     Returns:
         Hidden states tensor of shape (1, seqlen, dim).
     """
-    num_chunks = num_chunks or [1]
-    media_type = media_type or ["video"]
-
-    _, seqlen = token_values.shape
-
-    # Step 1: Token embeddings
-    h = model.tok_embeddings(token_values)
-
-    # Step 2: Stitch vision features into the token sequence
-    if images is not None and image_pos_index is not None:
-        h_img = model.vision_model(images, strip_cls_token=True)
-        h_img = model.vision_projector(h_img)
-        h = model.stitch_images_into_text(
-            h,
-            h_img,
-            image_pos_index,
-            num_chunks=num_chunks,
-            media_type=media_type,
-        )
-
-    # Step 3: Causal attention mask
-    mask = create_causal_mask(seqlen, "sdpa", model.sliding_window)
-
-    # Step 4: Run through all transformer layers
-    freq_cis = model.rope_embeddings(seqlen=model.max_seqlen)
-    for layer in model.layers:
-        h = layer(h, freq_cis, mask=mask, attn_impl="sdpa")
-
-    # Step 5: Final RMS normalization
-    h = model.norm(h)
-
-    return h
+    _, hidden_states = model.forward(
+        token_values,
+        images=images,
+        image_pos_index=image_pos_index,
+        num_chunks=num_chunks or [1],
+        media_type=media_type or ["video"],
+        return_hidden_states=True,
+    )
+    return hidden_states
 
 
 @torch.inference_mode()

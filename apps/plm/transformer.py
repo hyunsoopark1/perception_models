@@ -149,6 +149,7 @@ class LMTransformer(BaseTransformer):
         num_chunks: List[int] = [1],
         media_type: List[str] = ["multi_image"],
         attn_impl: str = "sdpa",
+        return_hidden_states: bool = False,
     ):
         _, seqlen = token_values.shape
 
@@ -174,13 +175,18 @@ class LMTransformer(BaseTransformer):
 
         h = super().forward(h, tok_idx=tok_idx, mask=mask, attn_impl=attn_impl)
 
-        logits = self.output(self.norm(h))
+        h_normed = self.norm(h)
+        logits = self.output(h_normed)
         if target is not None:
             logits = logits[loss_mask]
             target = target[loss_mask]
-            return cross_entropy(logits, target)
+            result = cross_entropy(logits, target)
         else:
-            return logits
+            result = logits
+
+        if return_hidden_states:
+            return result, h_normed.detach()
+        return result
 
     def reset_parameters(self, init_std=None):
         # Either use fixed base std or sqrt model dim
