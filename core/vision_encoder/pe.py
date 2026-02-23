@@ -18,7 +18,7 @@ from torch.nn.init import constant_, xavier_normal_, xavier_uniform_
 from torch.nn.parameter import Parameter
 from torch.utils.checkpoint import checkpoint
 
-from core.vision_encoder.rope import Rope2D
+from core.vision_encoder.rope import Rope1D, Rope2D
 from core.vision_encoder.config import PEConfig, PETextConfig, PE_VISION_CONFIG, PE_TEXT_CONFIG, fetch_pe_checkpoint
 
 
@@ -287,6 +287,87 @@ class Transformer(nn.Module):
             if i == stop_idx:
                 break
 
+        return x
+
+
+class TemporalTransformer(nn.Module):
+    """
+    Lightweight transformer that encodes temporal relationships across
+    per-frame features.
+
+    Replaces naive temporal mean-pooling with learned self-attention over
+    the time axis.  Each frame's embedding (produced by the spatial image
+    encoder) is treated as one token.  1D Rotary Position Embeddings
+    (Rope1D) are applied so that every attention layer is aware of the
+    relative order of frames.  A learnable attention-pooling probe then
+    collapses the variable-length temporal sequence into a single
+    spatiotemporally-aware video embedding.
+
+    Input : (B, N, D)  — batch, num_frames, feature_dim
+    Output: (B, D)     — video-level embedding
+    """
+
+    def __init__(
+        self,
+        width: int,
+        layers: int = 2,
+        heads: int = 8,
+        mlp_ratio: float = 4.0,
+        act_layer: Callable = nn.GELU,
+        norm_layer: Callable = partial(nn.LayerNorm, eps=1e-5),
+    ):
+        super().__init__()
+        self.width = width
+
+        head_dim = width // heads
+        assert head_dim * heads == width, "width must be divisible by heads"
+
+        # 1D temporal RoPE — shared reference passed to every attention block
+        self.temporal_rope = Rope1D(dim=head_dim)
+        self.temporal_rope.init_tensors()
+
+        self.ln_pre = norm_layer(width)
+        self.ln_post = norm_layer(width)
+
+        self.resblocks = nn.ModuleList([
+            ResidualAttentionBlock(
+                d_model=width,
+                n_head=heads,
+                mlp_ratio=mlp_ratio,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+                rope=self.temporal_rope,
+            )
+            for _ in range(layers)
+        ])
+
+        # Learnable probe collapses (B, N, D) → (B, 1, D) → (B, D)
+        self.attn_pool = AttentionPooling(
+            embed_dim=width,
+            num_heads=heads,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for block in self.resblocks:
+            if isinstance(block.attn, SelfAttention):
+                block.attn.init_tensors()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: per-frame feature vectors, shape (B, N, D)
+        Returns:
+            video-level embedding, shape (B, D)
+        """
+        x = self.ln_pre(x)
+        for block in self.resblocks:
+            x = block(x)
+        x = self.ln_post(x)
+        x = self.attn_pool(x).squeeze(1)  # (B, 1, D) → (B, D)
         return x
 
 
@@ -702,25 +783,65 @@ class CLIP(TextTransformer):
         self,
         vision_cfg: PEConfig,
         text_cfg: PETextConfig,
-        init_logit_scale: float = np.log(1 / 0.07)
+        init_logit_scale: float = np.log(1 / 0.07),
+        num_temporal_layers: int = 2,
+        num_temporal_heads: int = 8,
     ):
         super(CLIP, self).__init__(**asdict(text_cfg))
         self.visual = VisionTransformer(**asdict(vision_cfg))
         self.image_size = self.visual.image_size  # For ease of use
         self.logit_scale = nn.Parameter(torch.ones([]) * init_logit_scale)
 
+        # Temporal transformer for spatiotemporal video encoding.
+        # Requires a projected output dimension (output_dim is not None) so
+        # that frame features are fixed-size vectors ready for temporal
+        # attention.  Falls back to mean-pooling when output_dim is None or
+        # num_temporal_layers == 0.
+        if num_temporal_layers > 0 and vision_cfg.output_dim is not None:
+            self.temporal_encoder = TemporalTransformer(
+                width=vision_cfg.output_dim,
+                layers=num_temporal_layers,
+                heads=num_temporal_heads,
+            )
+        else:
+            self.temporal_encoder = None
+
 
     def encode_image(self, image, normalize: bool = False):
         x = self.visual(image)
         return F.normalize(x, dim=-1) if normalize else x
 
-    def encode_video(self, video, normalize: bool = False): # b n c h w
+    def encode_video(self, video, normalize: bool = False):  # b n c h w
+        """
+        Encode a video clip into a single spatiotemporally-aware embedding.
+
+        Each frame is first encoded independently by the spatial image
+        encoder, producing per-frame features (B, N, D).  The temporal
+        transformer then applies self-attention with 1D RoPE across the
+        frame axis so that inter-frame relationships and frame order are
+        captured before pooling to a single vector.
+
+        Falls back to simple mean-pooling when no temporal encoder is
+        present (e.g. num_temporal_layers=0 at construction time).
+
+        Args:
+            video: (B, N, C, H, W) video tensor
+            normalize: L2-normalise the output embedding
+        Returns:
+            (B, D) video embedding
+        """
         b, n, c, h, w = video.shape
         frms = video.reshape(b * n, c, h, w)
-        frm_feats = self.encode_image(frms, normalize=normalize)
-        video_feats = frm_feats.reshape(b, n, -1)
-        video_feats = video_feats.mean(dim=1)
-        return video_feats
+        # Encode each frame spatially; defer normalisation to the very end
+        frm_feats = self.encode_image(frms, normalize=False)   # (B*N, D)
+        video_feats = frm_feats.reshape(b, n, -1)              # (B, N, D)
+
+        if self.temporal_encoder is not None:
+            video_feats = self.temporal_encoder(video_feats)   # (B, D)
+        else:
+            video_feats = video_feats.mean(dim=1)              # (B, D)
+
+        return F.normalize(video_feats, dim=-1) if normalize else video_feats
 
     def encode_text(self, text, normalize: bool = False):
         x = super().forward(text)
