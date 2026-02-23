@@ -345,3 +345,42 @@ class Rope2D:
         k = apply_rotary_emb(self.freq[:, None, :, :], k)
 
         return q, k
+
+
+class Rope1D:
+    """
+    Helper class to apply 1D RoPE along a single (temporal) dimension.
+
+    Uses the full head dimension for temporal frequency encoding so that
+    every dimension of each query/key vector carries temporal position
+    information.  The frequency cache is lazily recomputed whenever the
+    sequence length changes, so variable-length temporal sequences are
+    handled transparently.
+    """
+
+    def __init__(self, dim: int):
+        # dim == head_dim; all head dimensions are rotated by temporal freqs
+        self.dim = dim
+        self._seq_len = None
+        self.freq = None
+
+    def init_tensors(self):
+        # RotaryEmbedding(dim) produces (seq_len, dim)-shaped frequency tensors
+        self.rope = RotaryEmbedding(self.dim)
+
+    def update_seq_len(self, device: torch.device, seq_len: int):
+        if self._seq_len != seq_len:
+            self._seq_len = seq_len
+            self.rope = self.rope.to(device)
+            t = torch.arange(seq_len, device=device, dtype=torch.float32)
+            freq = self.rope(t, seq_len=seq_len)  # (seq_len, dim)
+            self.freq = freq[None, ...]            # (1, seq_len, dim)
+        self.freq = self.freq.to(device)
+
+    def __call__(self, q: Tensor, k: Tensor):
+        # q, k: (batch, heads, seq_len, head_dim)
+        seq_len = q.shape[2]
+        self.update_seq_len(q.device, seq_len)
+        q = apply_rotary_emb(self.freq[:, None, :, :], q)
+        k = apply_rotary_emb(self.freq[:, None, :, :], k)
+        return q, k
