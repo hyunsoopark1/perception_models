@@ -432,7 +432,7 @@ def main() -> None:
     import matplotlib
     matplotlib.use("QtAgg")
     import matplotlib.pyplot as plt
-    plt.imshow(confusion_matrix[:17, :17], cmap='viridis') # 'viridis' is a good default colormap
+    plt.imshow(sim, cmap='viridis') # 'viridis' is a good default colormap
     plt.colorbar() # Add a color bar to show the scale
     plt.title("Matrix Visualization with imshow()")
     plt.xlabel("Video feature")
