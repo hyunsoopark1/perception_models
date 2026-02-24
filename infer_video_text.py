@@ -429,6 +429,16 @@ def main() -> None:
     text_labels = [t[:80] for t in texts]
     print_similarity_matrix(sim, video_labels, text_labels, topk=args.topk)
 
+    import matplotlib
+    matplotlib.use("QtAgg")
+    import matplotlib.pyplot as plt
+    plt.imshow(confusion_matrix[:17, :17], cmap='viridis') # 'viridis' is a good default colormap
+    plt.colorbar() # Add a color bar to show the scale
+    plt.title("Matrix Visualization with imshow()")
+    plt.xlabel("Video feature")
+    plt.ylabel("Language feature")
+    plt.savefig("output_base.png", dpi=150, bbox_inches="tight")
+
     # Optional JSON dump
     if args.output_json:
         import json as _json
