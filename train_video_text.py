@@ -9,8 +9,18 @@ symmetric InfoNCE contrastive loss between L2-normalised video embeddings
 and paired text embeddings (identical to the original CLIP objective).
 
 Dataset format — one JSON object per line (JSONL):
-    {"video": "/abs/path/to/clip.mp4", "caption": "...", "start": 0.0, "end": 10.0}
-    "start" / "end" (seconds) are optional; omit to use the full clip.
+    {
+        "video": "clip.mp4",                    # filename; joined with data.video_root
+        "video_id": "optional_id",
+        "source": "VATEX",
+        "type": "captioning",
+        "instruction": "...",
+        "conversations": [
+            {"from": "human",     "value": "..."},
+            {"from": "assistant", "value": "caption text used for training"}
+        ]
+    }
+    The caption is taken from the last "assistant" turn in conversations.
 
 Single-GPU launch:
     python train_video_text.py data.train_data=data/train.jsonl
@@ -68,9 +78,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DataArgs:
     """Dataset and data-loading configuration."""
-    # Paths to JSONL files (one {"video", "caption"[, "start", "end"]} per line)
+    # Paths to JSONL files (conversations format, one JSON object per line)
     train_data: str = ""
     val_data: str = ""
+    # Optional root directory prepended to each "video" filename in the JSONL.
+    # Leave empty if the JSONL already contains absolute paths.
+    video_root: str = ""
 
     image_size: int = 224       # Spatial resolution passed to the spatial encoder
     num_frames: int = 8         # Frames uniformly sampled per video clip
@@ -127,13 +140,21 @@ class VideoTextDataset(Dataset):
     """
     Video-text contrastive dataset.
 
-    Reads a JSONL file where each line is a JSON object:
+    Reads a JSONL file where each line is a JSON object in conversations format:
         {
-            "video":   "/absolute/path/to/clip.mp4",
-            "caption": "free-form natural language description",
-            "start":   0.0,   # clip start in seconds (optional)
-            "end":     10.0   # clip end   in seconds (optional)
+            "video":   "clip.mp4",
+            "video_id": "Abuse001_x264_000",       # optional
+            "source":  "VATEX",                     # optional
+            "type":    "captioning",                # optional
+            "instruction": "...",                   # optional, unused
+            "conversations": [
+                {"from": "human",     "value": "..."},
+                {"from": "assistant", "value": "caption used as the text pair"}
+            ]
         }
+    The caption is the value of the last "assistant" turn in conversations.
+    The video filename is joined with ``video_root`` (if provided) to form the
+    full path.
 
     Each sample is decoded on the fly: frames are loaded, uniformly sampled
     to exactly ``num_frames``, resized to ``image_size x image_size``, and
@@ -152,12 +173,14 @@ class VideoTextDataset(Dataset):
         tokenizer,
         num_frames: int = 8,
         sampling_fps: int = 1,
+        video_root: str = "",
     ):
         super().__init__()
         self.video_transform = video_transform
         self.tokenizer = tokenizer
         self.num_frames = num_frames
         self.sampling_fps = sampling_fps
+        self.video_root = video_root
 
         self.samples: List[Dict] = []
         with open(jsonl_path) as f:
@@ -173,12 +196,23 @@ class VideoTextDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         item = self.samples[idx]
-        video_path = item["video"]
-        caption = item.get("caption", "")
-        start = item.get("start", None)
-        end = item.get("end", None)
 
-        frames = self._load_frames(video_path, start, end)
+        # Resolve video path
+        video_file = item["video"]
+        video_path = (
+            str(Path(self.video_root) / video_file)
+            if self.video_root
+            else video_file
+        )
+
+        # Extract caption from the last assistant turn in conversations
+        caption = ""
+        for turn in reversed(item.get("conversations", [])):
+            if turn.get("from") == "assistant":
+                caption = turn.get("value", "")
+                break
+
+        frames = self._load_frames(video_path, start=None, end=None)
         tokens = self.tokenizer(caption)   # (context_length,)
         return frames, tokens
 
@@ -234,6 +268,7 @@ def build_dataloader(
         tokenizer=tokenizer,
         num_frames=args.num_frames,
         sampling_fps=args.sampling_fps,
+        video_root=args.video_root,
     )
 
     is_train = split == "train"
