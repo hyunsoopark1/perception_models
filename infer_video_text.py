@@ -437,7 +437,6 @@ def main() -> None:
     print_similarity_matrix(sim, video_labels, text_labels, topk=args.topk)
 
     import matplotlib
-    matplotlib.use("QtAgg")
     import matplotlib.pyplot as plt
     plt.imshow(sim, cmap='viridis') # 'viridis' is a good default colormap
     plt.colorbar() # Add a color bar to show the scale
