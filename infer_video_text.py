@@ -262,7 +262,10 @@ def print_similarity_matrix(
         scores, indices = sim[i].topk(topk)
         print(f"\n  Video : {vlabel}")
         for rank, (idx, s) in enumerate(zip(indices.tolist(), scores.tolist()), 1):
-            print(f"    #{rank}  [{s * 100:+.1f}]  {text_labels[idx]}")
+            if idx == i:
+                print(f"    #{rank} (correct)  [{s * 100:+.1f}]  {text_labels[idx]}")
+            else:
+                print(f"    #{rank}  [{s * 100:+.1f}]  {text_labels[idx]}")
 
     # ---- Text → Video top-k ----
     print(f"\n=== Text → Video  (top-{topk}) ===")
@@ -270,7 +273,11 @@ def print_similarity_matrix(
         scores, indices = sim[:, j].topk(topk)
         print(f"\n  Text  : {tlabel}")
         for rank, (idx, s) in enumerate(zip(indices.tolist(), scores.tolist()), 1):
-            print(f"    #{rank}  [{s * 100:+.1f}]  {video_labels[idx]}")
+            
+            if idx == j:
+                print(f"    #{rank} (correct)  [{s * 100:+.1f}]  {video_labels[idx]}")
+            else:
+                print(f"    #{rank}  [{s * 100:+.1f}]  {video_labels[idx]}")
 
     # ---- Retrieval metrics (only when V == T, i.e. paired evaluation) ----
     if V == T:
