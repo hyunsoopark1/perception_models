@@ -213,7 +213,9 @@ class VideoTextDataset(Dataset):
                 break
 
         frames = self._load_frames(video_path, start=None, end=None)
-        tokens = self.tokenizer(caption)   # (context_length,)
+        # SimpleTokenizer always returns (num_strings, context_length); squeeze to (context_length,)
+        # so _collate_fn produces (B, context_length) rather than (B, 1, context_length).
+        tokens = self.tokenizer(caption).squeeze(0)   # (context_length,)
         return frames, tokens
 
     def _load_frames(
