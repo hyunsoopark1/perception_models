@@ -638,6 +638,7 @@ def train(args: TrainArgs) -> None:
                 # ----------------------------------------------------------
                 # Logging
                 # ----------------------------------------------------------
+                print(f"step: {step} {loss.item()}")
                 if get_is_master() and step % args.log_freq == 0:
                     avg_loss = running_loss / max(step - start_step + 1, 1)
                     running_loss = 0.0
