@@ -74,14 +74,40 @@ def load_model(
     """
     Reconstruct the CLIP model with TemporalTransformer and load fine-tuned weights.
 
-    The architecture is rebuilt from ``pe_config`` / ``num_temporal_*`` so that
-    it matches exactly what was used during training.  No pretrained hub weights
-    are downloaded — all weights come from the checkpoint.
+    If the checkpoint was saved by a recent version of train_video_text.py it
+    will contain a ``"config"`` key with the exact architecture that was used
+    during training.  When present, those values take precedence over the
+    ``pe_config`` / ``num_temporal_*`` arguments so that you never have to
+    manually pass ``--pe_config`` to match a checkpoint.
+
+    For older checkpoints that lack ``"config"``, the explicit arguments are
+    used as before (backward-compatible).
     """
+    # Load checkpoint first so we can read the saved config before building the model
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+
+    saved_cfg = ckpt.get("config", {})
+    if saved_cfg:
+        pe_config           = saved_cfg.get("pe_config",           pe_config)
+        num_temporal_layers = saved_cfg.get("num_temporal_layers",  num_temporal_layers)
+        num_temporal_heads  = saved_cfg.get("num_temporal_heads",   num_temporal_heads)
+        logger.info(
+            "Auto-detected model config from checkpoint: pe_config=%s, "
+            "num_temporal_layers=%d, num_temporal_heads=%d",
+            pe_config, num_temporal_layers, num_temporal_heads,
+        )
+    else:
+        logger.warning(
+            "Checkpoint has no saved 'config' — using CLI args: pe_config=%s, "
+            "num_temporal_layers=%d, num_temporal_heads=%d. "
+            "Make sure these match your training config!",
+            pe_config, num_temporal_layers, num_temporal_heads,
+        )
+
     # Build skeleton (pretrained=False; weights come entirely from the checkpoint)
     model = CLIP.from_config(name=pe_config, pretrained=False)
 
-    # Attach TemporalTransformer with the requested depth
+    # Attach TemporalTransformer with the correct depth
     output_dim = PE_VISION_CONFIG[pe_config].output_dim
     if output_dim is not None:
         model.temporal_encoder = TemporalTransformer(
@@ -90,8 +116,6 @@ def load_model(
             heads=num_temporal_heads,
         )
 
-    # Load checkpoint
-    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
     state_dict = ckpt["model"] if "model" in ckpt else ckpt
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
@@ -101,6 +125,9 @@ def load_model(
 
     step = ckpt.get("step", "unknown")
     logger.info("Loaded checkpoint from '%s' (step=%s)", checkpoint, step)
+
+    # Stash the resolved config name so callers can derive image_size, etc.
+    model.pe_config_name = pe_config
 
     model.to(device)
     model.eval()
@@ -358,8 +385,11 @@ def parse_args() -> argparse.Namespace:
     # --- Video sampling ---
     p.add_argument("--num_frames", type=int, default=8,
                    help="Frames uniformly sampled per video (default: 8).")
-    p.add_argument("--image_size", type=int, default=224,
-                   help="Spatial resolution for video frames (default: 224).")
+    p.add_argument("--image_size", type=int, default=None,
+                   help="Spatial resolution for video frames. "
+                        "Defaults to the native resolution of the PE model "
+                        "(e.g. 448 for PE-Core-G14-448, 224 for PE-Core-B16-224). "
+                        "Only set this if you trained with a non-standard size.")
     p.add_argument("--sampling_fps", type=int, default=1,
                    help="Target FPS when sampling frames (default: 1).")
 
@@ -414,12 +444,21 @@ def main() -> None:
     )
     tokenizer = get_text_tokenizer(model.context_length)
 
+    # Derive image_size from the PE config when not explicitly overridden
+    if args.image_size is not None:
+        image_size = args.image_size
+    else:
+        # model.visual.image_size is the authoritative value on the loaded model
+        cfg_size = PE_VISION_CONFIG[model.pe_config_name].image_size
+        image_size = cfg_size[0] if isinstance(cfg_size, tuple) else cfg_size
+        logger.info("Using image_size=%d from model config '%s'", image_size, model.pe_config_name)
+
     # Encode
     logger.info("Encoding %d video(s)…", len(video_paths))
     video_feats = encode_videos(
         model, video_paths,
         num_frames=args.num_frames,
-        image_size=args.image_size,
+        image_size=image_size,
         sampling_fps=args.sampling_fps,
         device=device,
         batch_size=args.batch_size,

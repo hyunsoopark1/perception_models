@@ -40,6 +40,7 @@ import logging
 import os
 import random
 import sys
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -484,17 +485,18 @@ def save_checkpoint(
     scheduler,
     step: int,
     path: Path,
+    model_args: "ModelArgs" = None,
 ) -> None:
     raw_model = model.module if isinstance(model, DDP) else model
-    torch.save(
-        {
-            "model": raw_model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "step": step,
-        },
-        path,
-    )
+    ckpt = {
+        "model": raw_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "step": step,
+    }
+    if model_args is not None:
+        ckpt["config"] = dataclasses.asdict(model_args)
+    torch.save(ckpt, path)
     logger.info(f"Checkpoint saved → {path}")
 
 
@@ -682,10 +684,12 @@ def train(args: TrainArgs) -> None:
                     save_checkpoint(
                         model, optimizer, scheduler, step,
                         Path(args.dump_dir) / f"checkpoint_{step:07d}.pt",
+                        model_args=args.model,
                     )
                     # Also keep a rolling "latest" checkpoint for easy resuming
                     save_checkpoint(
-                        model, optimizer, scheduler, step, ckpt_path
+                        model, optimizer, scheduler, step, ckpt_path,
+                        model_args=args.model,
                     )
 
                 step += 1
@@ -695,6 +699,7 @@ def train(args: TrainArgs) -> None:
             save_checkpoint(
                 model, optimizer, scheduler, step - 1,
                 Path(args.dump_dir) / f"checkpoint_final.pt",
+                model_args=args.model,
             )
 
     logger.info("Training complete.")
