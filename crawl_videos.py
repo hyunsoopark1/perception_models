@@ -99,8 +99,19 @@ def _base_ydl_opts(
     cookies_file: Optional[str] = None,
     username: Optional[str] = None,
     password: Optional[str] = None,
+    player_client: Optional[str] = None,
 ) -> dict:
     """Return common yt-dlp options shared across search, enrich, and download.
+
+    Bot-detection bypass strategy
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    By default the YouTube ``tv_embedded`` player client is tried first,
+    followed by ``web``.  The ``tv_embedded`` client does not require a
+    signed-in session for most public videos and therefore avoids the
+    "Sign in to confirm you're not a bot" error without needing cookies.
+
+    When cookies or credentials are also supplied they are applied on top
+    (useful for age-restricted or private videos).
 
     Authentication priority (only one cookie method is applied):
       1. cookies_from_browser – pull live cookies from an installed browser
@@ -120,11 +131,25 @@ def _base_ydl_opts(
         YouTube does NOT support this – use a cookies option instead.
     password:
         Account password paired with *username*.
+    player_client:
+        Comma-separated list of YouTube player clients to try in order.
+        Defaults to ``"tv_embedded,web"`` which works for most public videos
+        without authentication.  Other options: ``web``, ``android``,
+        ``ios``, ``mediaconnect``.
     """
+    _player_client = player_client or "tv_embedded,web"
+
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
-        # Mimic a real browser to reduce bot-detection signals
+        # Use alternative player clients that don't require sign-in for
+        # most public videos – this is the primary bot-detection bypass.
+        "extractor_args": {
+            "youtube": {
+                "player_client": _player_client.split(","),
+            }
+        },
+        # Mimic a real browser to reduce additional bot-detection signals.
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -159,6 +184,7 @@ def search_videos(
     cookies_file: Optional[str] = None,
     username: Optional[str] = None,
     password: Optional[str] = None,
+    player_client: Optional[str] = None,
 ) -> list[VideoMeta]:
     """Return a list of VideoMeta objects matching *query*.
 
@@ -172,12 +198,13 @@ def search_videos(
     cookies_file:         Path to a Netscape-format cookies.txt file.
     username:             Site credential login (not supported by YouTube).
     password:             Password paired with username.
+    player_client:        YouTube player client(s) to use (default: tv_embedded,web).
     """
     yt_dlp = _import_yt_dlp()
 
     search_url = f"ytsearch{max_results}:{query}"
 
-    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file, username, password)
+    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file, username, password, player_client)
     ydl_opts.update({
         "extract_flat": "in_playlist",  # fast: fetch only metadata
         "skip_download": True,
@@ -237,10 +264,11 @@ def enrich_metadata(
     cookies_file: Optional[str] = None,
     username: Optional[str] = None,
     password: Optional[str] = None,
+    player_client: Optional[str] = None,
 ) -> VideoMeta:
     """Fetch full metadata for a single video (fills description, tags, etc.)."""
     yt_dlp = _import_yt_dlp()
-    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file, username, password)
+    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file, username, password, player_client)
     ydl_opts["skip_download"] = True
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -273,6 +301,7 @@ def _download_video(
     cookies_file: Optional[str] = None,
     username: Optional[str] = None,
     password: Optional[str] = None,
+    player_client: Optional[str] = None,
 ) -> Optional[Path]:
     """Download a single video and return its local path.
 
@@ -285,7 +314,7 @@ def _download_video(
 
     outtmpl = str(video_dir / "%(id)s.%(ext)s")
 
-    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file, username, password)
+    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file, username, password, player_client)
     ydl_opts.update({
         "format": format_spec,
         "outtmpl": outtmpl,
@@ -367,6 +396,7 @@ def crawl(
     cookies_file: Optional[str] = None,
     username: Optional[str] = None,
     password: Optional[str] = None,
+    player_client: Optional[str] = None,
 ) -> None:
     """Crawl videos for all *queries* and write metadata (+ optional videos).
 
@@ -386,6 +416,7 @@ def crawl(
     cookies_file:         Path to a Netscape-format cookies.txt file.
     username:             Site credential login (not supported by YouTube).
     password:             Password paired with username.
+    player_client:        YouTube player client(s) to use (default: tv_embedded,web).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "metadata.jsonl"
@@ -406,6 +437,7 @@ def crawl(
             cookies_file=cookies_file,
             username=username,
             password=password,
+            player_client=player_client,
         )
         new = [m for m in results if m.video_id not in done_ids]
         log.info("  %d new videos (skipping %d already done)",
@@ -432,6 +464,7 @@ def crawl(
                 cookies_file=cookies_file,
                 username=username,
                 password=password,
+                player_client=player_client,
             )
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -452,6 +485,7 @@ def crawl(
                 cookies_file=cookies_file,
                 username=username,
                 password=password,
+                player_client=player_client,
             )
             if path:
                 meta.local_path = str(path)
@@ -583,6 +617,17 @@ def parse_args() -> argparse.Namespace:
         metavar="PASS",
         help="Password paired with --username (only used when --username is set).",
     )
+    p.add_argument(
+        "--player-client",
+        dest="player_client",
+        metavar="CLIENTS",
+        default=None,
+        help=(
+            "Comma-separated YouTube player client(s) to try in order. "
+            "Default: 'tv_embedded,web' (bypasses bot-detection for public videos). "
+            "Other values: web, android, ios, mediaconnect."
+        ),
+    )
 
     # Misc
     p.add_argument(
@@ -651,6 +696,7 @@ def main() -> None:
         cookies_file=args.cookies_file,
         username=getattr(args, "username", None),
         password=getattr(args, "password", None),
+        player_client=args.player_client,
     )
 
 
