@@ -28,9 +28,12 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -172,6 +175,122 @@ def _base_ydl_opts(
 
 
 # ---------------------------------------------------------------------------
+# YouTube Data API v3 helpers  (headless-server-friendly search backend)
+# ---------------------------------------------------------------------------
+
+_YT_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+_YT_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
+
+
+def _iso8601_to_seconds(duration: str) -> int:
+    """Convert an ISO 8601 duration string (e.g. ``PT1H2M3S``) to seconds."""
+    m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", duration or "PT0S")
+    if not m:
+        return 0
+    h, mn, s = (int(x or 0) for x in m.groups())
+    return h * 3600 + mn * 60 + s
+
+
+def _yt_api_get(url: str) -> dict:
+    """Perform a simple GET request and return parsed JSON."""
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def _search_youtube_api(
+    query: str,
+    api_key: str,
+    max_results: int = 20,
+    max_duration: Optional[int] = None,
+    min_duration: Optional[int] = None,
+) -> list[VideoMeta]:
+    """Search YouTube via the Data API v3 (no browser, no cookies needed).
+
+    Requires a free API key from Google Cloud Console:
+      https://console.cloud.google.com/  →  APIs & Services → YouTube Data API v3
+
+    Free quota: 10,000 units/day.  Each search costs 100 units; each
+    ``videos.list`` call for details costs 1 unit per 50 IDs.
+
+    Parameters
+    ----------
+    query:        Search string.
+    api_key:      YouTube Data API v3 key.
+    max_results:  Maximum videos to return (after duration filtering).
+    max_duration: Discard videos longer than this many seconds.
+    min_duration: Discard videos shorter than this many seconds.
+    """
+    # Over-fetch so duration filtering still leaves enough results.
+    fetch_n = min(max_results * 2, 50)   # API hard cap is 50
+
+    search_params = urllib.parse.urlencode({
+        "part": "snippet",
+        "q": query,
+        "maxResults": fetch_n,
+        "type": "video",
+        "key": api_key,
+    })
+    search_data = _yt_api_get(f"{_YT_SEARCH_URL}?{search_params}")
+    items = search_data.get("items", [])
+    if not items:
+        return []
+
+    video_ids = [it["id"]["videoId"] for it in items]
+    snippets  = {it["id"]["videoId"]: it["snippet"] for it in items}
+
+    # Fetch duration + statistics in one batched call
+    videos_params = urllib.parse.urlencode({
+        "part": "contentDetails,statistics",
+        "id": ",".join(video_ids),
+        "key": api_key,
+    })
+    videos_data = _yt_api_get(f"{_YT_VIDEOS_URL}?{videos_params}")
+    details = {v["id"]: v for v in videos_data.get("items", [])}
+
+    results: list[VideoMeta] = []
+    for vid_id in video_ids:
+        if len(results) >= max_results:
+            break
+
+        snippet = snippets.get(vid_id, {})
+        detail  = details.get(vid_id, {})
+        content = detail.get("contentDetails", {})
+        stats   = detail.get("statistics", {})
+
+        duration = _iso8601_to_seconds(content.get("duration", "PT0S"))
+
+        if max_duration is not None and duration > max_duration:
+            log.debug("Skipping %s – duration %ds > max %ds", vid_id, duration, max_duration)
+            continue
+        if min_duration is not None and duration < min_duration:
+            log.debug("Skipping %s – duration %ds < min %ds", vid_id, duration, min_duration)
+            continue
+
+        # publishedAt → YYYYMMDD
+        published = snippet.get("publishedAt", "")[:10].replace("-", "")
+        thumb = (snippet.get("thumbnails") or {})
+        thumb_url = (thumb.get("high") or thumb.get("default") or {}).get("url", "")
+
+        results.append(VideoMeta(
+            video_id=vid_id,
+            title=snippet.get("title", ""),
+            description=snippet.get("description", ""),
+            url=f"https://www.youtube.com/watch?v={vid_id}",
+            webpage_url=f"https://www.youtube.com/watch?v={vid_id}",
+            channel=snippet.get("channelTitle", ""),
+            channel_id=snippet.get("channelId", ""),
+            duration=duration,
+            view_count=int(stats.get("viewCount") or 0),
+            like_count=int(stats.get("likeCount") or 0),
+            upload_date=published,
+            search_query=query,
+            thumbnail_url=thumb_url,
+        ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
 
@@ -185,8 +304,13 @@ def search_videos(
     username: Optional[str] = None,
     password: Optional[str] = None,
     player_client: Optional[str] = None,
+    youtube_api_key: Optional[str] = None,
 ) -> list[VideoMeta]:
     """Return a list of VideoMeta objects matching *query*.
+
+    When *youtube_api_key* is provided the YouTube Data API v3 is used for
+    searching – this works on any headless server (no browser, no cookies).
+    Otherwise yt-dlp is used, which may be blocked on cloud/data-center IPs.
 
     Parameters
     ----------
@@ -199,7 +323,23 @@ def search_videos(
     username:             Site credential login (not supported by YouTube).
     password:             Password paired with username.
     player_client:        YouTube player client(s) to use (default: tv_embedded,web).
+    youtube_api_key:      YouTube Data API v3 key – recommended for headless servers.
     """
+    log.info("Searching: %r  (max %d results)", query, max_results)
+
+    # --- YouTube Data API v3 path (headless-server-friendly) ---
+    if youtube_api_key:
+        results = _search_youtube_api(
+            query,
+            api_key=youtube_api_key,
+            max_results=max_results,
+            max_duration=max_duration,
+            min_duration=min_duration,
+        )
+        log.info("  Found %d videos for query %r (via YouTube API)", len(results), query)
+        return results
+
+    # --- yt-dlp path (works on residential IPs / with cookies) ---
     yt_dlp = _import_yt_dlp()
 
     search_url = f"ytsearch{max_results}:{query}"
@@ -209,8 +349,6 @@ def search_videos(
         "extract_flat": "in_playlist",  # fast: fetch only metadata
         "skip_download": True,
     })
-
-    log.info("Searching: %r  (max %d results)", query, max_results)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(search_url, download=False)
@@ -224,7 +362,6 @@ def search_videos(
 
         duration = entry.get("duration") or 0
 
-        # Duration filters
         if max_duration is not None and duration > max_duration:
             log.debug("Skipping %s – duration %ds > max %ds",
                       entry.get("id"), duration, max_duration)
@@ -254,7 +391,7 @@ def search_videos(
         )
         results.append(meta)
 
-    log.info("  Found %d videos for query %r", len(results), query)
+    log.info("  Found %d videos for query %r (via yt-dlp)", len(results), query)
     return results
 
 
@@ -397,6 +534,7 @@ def crawl(
     username: Optional[str] = None,
     password: Optional[str] = None,
     player_client: Optional[str] = None,
+    youtube_api_key: Optional[str] = None,
 ) -> None:
     """Crawl videos for all *queries* and write metadata (+ optional videos).
 
@@ -417,6 +555,7 @@ def crawl(
     username:             Site credential login (not supported by YouTube).
     password:             Password paired with username.
     player_client:        YouTube player client(s) to use (default: tv_embedded,web).
+    youtube_api_key:      YouTube Data API v3 key – recommended for headless servers.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "metadata.jsonl"
@@ -438,6 +577,7 @@ def crawl(
             username=username,
             password=password,
             player_client=player_client,
+            youtube_api_key=youtube_api_key,
         )
         new = [m for m in results if m.video_id not in done_ids]
         log.info("  %d new videos (skipping %d already done)",
@@ -628,6 +768,22 @@ def parse_args() -> argparse.Namespace:
             "Other values: web, android, ios, mediaconnect."
         ),
     )
+    p.add_argument(
+        "--youtube-api-key",
+        dest="youtube_api_key",
+        metavar="KEY",
+        default=None,
+        help=(
+            "YouTube Data API v3 key. "
+            "RECOMMENDED for headless/cloud servers (AWS, GCP, etc.) where "
+            "YouTube blocks yt-dlp requests. "
+            "Get a free key at https://console.cloud.google.com/ → "
+            "APIs & Services → YouTube Data API v3. "
+            "Free quota: 10,000 units/day (~100 searches/day). "
+            "When set, the API is used for all searches; yt-dlp is still "
+            "used for downloading video files."
+        ),
+    )
 
     # Misc
     p.add_argument(
@@ -673,11 +829,15 @@ def main() -> None:
             "Username/password auth is NOT supported by YouTube. "
             "If you are crawling YouTube, use --cookies-from-browser or --cookies."
         )
+    elif args.youtube_api_key:
+        log.info("Using YouTube Data API v3 for search (headless-server mode).")
     elif not args.cookies_from_browser and not args.cookies_file:
         log.warning(
-            "No authentication provided. YouTube may block requests with "
+            "No authentication provided and no --youtube-api-key set. "
+            "YouTube may block yt-dlp requests from cloud/server IPs with "
             "'Sign in to confirm you're not a bot'. "
-            "Use --cookies-from-browser BROWSER or --cookies FILE to fix this."
+            "Options: (1) --youtube-api-key KEY  [recommended for servers] "
+            "(2) --cookies-from-browser BROWSER  (3) --cookies FILE"
         )
 
     # Run the crawl
@@ -697,6 +857,7 @@ def main() -> None:
         username=getattr(args, "username", None),
         password=getattr(args, "password", None),
         player_client=args.player_client,
+        youtube_api_key=args.youtube_api_key,
     )
 
 
