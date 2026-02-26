@@ -94,6 +94,46 @@ def _import_yt_dlp():
     return yt_dlp
 
 
+def _base_ydl_opts(
+    cookies_from_browser: Optional[str] = None,
+    cookies_file: Optional[str] = None,
+) -> dict:
+    """Return common yt-dlp options shared across search, enrich, and download.
+
+    Authentication options (cookies_from_browser / cookies_file) bypass
+    YouTube's bot-detection challenge.  Pass at most one of them.
+
+    Parameters
+    ----------
+    cookies_from_browser:
+        Browser name to pull cookies from, e.g. ``"chrome"``, ``"firefox"``,
+        ``"safari"``, ``"edge"``.  Requires the browser to be installed and
+        the user to be logged in to YouTube in that browser.
+    cookies_file:
+        Path to a Netscape-format cookies.txt file exported from the browser
+        (e.g. via the *Get cookies.txt LOCALLY* extension).
+    """
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        # Mimic a real browser to reduce bot-detection signals
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        },
+    }
+    if cookies_from_browser:
+        opts["cookiesfrombrowser"] = (cookies_from_browser,)
+        log.debug("Using cookies from browser: %s", cookies_from_browser)
+    if cookies_file:
+        opts["cookiefile"] = cookies_file
+        log.debug("Using cookies file: %s", cookies_file)
+    return opts
+
+
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
@@ -103,26 +143,29 @@ def search_videos(
     max_results: int = 20,
     max_duration: Optional[int] = None,
     min_duration: Optional[int] = None,
+    cookies_from_browser: Optional[str] = None,
+    cookies_file: Optional[str] = None,
 ) -> list[VideoMeta]:
     """Return a list of VideoMeta objects matching *query*.
 
     Parameters
     ----------
-    query:        YouTube search string.
-    max_results:  Maximum number of videos to return.
-    max_duration: Skip videos longer than this many seconds (None = no limit).
-    min_duration: Skip videos shorter than this many seconds (None = no limit).
+    query:                YouTube search string.
+    max_results:          Maximum number of videos to return.
+    max_duration:         Skip videos longer than this many seconds.
+    min_duration:         Skip videos shorter than this many seconds.
+    cookies_from_browser: Browser name to pull cookies from (e.g. "chrome").
+    cookies_file:         Path to a Netscape-format cookies.txt file.
     """
     yt_dlp = _import_yt_dlp()
 
     search_url = f"ytsearch{max_results}:{query}"
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file)
+    ydl_opts.update({
         "extract_flat": "in_playlist",  # fast: fetch only metadata
         "skip_download": True,
-    }
+    })
 
     log.info("Searching: %r  (max %d results)", query, max_results)
 
@@ -172,14 +215,15 @@ def search_videos(
     return results
 
 
-def enrich_metadata(meta: VideoMeta) -> VideoMeta:
+def enrich_metadata(
+    meta: VideoMeta,
+    cookies_from_browser: Optional[str] = None,
+    cookies_file: Optional[str] = None,
+) -> VideoMeta:
     """Fetch full metadata for a single video (fills description, tags, etc.)."""
     yt_dlp = _import_yt_dlp()
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-    }
+    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file)
+    ydl_opts["skip_download"] = True
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(meta.webpage_url, download=False)
@@ -207,6 +251,8 @@ def _download_video(
     output_dir: Path,
     format_spec: str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
     retries: int = 3,
+    cookies_from_browser: Optional[str] = None,
+    cookies_file: Optional[str] = None,
 ) -> Optional[Path]:
     """Download a single video and return its local path.
 
@@ -219,15 +265,14 @@ def _download_video(
 
     outtmpl = str(video_dir / "%(id)s.%(ext)s")
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file)
+    ydl_opts.update({
         "format": format_spec,
         "outtmpl": outtmpl,
         "retries": retries,
         "merge_output_format": "mp4",
         "noplaylist": True,
-    }
+    })
 
     for attempt in range(1, retries + 1):
         try:
@@ -298,21 +343,25 @@ def crawl(
     workers: int = 4,
     rate_limit_secs: float = 1.0,
     enrich: bool = False,
+    cookies_from_browser: Optional[str] = None,
+    cookies_file: Optional[str] = None,
 ) -> None:
     """Crawl videos for all *queries* and write metadata (+ optional videos).
 
     Parameters
     ----------
-    queries:         List of search strings.
-    output_dir:      Root directory for all outputs.
-    max_results:     Videos to fetch per query.
-    max_duration:    Maximum video duration in seconds (None = no filter).
-    min_duration:    Minimum video duration in seconds (None = no filter).
-    download_video:  If True, download the video files.
-    format_spec:     yt-dlp format selector used when downloading.
-    workers:         Number of parallel download threads.
-    rate_limit_secs: Minimum delay (seconds) between searches to avoid bans.
-    enrich:          Fetch full metadata for each video (slower but complete).
+    queries:              List of search strings.
+    output_dir:           Root directory for all outputs.
+    max_results:          Videos to fetch per query.
+    max_duration:         Maximum video duration in seconds (None = no filter).
+    min_duration:         Minimum video duration in seconds (None = no filter).
+    download_video:       If True, download the video files.
+    format_spec:          yt-dlp format selector used when downloading.
+    workers:              Number of parallel download threads.
+    rate_limit_secs:      Minimum delay (seconds) between searches.
+    enrich:               Fetch full metadata for each video.
+    cookies_from_browser: Browser name to pull cookies from (e.g. "chrome").
+    cookies_file:         Path to a Netscape-format cookies.txt file.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "metadata.jsonl"
@@ -329,6 +378,8 @@ def crawl(
             max_results=max_results,
             max_duration=max_duration,
             min_duration=min_duration,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=cookies_file,
         )
         new = [m for m in results if m.video_id not in done_ids]
         log.info("  %d new videos (skipping %d already done)",
@@ -349,7 +400,11 @@ def crawl(
         log.info("Enriching metadata for %d videos …", len(all_metas))
         def _enrich_one(m):
             time.sleep(0.5)   # small delay per request
-            return enrich_metadata(m)
+            return enrich_metadata(
+                m,
+                cookies_from_browser=cookies_from_browser,
+                cookies_file=cookies_file,
+            )
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_enrich_one, m): m for m in all_metas}
@@ -363,7 +418,11 @@ def crawl(
         log.info("Downloading %d videos with %d workers …", len(all_metas), workers)
 
         def _do_download(meta: VideoMeta) -> VideoMeta:
-            path = _download_video(meta, output_dir, format_spec)
+            path = _download_video(
+                meta, output_dir, format_spec,
+                cookies_from_browser=cookies_from_browser,
+                cookies_file=cookies_file,
+            )
             if path:
                 meta.local_path = str(path)
             time.sleep(rate_limit_secs)
@@ -452,6 +511,29 @@ def parse_args() -> argparse.Namespace:
         help="Fetch full per-video metadata (slower, more complete).",
     )
 
+    # Authentication (bypass YouTube bot-detection)
+    auth_group = p.add_mutually_exclusive_group()
+    auth_group.add_argument(
+        "--cookies-from-browser",
+        dest="cookies_from_browser",
+        metavar="BROWSER",
+        help=(
+            "Pass cookies from a browser to bypass YouTube bot-detection. "
+            "BROWSER can be: chrome, chromium, firefox, safari, edge, opera, "
+            "brave, vivaldi.  The browser must be installed and you must be "
+            "logged in to YouTube in it."
+        ),
+    )
+    auth_group.add_argument(
+        "--cookies",
+        dest="cookies_file",
+        metavar="FILE",
+        help=(
+            "Path to a Netscape-format cookies.txt file (e.g. exported with "
+            "the 'Get cookies.txt LOCALLY' browser extension)."
+        ),
+    )
+
     # Misc
     p.add_argument(
         "--verbose", action="store_true",
@@ -485,6 +567,14 @@ def main() -> None:
     # Ensure yt-dlp is available
     _ensure_yt_dlp()
 
+    # Warn if no auth method provided (bot-detection is likely)
+    if not args.cookies_from_browser and not args.cookies_file:
+        log.warning(
+            "No authentication provided. YouTube may block requests with "
+            "'Sign in to confirm you're not a bot'. "
+            "Use --cookies-from-browser BROWSER or --cookies FILE to fix this."
+        )
+
     # Run the crawl
     crawl(
         queries=queries,
@@ -497,6 +587,8 @@ def main() -> None:
         workers=args.workers,
         rate_limit_secs=args.rate_limit_secs,
         enrich=args.enrich,
+        cookies_from_browser=args.cookies_from_browser,
+        cookies_file=args.cookies_file,
     )
 
 
