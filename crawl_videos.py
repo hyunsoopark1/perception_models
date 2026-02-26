@@ -97,21 +97,29 @@ def _import_yt_dlp():
 def _base_ydl_opts(
     cookies_from_browser: Optional[str] = None,
     cookies_file: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
 ) -> dict:
     """Return common yt-dlp options shared across search, enrich, and download.
 
-    Authentication options (cookies_from_browser / cookies_file) bypass
-    YouTube's bot-detection challenge.  Pass at most one of them.
+    Authentication priority (only one cookie method is applied):
+      1. cookies_from_browser – pull live cookies from an installed browser
+      2. cookies_file         – load a pre-exported Netscape cookies.txt
+      3. username + password  – site credential login (NOT supported by YouTube;
+                                works on Vimeo, Dailymotion, and other sites)
 
     Parameters
     ----------
     cookies_from_browser:
         Browser name to pull cookies from, e.g. ``"chrome"``, ``"firefox"``,
-        ``"safari"``, ``"edge"``.  Requires the browser to be installed and
-        the user to be logged in to YouTube in that browser.
+        ``"safari"``, ``"edge"``.
     cookies_file:
-        Path to a Netscape-format cookies.txt file exported from the browser
-        (e.g. via the *Get cookies.txt LOCALLY* extension).
+        Path to a Netscape-format cookies.txt file.
+    username:
+        Account username / e-mail for sites that support credential login.
+        YouTube does NOT support this – use a cookies option instead.
+    password:
+        Account password paired with *username*.
     """
     opts: dict = {
         "quiet": True,
@@ -128,9 +136,13 @@ def _base_ydl_opts(
     if cookies_from_browser:
         opts["cookiesfrombrowser"] = (cookies_from_browser,)
         log.debug("Using cookies from browser: %s", cookies_from_browser)
-    if cookies_file:
+    elif cookies_file:
         opts["cookiefile"] = cookies_file
         log.debug("Using cookies file: %s", cookies_file)
+    elif username:
+        opts["username"] = username
+        opts["password"] = password or ""
+        log.debug("Using username/password auth for user: %s", username)
     return opts
 
 
@@ -145,6 +157,8 @@ def search_videos(
     min_duration: Optional[int] = None,
     cookies_from_browser: Optional[str] = None,
     cookies_file: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
 ) -> list[VideoMeta]:
     """Return a list of VideoMeta objects matching *query*.
 
@@ -156,12 +170,14 @@ def search_videos(
     min_duration:         Skip videos shorter than this many seconds.
     cookies_from_browser: Browser name to pull cookies from (e.g. "chrome").
     cookies_file:         Path to a Netscape-format cookies.txt file.
+    username:             Site credential login (not supported by YouTube).
+    password:             Password paired with username.
     """
     yt_dlp = _import_yt_dlp()
 
     search_url = f"ytsearch{max_results}:{query}"
 
-    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file)
+    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file, username, password)
     ydl_opts.update({
         "extract_flat": "in_playlist",  # fast: fetch only metadata
         "skip_download": True,
@@ -219,10 +235,12 @@ def enrich_metadata(
     meta: VideoMeta,
     cookies_from_browser: Optional[str] = None,
     cookies_file: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
 ) -> VideoMeta:
     """Fetch full metadata for a single video (fills description, tags, etc.)."""
     yt_dlp = _import_yt_dlp()
-    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file)
+    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file, username, password)
     ydl_opts["skip_download"] = True
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -253,6 +271,8 @@ def _download_video(
     retries: int = 3,
     cookies_from_browser: Optional[str] = None,
     cookies_file: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
 ) -> Optional[Path]:
     """Download a single video and return its local path.
 
@@ -265,7 +285,7 @@ def _download_video(
 
     outtmpl = str(video_dir / "%(id)s.%(ext)s")
 
-    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file)
+    ydl_opts = _base_ydl_opts(cookies_from_browser, cookies_file, username, password)
     ydl_opts.update({
         "format": format_spec,
         "outtmpl": outtmpl,
@@ -345,6 +365,8 @@ def crawl(
     enrich: bool = False,
     cookies_from_browser: Optional[str] = None,
     cookies_file: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
 ) -> None:
     """Crawl videos for all *queries* and write metadata (+ optional videos).
 
@@ -362,6 +384,8 @@ def crawl(
     enrich:               Fetch full metadata for each video.
     cookies_from_browser: Browser name to pull cookies from (e.g. "chrome").
     cookies_file:         Path to a Netscape-format cookies.txt file.
+    username:             Site credential login (not supported by YouTube).
+    password:             Password paired with username.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "metadata.jsonl"
@@ -380,6 +404,8 @@ def crawl(
             min_duration=min_duration,
             cookies_from_browser=cookies_from_browser,
             cookies_file=cookies_file,
+            username=username,
+            password=password,
         )
         new = [m for m in results if m.video_id not in done_ids]
         log.info("  %d new videos (skipping %d already done)",
@@ -404,6 +430,8 @@ def crawl(
                 m,
                 cookies_from_browser=cookies_from_browser,
                 cookies_file=cookies_file,
+                username=username,
+                password=password,
             )
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -422,6 +450,8 @@ def crawl(
                 meta, output_dir, format_spec,
                 cookies_from_browser=cookies_from_browser,
                 cookies_file=cookies_file,
+                username=username,
+                password=password,
             )
             if path:
                 meta.local_path = str(path)
@@ -512,16 +542,18 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Authentication (bypass YouTube bot-detection)
+    # --cookies-from-browser / --cookies are mutually exclusive cookie methods.
+    # --username / --password work on many sites but NOT on YouTube.
     auth_group = p.add_mutually_exclusive_group()
     auth_group.add_argument(
         "--cookies-from-browser",
         dest="cookies_from_browser",
         metavar="BROWSER",
         help=(
-            "Pass cookies from a browser to bypass YouTube bot-detection. "
-            "BROWSER can be: chrome, chromium, firefox, safari, edge, opera, "
-            "brave, vivaldi.  The browser must be installed and you must be "
-            "logged in to YouTube in it."
+            "Pull live cookies from an installed browser session to authenticate. "
+            "BROWSER: chrome, chromium, firefox, safari, edge, opera, brave, vivaldi. "
+            "You must be logged in to YouTube in that browser. "
+            "Recommended for YouTube."
         ),
     )
     auth_group.add_argument(
@@ -530,8 +562,26 @@ def parse_args() -> argparse.Namespace:
         metavar="FILE",
         help=(
             "Path to a Netscape-format cookies.txt file (e.g. exported with "
-            "the 'Get cookies.txt LOCALLY' browser extension)."
+            "the 'Get cookies.txt LOCALLY' browser extension). "
+            "Recommended for YouTube."
         ),
+    )
+    auth_group.add_argument(
+        "--username",
+        dest="username",
+        metavar="USER",
+        help=(
+            "Account username/e-mail for sites that support credential login "
+            "(Vimeo, Dailymotion, etc.). "
+            "WARNING: YouTube dropped username/password support – use "
+            "--cookies-from-browser or --cookies instead."
+        ),
+    )
+    p.add_argument(
+        "--password",
+        dest="password",
+        metavar="PASS",
+        help="Password paired with --username (only used when --username is set).",
     )
 
     # Misc
@@ -567,8 +617,18 @@ def main() -> None:
     # Ensure yt-dlp is available
     _ensure_yt_dlp()
 
-    # Warn if no auth method provided (bot-detection is likely)
-    if not args.cookies_from_browser and not args.cookies_file:
+    # Validate --password requires --username
+    if args.password and not args.username:
+        log.error("--password requires --username.")
+        sys.exit(1)
+
+    # Warn appropriately based on auth method chosen
+    if args.username:
+        log.warning(
+            "Username/password auth is NOT supported by YouTube. "
+            "If you are crawling YouTube, use --cookies-from-browser or --cookies."
+        )
+    elif not args.cookies_from_browser and not args.cookies_file:
         log.warning(
             "No authentication provided. YouTube may block requests with "
             "'Sign in to confirm you're not a bot'. "
@@ -589,6 +649,8 @@ def main() -> None:
         enrich=args.enrich,
         cookies_from_browser=args.cookies_from_browser,
         cookies_file=args.cookies_file,
+        username=getattr(args, "username", None),
+        password=getattr(args, "password", None),
     )
 
 
