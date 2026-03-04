@@ -727,11 +727,6 @@ def main() -> None:
         config_file = cli.pop("config")
         base_cfg = OmegaConf.load(config_file)
     else:
-        base_cfg = OmegaConf.merge(
-            OmegaConf.structured(ModelArgs()),
-            OmegaConf.structured(DataArgs()),
-            OmegaConf.structured(TrainArgs()),
-        )
         base_cfg = OmegaConf.create({
             "model": OmegaConf.structured(ModelArgs()),
             "data": OmegaConf.structured(DataArgs()),
