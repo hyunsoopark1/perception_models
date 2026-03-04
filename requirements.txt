@@ -31,3 +31,8 @@ fsspec
 datatrove
 ftfy
 transformers>=4.48.0
+# Llama Korean fine-tuning dependencies
+peft>=0.10.0
+accelerate>=0.28.0
+bitsandbytes>=0.43.0
+datasets>=2.18.0
