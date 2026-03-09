@@ -66,6 +66,11 @@ class BBoxPrompt:
         w, h = self.image_size
         return x1 / w, y1 / h, x2 / w, y2 / h
 
+    def crop(self, pil_image):
+        """Return the bbox region cropped from a PIL image."""
+        x1, y1, x2, y2 = self.pixel_coords
+        return pil_image.crop((x1, y1, x2, y2))
+
 
 # ---------------------------------------------------------------------------
 # Patch selection utilities
@@ -322,6 +327,9 @@ def _parse_args():
                    help="Path to a local .pt checkpoint (skips HF download)")
     p.add_argument("--no-pretrained", action="store_true",
                    help="Skip loading pretrained weights (for quick smoke tests)")
+    p.add_argument("--crop-out", type=str, default=None,
+                   metavar="PATH",
+                   help="Save the cropped bbox region to this file (PNG/JPEG).")
     return p.parse_args()
 
 
@@ -350,6 +358,7 @@ if __name__ == "__main__":
         img_tensor = preprocess(pil_img)
         print(f"Loaded image: {args.image}  ({img_w}x{img_h} px)")
     else:
+        pil_img = None
         if args.image_size is None:
             raise SystemExit("--image-size WIDTH HEIGHT is required when --image is omitted.")
         img_w, img_h = args.image_size
@@ -364,6 +373,15 @@ if __name__ == "__main__":
     print(f"BBox (pixels)    : x1={bbox.pixel_coords[0]}, y1={bbox.pixel_coords[1]}, "
           f"x2={bbox.pixel_coords[2]}, y2={bbox.pixel_coords[3]}")
     print(f"BBox (normalized): x1={nx1:.4f}, y1={ny1:.4f}, x2={nx2:.4f}, y2={ny2:.4f}")
+
+    # -- Crop and save bbox region --
+    if args.crop_out is not None:
+        if pil_img is None:
+            print("Warning: --crop-out skipped (no source image provided).")
+        else:
+            crop = bbox.crop(pil_img)
+            crop.save(args.crop_out)
+            print(f"Crop saved : {args.crop_out}  ({crop.width}x{crop.height} px)")
 
     # -- Extract feature --
     feat = model.encode(img_tensor, bbox)
