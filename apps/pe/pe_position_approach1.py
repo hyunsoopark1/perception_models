@@ -232,8 +232,8 @@ class PEBBoxFeatureExtractor(nn.Module):
         self,
         images: torch.Tensor,    # [B, C, H, W]
         bboxes: list[BBoxPrompt],
-    ) -> torch.Tensor:           # [B, D]
-        """Returns L2-normalized bbox-aware feature embeddings."""
+    ) -> torch.Tensor:           # [B, output_dim]
+        """Returns L2-normalized bbox-aware feature embeddings in CLIP output_dim space."""
         B = images.shape[0]
         assert len(bboxes) == B, "One bbox per image required"
 
@@ -251,7 +251,14 @@ class PEBBoxFeatureExtractor(nn.Module):
         for b, q in enumerate(query_list):
             query_padded[b, : q.shape[0]] = q
 
-        embeds = self.cross_attn_head(query_padded, all_tokens)  # [B, D]
+        embeds = self.cross_attn_head(query_padded, all_tokens)  # [B, width]
+
+        # Project into the shared CLIP embedding space (width → output_dim),
+        # mirroring VisionTransformer.forward() which applies self.proj after pooling.
+        # If no projection exists (proj_dim is None), width == output_dim already.
+        if hasattr(self.encoder, "proj") and self.encoder.proj is not None:
+            embeds = embeds @ self.encoder.proj                  # [B, output_dim]
+
         return F.normalize(embeds, dim=-1)
 
     # ------------------------------------------------------------------
@@ -423,31 +430,23 @@ if __name__ == "__main__":
 
     # -- Text comparison --
     if args.text is not None:
-        if pil_img is None:
-            print("\nWarning: --text comparison skipped (no source image provided).")
-        else:
-            from core.vision_encoder.transforms import get_text_tokenizer
+        from core.vision_encoder.transforms import get_text_tokenizer
 
-            print("\n--- Text Comparison (cosine similarity) ---")
+        print("\n--- Text Comparison (cosine similarity) ---")
 
-            # Encode the bbox crop through CLIP's image encoder (→ output_dim space)
-            crop_pil = bbox.crop(pil_img)
-            crop_tensor = preprocess(crop_pil).unsqueeze(0).to(device)
-            with torch.no_grad():
-                crop_feat = clip_model.encode_image(crop_tensor, normalize=True)  # [1, D]
+        # feat is already in the shared CLIP output_dim space (via encoder.proj).
+        # Tokenize and encode all text phrases into the same space.
+        tokenizer = get_text_tokenizer(clip_model.context_length)
+        tokens = tokenizer(args.text).to(device)                        # [T, L]
+        with torch.no_grad():
+            text_feats = clip_model.encode_text(tokens, normalize=True) # [T, output_dim]
 
-            # Tokenize and encode all text phrases
-            tokenizer = get_text_tokenizer(clip_model.context_length)
-            tokens = tokenizer(args.text).to(device)          # [T, L]
-            with torch.no_grad():
-                text_feats = clip_model.encode_text(tokens, normalize=True)   # [T, D]
+        # Cosine similarity: feat · text_feats^T  (both L2-normalised)
+        sims = (feat.unsqueeze(0) @ text_feats.T).squeeze(0)            # [T]
+        logit_scale = clip_model.logit_scale.exp().item()
 
-            # Cosine similarity: crop_feat · text_feats^T
-            sims = (crop_feat @ text_feats.T).squeeze(0)     # [T]
-            logit_scale = clip_model.logit_scale.exp().item()
-
-            col_w = max(len(t) for t in args.text) + 2
-            print(f"  {'Phrase':<{col_w}}  cosine sim   logit-scaled")
-            print(f"  {'-'*col_w}  ----------   ------------")
-            for phrase, sim in zip(args.text, sims.tolist()):
-                print(f"  {phrase:<{col_w}}  {sim:+.4f}       {sim * logit_scale:+.4f}")
+        col_w = max(len(t) for t in args.text) + 2
+        print(f"  {'Phrase':<{col_w}}  cosine sim   logit-scaled")
+        print(f"  {'-'*col_w}  ----------   ------------")
+        for phrase, sim in zip(args.text, sims.tolist()):
+            print(f"  {phrase:<{col_w}}  {sim:+.4f}       {sim * logit_scale:+.4f}")
