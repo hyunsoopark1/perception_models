@@ -55,10 +55,15 @@ class BBoxPrompt:
         pixel_coords  = (x1, y1, x2, y2)  in pixels
         image_size    = (width, height)    of the original image
 
+    Coordinates are auto-sorted so x1 ≤ x2 and y1 ≤ y2.
     Call `.normalized()` to get coords in [0, 1] for patch selection.
     """
     pixel_coords: Tuple[int, int, int, int]   # (x1, y1, x2, y2) in pixels
     image_size:   Tuple[int, int]             # (width, height) of source image
+
+    def __post_init__(self):
+        x1, y1, x2, y2 = self.pixel_coords
+        self.pixel_coords = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
 
     def normalized(self) -> Tuple[float, float, float, float]:
         """Return (x1, y1, x2, y2) normalized to [0, 1]."""
@@ -273,6 +278,7 @@ def load_pe_extractor(
     checkpoint_path: Optional[str] = None,
     num_heads: int = 8,
     device: Optional[torch.device] = None,
+    vision_encoder=None,
 ) -> PEBBoxFeatureExtractor:
     """
     Load a PE vision encoder and wrap it in PEBBoxFeatureExtractor.
@@ -283,25 +289,27 @@ def load_pe_extractor(
         checkpoint_path : local .pt path; overrides HF download when set
         num_heads       : cross-attention heads (must divide model width)
         device          : target device (defaults to cuda if available)
+        vision_encoder  : pre-built VisionTransformer; skips loading when set
     """
     from core.vision_encoder.pe import VisionTransformer
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"Loading {model_name} (pretrained={pretrained}) …")
-    vision_enc = VisionTransformer.from_config(
-        model_name,
-        pretrained=pretrained,
-        checkpoint_path=checkpoint_path,
-    )
-    vision_enc = vision_enc.to(device).eval()
+    if vision_encoder is None:
+        print(f"Loading {model_name} (pretrained={pretrained}) …")
+        vision_encoder = VisionTransformer.from_config(
+            model_name,
+            pretrained=pretrained,
+            checkpoint_path=checkpoint_path,
+        )
+        vision_encoder = vision_encoder.to(device).eval()
 
-    model = PEBBoxFeatureExtractor(vision_enc, num_heads=num_heads).to(device)
+    model = PEBBoxFeatureExtractor(vision_encoder, num_heads=num_heads).to(device)
     print(
-        f"  image_size={vision_enc.image_size}, "
-        f"patch_size={vision_enc.patch_size}, "
-        f"width={vision_enc.width}"
+        f"  image_size={vision_encoder.image_size}, "
+        f"patch_size={vision_encoder.patch_size}, "
+        f"width={vision_encoder.width}"
     )
     return model
 
@@ -330,6 +338,10 @@ def _parse_args():
     p.add_argument("--crop-out", type=str, default=None,
                    metavar="PATH",
                    help="Save the cropped bbox region to this file (PNG/JPEG).")
+    p.add_argument("--text", type=str, nargs="+", default=None,
+                   metavar="PHRASE",
+                   help="One or more text phrases to compare with the bbox region "
+                        "via cosine similarity (requires --image).")
     return p.parse_args()
 
 
@@ -339,13 +351,28 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pretrained = not args.no_pretrained
 
-    # -- Load model --
-    model = load_pe_extractor(
-        model_name=args.model,
-        pretrained=pretrained,
-        checkpoint_path=args.checkpoint,
-        device=device,
-    )
+    # -- Load model (CLIP when text comparison is requested, VisionTransformer otherwise) --
+    clip_model = None
+    if args.text is not None:
+        from core.vision_encoder.pe import CLIP
+        print(f"Loading {args.model} (pretrained={pretrained}) …")
+        clip_model = CLIP.from_config(
+            args.model,
+            pretrained=pretrained,
+            checkpoint_path=args.checkpoint,
+        ).to(device).eval()
+        model = load_pe_extractor(
+            model_name=args.model,
+            device=device,
+            vision_encoder=clip_model.visual,
+        )
+    else:
+        model = load_pe_extractor(
+            model_name=args.model,
+            pretrained=pretrained,
+            checkpoint_path=args.checkpoint,
+            device=device,
+        )
 
     # -- Prepare image --
     from core.vision_encoder import transforms as pe_transforms
@@ -388,3 +415,34 @@ if __name__ == "__main__":
     print(f"\nFeature shape : {feat.shape}")
     print(f"L2 norm (≈1.0): {feat.norm().item():.6f}")
     print(f"First 8 values: {feat[:8].tolist()}")
+
+    # -- Text comparison --
+    if args.text is not None:
+        if pil_img is None:
+            print("\nWarning: --text comparison skipped (no source image provided).")
+        else:
+            from core.vision_encoder.transforms import get_text_tokenizer
+
+            print("\n--- Text Comparison (cosine similarity) ---")
+
+            # Encode the bbox crop through CLIP's image encoder (→ output_dim space)
+            crop_pil = bbox.crop(pil_img)
+            crop_tensor = preprocess(crop_pil).unsqueeze(0).to(device)
+            with torch.no_grad():
+                crop_feat = clip_model.encode_image(crop_tensor, normalize=True)  # [1, D]
+
+            # Tokenize and encode all text phrases
+            tokenizer = get_text_tokenizer(clip_model.context_length)
+            tokens = tokenizer(args.text).to(device)          # [T, L]
+            with torch.no_grad():
+                text_feats = clip_model.encode_text(tokens, normalize=True)   # [T, D]
+
+            # Cosine similarity: crop_feat · text_feats^T
+            sims = (crop_feat @ text_feats.T).squeeze(0)     # [T]
+            logit_scale = clip_model.logit_scale.exp().item()
+
+            col_w = max(len(t) for t in args.text) + 2
+            print(f"  {'Phrase':<{col_w}}  cosine sim   logit-scaled")
+            print(f"  {'-'*col_w}  ----------   ------------")
+            for phrase, sim in zip(args.text, sims.tolist()):
+                print(f"  {phrase:<{col_w}}  {sim:+.4f}       {sim * logit_scale:+.4f}")
