@@ -5,14 +5,16 @@ Patch Token Selection + Cross-Attention (no retraining of PE required)
 Usage (bbox feature extraction):
     python apps/pe/pe_position_approach1.py \
         --image apps/pe/docs/assets/cat.png \
-        --bbox 50 30 400 300 \
+        --bbox 50 30 350 270 \
         --model PE-Core-G14-448
 
     # Without an image (smoke test), supply original image dimensions:
     python apps/pe/pe_position_approach1.py \
-        --bbox 50 30 400 300 \
+        --bbox 50 30 350 270 \
         --image-size 640 480 \
         --no-pretrained
+
+    # --bbox takes X Y W H (top-left corner + width + height)
 
 Available models:
     PE-Core-G14-448  (width=1536, patch=14, image=448)
@@ -52,18 +54,19 @@ class BBoxPrompt:
     """
     Bounding box in pixel coordinates of the original (pre-resize) image.
 
-        pixel_coords  = (x1, y1, x2, y2)  in pixels
-        image_size    = (width, height)    of the original image
+        pixel_coords  = (x, y, w, h)    top-left corner + width/height in pixels
+        image_size    = (width, height) of the original image
 
-    Coordinates are auto-sorted so x1 ≤ x2 and y1 ≤ y2.
-    Call `.normalized()` to get coords in [0, 1] for patch selection.
+    Internally converts to (x1, y1, x2, y2) for patch selection and cropping.
+    Call `.normalized()` to get (x1, y1, x2, y2) in [0, 1].
     """
-    pixel_coords: Tuple[int, int, int, int]   # (x1, y1, x2, y2) in pixels
+    pixel_coords: Tuple[int, int, int, int]   # (x, y, w, h) in pixels
     image_size:   Tuple[int, int]             # (width, height) of source image
 
     def __post_init__(self):
-        x1, y1, x2, y2 = self.pixel_coords
-        self.pixel_coords = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        x, y, w, h = self.pixel_coords
+        # Store as (x1, y1, x2, y2) internally; abs() tolerates negative w/h
+        self.pixel_coords = (x, y, x + abs(w), y + abs(h))
 
     def normalized(self) -> Tuple[float, float, float, float]:
         """Return (x1, y1, x2, y2) normalized to [0, 1]."""
@@ -324,8 +327,8 @@ def _parse_args():
                    help="Path to an image file (PNG/JPEG). "
                         "If omitted, --image-size must be provided.")
     p.add_argument("--bbox", type=int, nargs=4,
-                   metavar=("X1", "Y1", "X2", "Y2"), required=True,
-                   help="Bounding box in pixel coordinates of the original image.")
+                   metavar=("X", "Y", "W", "H"), required=True,
+                   help="Bounding box as top-left corner + size: X Y W H in pixels.")
     p.add_argument("--image-size", type=int, nargs=2,
                    metavar=("WIDTH", "HEIGHT"), default=None,
                    help="Original image size in pixels (required when --image is omitted).")
@@ -395,10 +398,12 @@ if __name__ == "__main__":
     img_tensor = img_tensor.to(device)
 
     # -- Build bbox prompt --
-    bbox = BBoxPrompt(pixel_coords=tuple(args.bbox), image_size=(img_w, img_h))
+    x, y, w, h = args.bbox
+    bbox = BBoxPrompt(pixel_coords=(x, y, w, h), image_size=(img_w, img_h))
+    x1, y1, x2, y2 = bbox.pixel_coords
     nx1, ny1, nx2, ny2 = bbox.normalized()
-    print(f"BBox (pixels)    : x1={bbox.pixel_coords[0]}, y1={bbox.pixel_coords[1]}, "
-          f"x2={bbox.pixel_coords[2]}, y2={bbox.pixel_coords[3]}")
+    print(f"BBox (xywh)      : x={x}, y={y}, w={w}, h={h}")
+    print(f"BBox (xyxy)      : x1={x1}, y1={y1}, x2={x2}, y2={y2}")
     print(f"BBox (normalized): x1={nx1:.4f}, y1={ny1:.4f}, x2={nx2:.4f}, y2={ny2:.4f}")
 
     # -- Crop and save bbox region --
