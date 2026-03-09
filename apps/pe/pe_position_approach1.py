@@ -5,8 +5,14 @@ Patch Token Selection + Cross-Attention (no retraining of PE required)
 Usage (bbox feature extraction):
     python apps/pe/pe_position_approach1.py \
         --image apps/pe/docs/assets/cat.png \
-        --bbox 0.1 0.1 0.6 0.6 \
+        --bbox 50 30 400 300 \
         --model PE-Core-G14-448
+
+    # Without an image (smoke test), supply original image dimensions:
+    python apps/pe/pe_position_approach1.py \
+        --bbox 50 30 400 300 \
+        --image-size 640 480 \
+        --no-pretrained
 
 Available models:
     PE-Core-G14-448  (width=1536, patch=14, image=448)
@@ -44,10 +50,21 @@ _PE_WIDTH = {
 @dataclass
 class BBoxPrompt:
     """
-    Bounding box in normalized image coordinates [0, 1].
-        coords = (x1, y1, x2, y2)
+    Bounding box in pixel coordinates of the original (pre-resize) image.
+
+        pixel_coords  = (x1, y1, x2, y2)  in pixels
+        image_size    = (width, height)    of the original image
+
+    Call `.normalized()` to get coords in [0, 1] for patch selection.
     """
-    coords: Tuple[float, float, float, float]
+    pixel_coords: Tuple[int, int, int, int]   # (x1, y1, x2, y2) in pixels
+    image_size:   Tuple[int, int]             # (width, height) of source image
+
+    def normalized(self) -> Tuple[float, float, float, float]:
+        """Return (x1, y1, x2, y2) normalized to [0, 1]."""
+        x1, y1, x2, y2 = self.pixel_coords
+        w, h = self.image_size
+        return x1 / w, y1 / h, x2 / w, y2 / h
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +91,7 @@ def select_bbox_patches(
     Returns indices of patches whose centers fall inside the bounding box.
     Raises ValueError if the box selects no patches.
     """
-    x1, y1, x2, y2 = bbox.coords
+    x1, y1, x2, y2 = bbox.normalized()
     mask = (
         (patch_grid[:, 0] >= x1) & (patch_grid[:, 0] <= x2) &
         (patch_grid[:, 1] >= y1) & (patch_grid[:, 1] <= y2)
@@ -82,8 +99,9 @@ def select_bbox_patches(
     indices = mask.nonzero(as_tuple=True)[0]
     if len(indices) == 0:
         raise ValueError(
-            f"No patches selected for bbox {bbox.coords}. "
-            "Check that coordinates are in [0, 1] and x2 > x1, y2 > y1."
+            f"No patches selected for bbox {bbox.pixel_coords} "
+            f"(normalized: {bbox.normalized()}). "
+            "Check that x2 > x1 and y2 > y1 in pixel coordinates."
         )
     return indices
 
@@ -289,14 +307,16 @@ def load_pe_extractor(
 
 def _parse_args():
     p = argparse.ArgumentParser(description="Extract bbox features with PE")
-    p.add_argument("--image",  type=str, default=None,
+    p.add_argument("--image", type=str, default=None,
                    help="Path to an image file (PNG/JPEG). "
-                        "If omitted a random tensor is used for testing.")
-    p.add_argument("--bbox",   type=float, nargs=4,
-                   metavar=("X1", "Y1", "X2", "Y2"),
-                   default=[0.2, 0.2, 0.7, 0.7],
-                   help="Bounding box in normalized [0,1] coords (default: 0.2 0.2 0.7 0.7)")
-    p.add_argument("--model",  type=str, default="PE-Core-G14-448",
+                        "If omitted, --image-size must be provided.")
+    p.add_argument("--bbox", type=int, nargs=4,
+                   metavar=("X1", "Y1", "X2", "Y2"), required=True,
+                   help="Bounding box in pixel coordinates of the original image.")
+    p.add_argument("--image-size", type=int, nargs=2,
+                   metavar=("WIDTH", "HEIGHT"), default=None,
+                   help="Original image size in pixels (required when --image is omitted).")
+    p.add_argument("--model", type=str, default="PE-Core-G14-448",
                    choices=list(_PE_WIDTH.keys()))
     p.add_argument("--checkpoint", type=str, default=None,
                    help="Path to a local .pt checkpoint (skips HF download)")
@@ -325,19 +345,25 @@ if __name__ == "__main__":
 
     if args.image is not None:
         from PIL import Image as PILImage
-        img_tensor = preprocess(PILImage.open(args.image).convert("RGB"))
-        print(f"Loaded image: {args.image}")
+        pil_img = PILImage.open(args.image).convert("RGB")
+        img_w, img_h = pil_img.size
+        img_tensor = preprocess(pil_img)
+        print(f"Loaded image: {args.image}  ({img_w}x{img_h} px)")
     else:
-        # Random tensor for a smoke test (no real image needed)
+        if args.image_size is None:
+            raise SystemExit("--image-size WIDTH HEIGHT is required when --image is omitted.")
+        img_w, img_h = args.image_size
         img_tensor = torch.randn(3, model.encoder.image_size, model.encoder.image_size)
-        print("No image provided — using random tensor for smoke test")
+        print(f"No image provided — using random tensor (declared size: {img_w}x{img_h} px)")
 
     img_tensor = img_tensor.to(device)
 
     # -- Build bbox prompt --
-    bbox = BBoxPrompt(coords=tuple(args.bbox))
-    print(f"BBox (normalized): x1={bbox.coords[0]}, y1={bbox.coords[1]}, "
-          f"x2={bbox.coords[2]}, y2={bbox.coords[3]}")
+    bbox = BBoxPrompt(pixel_coords=tuple(args.bbox), image_size=(img_w, img_h))
+    nx1, ny1, nx2, ny2 = bbox.normalized()
+    print(f"BBox (pixels)    : x1={bbox.pixel_coords[0]}, y1={bbox.pixel_coords[1]}, "
+          f"x2={bbox.pixel_coords[2]}, y2={bbox.pixel_coords[3]}")
+    print(f"BBox (normalized): x1={nx1:.4f}, y1={ny1:.4f}, x2={nx2:.4f}, y2={ny2:.4f}")
 
     # -- Extract feature --
     feat = model.encode(img_tensor, bbox)
