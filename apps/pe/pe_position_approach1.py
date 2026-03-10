@@ -16,6 +16,18 @@ Usage (bbox feature extraction):
 
     # --bbox takes X Y W H (top-left corner + width + height)
 
+Usage (distillation training from crop.txt):
+    python apps/pe/pe_position_approach1.py \
+        --train \
+        --data-dir /path/to/images \
+        --ann-file crop.txt \
+        --head-checkpoint head.pt \
+        --epochs 10 --lr 1e-4 --batch-size 32
+
+    # crop.txt format (one entry per line):
+    #   image_name.jpg  x  y  w  h
+    # e.g.: aisol_1x4_2026-01-08_sync000_cam1_000000.jpg 509 189 183 276
+
 Available models:
     PE-Core-G14-448  (width=1536, patch=14, image=448)
     PE-Core-L14-336  (width=1024, patch=14, image=336)
@@ -166,13 +178,34 @@ def _collate_distillation(batch):
 
 def load_distillation_annotations(ann_file: str) -> list:
     """
-    Parse annotation JSON into a list of {"file_name", "bbox"} dicts.
+    Parse an annotation file into a list of {"file_name", "bbox"} dicts.
 
     Supports:
-      - Plain list : [{"file_name": str, "bbox": [x,y,w,h]}, ...]
-      - COCO format: {"images": [...], "annotations": [...]}
+      - .txt (whitespace-separated): ``image_name.jpg  x  y  w  h``  (one per line)
+      - .json plain list : [{"file_name": str, "bbox": [x,y,w,h]}, ...]
+      - .json COCO format: {"images": [...], "annotations": [...]}
+
+    Blank lines and lines starting with '#' are ignored in .txt files.
     """
-    with open(ann_file) as f:
+    path = Path(ann_file)
+    if path.suffix.lower() == ".txt":
+        anns = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) != 5:
+                    raise ValueError(
+                        f"Expected 'image_name x y w h' but got: {line!r}"
+                    )
+                name, x, y, w, h = parts
+                anns.append({"file_name": name, "bbox": [int(x), int(y), int(w), int(h)]})
+        return anns
+
+    # JSON formats
+    with open(path) as f:
         data = json.load(f)
     if isinstance(data, list):
         return data
@@ -487,8 +520,9 @@ def _parse_args():
                    help="Run distillation training instead of inference.")
     p.add_argument("--data-dir", type=str, default=None, metavar="DIR",
                    help="Root directory containing training images.")
-    p.add_argument("--ann-file", type=str, default=None, metavar="JSON",
-                   help="Annotation JSON (plain list or COCO format).")
+    p.add_argument("--ann-file", type=str, default=None, metavar="FILE",
+                   help="Annotation file: .txt with 'image_name x y w h' per line, "
+                        "or .json (plain list or COCO format).")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--batch-size", type=int, default=32)
