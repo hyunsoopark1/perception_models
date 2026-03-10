@@ -23,6 +23,7 @@ Available models:
 """
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image as PILImage
 
 # ---------------------------------------------------------------------------
 # PE model configs (width per model name)
@@ -117,6 +119,120 @@ def select_bbox_patches(
             "Check that x2 > x1 and y2 > y1 in pixel coordinates."
         )
     return indices
+
+
+# ---------------------------------------------------------------------------
+# Distillation dataset
+# ---------------------------------------------------------------------------
+
+class BBoxDistillationDataset(torch.utils.data.Dataset):
+    """
+    Loads (image_tensor, BBoxPrompt, crop_tensor) triples for distillation.
+
+    annotations: list of dicts with keys:
+        "file_name" : str   path relative to image_dir
+        "bbox"      : [x, y, w, h]  top-left + size in pixels
+
+    Accepts COCO-format JSON (with "images"/"annotations" keys) or a plain
+    list JSON via :func:`load_distillation_annotations`.
+    """
+
+    def __init__(self, image_dir: str, annotations: list,
+                 image_transform, crop_transform):
+        self.image_dir       = Path(image_dir)
+        self.anns            = annotations
+        self.image_transform = image_transform
+        self.crop_transform  = crop_transform
+
+    def __len__(self) -> int:
+        return len(self.anns)
+
+    def __getitem__(self, idx: int):
+        ann     = self.anns[idx]
+        pil_img = PILImage.open(self.image_dir / ann["file_name"]).convert("RGB")
+        img_w, img_h = pil_img.size
+        x, y, w, h  = ann["bbox"]
+        bbox         = BBoxPrompt(pixel_coords=(x, y, w, h),
+                                  image_size=(img_w, img_h))
+        crop = bbox.crop(pil_img)
+        return self.image_transform(pil_img), bbox, self.crop_transform(crop)
+
+
+def _collate_distillation(batch):
+    """Stack image/crop tensors; keep bboxes as a plain list."""
+    imgs, bboxes, crops = zip(*batch)
+    return torch.stack(imgs), list(bboxes), torch.stack(crops)
+
+
+def load_distillation_annotations(ann_file: str) -> list:
+    """
+    Parse annotation JSON into a list of {"file_name", "bbox"} dicts.
+
+    Supports:
+      - Plain list : [{"file_name": str, "bbox": [x,y,w,h]}, ...]
+      - COCO format: {"images": [...], "annotations": [...]}
+    """
+    with open(ann_file) as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return data
+    # COCO format
+    id_to_fn = {img["id"]: img["file_name"] for img in data["images"]}
+    return [
+        {"file_name": id_to_fn[ann["image_id"]], "bbox": ann["bbox"]}
+        for ann in data["annotations"]
+        if ann["image_id"] in id_to_fn
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Distillation training
+# ---------------------------------------------------------------------------
+
+def train_distillation(
+    model: "PEBBoxFeatureExtractor",
+    clip_model,
+    dataloader,
+    device: torch.device,
+    epochs: int,
+    lr: float,
+    save_path: Optional[str],
+) -> None:
+    """
+    Train PositionCrossAttention via feature distillation.
+
+    Teacher : clip_model.encode_image(crop)   — frozen CLIP crop embedding
+    Student : model(image, bbox)              — cross-attention head output
+    Loss    : 1 - cosine_similarity(student, teacher)  averaged over batch
+    """
+    optimizer = torch.optim.AdamW(model.cross_attn_head.parameters(), lr=lr)
+
+    for epoch in range(epochs):
+        model.train()
+        model.encoder.eval()   # PE stays frozen
+
+        total_loss = 0.0
+        for imgs, bboxes, crops in dataloader:
+            imgs  = imgs.to(device)
+            crops = crops.to(device)
+
+            with torch.no_grad():
+                teacher = clip_model.encode_image(crops, normalize=True)  # [B, D]
+
+            student = model(imgs, bboxes)                                  # [B, D]
+            loss    = (1.0 - F.cosine_similarity(student, teacher)).mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch + 1}/{epochs}  loss={total_loss / len(dataloader):.6f}")
+
+    if save_path is not None:
+        torch.save(model.cross_attn_head.state_dict(), save_path)
+        print(f"Head checkpoint saved → {save_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +402,7 @@ def load_pe_extractor(
     model_name: str = "PE-Core-G14-448",
     pretrained: bool = True,
     checkpoint_path: Optional[str] = None,
+    head_checkpoint_path: Optional[str] = None,
     num_heads: int = 8,
     device: Optional[torch.device] = None,
     vision_encoder=None,
@@ -294,12 +411,13 @@ def load_pe_extractor(
     Load a PE vision encoder and wrap it in PEBBoxFeatureExtractor.
 
     Args:
-        model_name      : one of the PE_VISION_CONFIG keys (see config.py)
-        pretrained      : download weights from HuggingFace if True
-        checkpoint_path : local .pt path; overrides HF download when set
-        num_heads       : cross-attention heads (must divide model width)
-        device          : target device (defaults to cuda if available)
-        vision_encoder  : pre-built VisionTransformer; skips loading when set
+        model_name           : one of the PE_VISION_CONFIG keys (see config.py)
+        pretrained           : download weights from HuggingFace if True
+        checkpoint_path      : local .pt path for PE encoder; overrides HF download
+        head_checkpoint_path : local .pt path for PositionCrossAttention weights
+        num_heads            : attention heads in the cross-attention head
+        device               : target device (defaults to cuda if available)
+        vision_encoder       : pre-built VisionTransformer; skips loading when set
     """
     from core.vision_encoder.pe import VisionTransformer
 
@@ -321,6 +439,12 @@ def load_pe_extractor(
         f"patch_size={vision_encoder.patch_size}, "
         f"width={vision_encoder.width}"
     )
+
+    if head_checkpoint_path is not None:
+        state = torch.load(head_checkpoint_path, map_location=device)
+        model.cross_attn_head.load_state_dict(state)
+        print(f"  Head weights loaded ← {head_checkpoint_path}")
+
     return model
 
 
@@ -330,28 +454,46 @@ def load_pe_extractor(
 
 def _parse_args():
     p = argparse.ArgumentParser(description="Extract bbox features with PE")
-    p.add_argument("--image", type=str, default=None,
-                   help="Path to an image file (PNG/JPEG). "
-                        "If omitted, --image-size must be provided.")
-    p.add_argument("--bbox", type=int, nargs=4,
-                   metavar=("X", "Y", "W", "H"), required=True,
-                   help="Bounding box as top-left corner + size: X Y W H in pixels.")
-    p.add_argument("--image-size", type=int, nargs=2,
-                   metavar=("WIDTH", "HEIGHT"), default=None,
-                   help="Original image size in pixels (required when --image is omitted).")
+
+    # ---- shared ----
     p.add_argument("--model", type=str, default="PE-Core-G14-448",
                    choices=list(_PE_WIDTH.keys()))
     p.add_argument("--checkpoint", type=str, default=None,
-                   help="Path to a local .pt checkpoint (skips HF download)")
-    p.add_argument("--no-pretrained", action="store_true",
-                   help="Skip loading pretrained weights (for quick smoke tests)")
-    p.add_argument("--crop-out", type=str, default=None,
+                   help="Path to a local .pt checkpoint for the PE encoder.")
+    p.add_argument("--head-checkpoint", type=str, default=None,
                    metavar="PATH",
-                   help="Save the cropped bbox region to this file (PNG/JPEG).")
+                   help="Path to save (training) or load (inference) "
+                        "PositionCrossAttention weights.")
+    p.add_argument("--no-pretrained", action="store_true",
+                   help="Skip loading pretrained PE weights (smoke tests).")
+
+    # ---- inference ----
+    p.add_argument("--image", type=str, default=None,
+                   help="Path to an image file (PNG/JPEG).")
+    p.add_argument("--bbox", type=int, nargs=4, default=None,
+                   metavar=("X", "Y", "W", "H"),
+                   help="Bounding box as top-left + size: X Y W H in pixels.")
+    p.add_argument("--image-size", type=int, nargs=2,
+                   metavar=("WIDTH", "HEIGHT"), default=None,
+                   help="Original image size (required when --image is omitted).")
+    p.add_argument("--crop-out", type=str, default=None, metavar="PATH",
+                   help="Save the cropped bbox region to this file.")
     p.add_argument("--text", type=str, nargs="+", default=None,
                    metavar="PHRASE",
-                   help="One or more text phrases to compare with the bbox region "
-                        "via cosine similarity (requires --image).")
+                   help="Text phrases to compare via cosine similarity.")
+
+    # ---- distillation training ----
+    p.add_argument("--train", action="store_true",
+                   help="Run distillation training instead of inference.")
+    p.add_argument("--data-dir", type=str, default=None, metavar="DIR",
+                   help="Root directory containing training images.")
+    p.add_argument("--ann-file", type=str, default=None, metavar="JSON",
+                   help="Annotation JSON (plain list or COCO format).")
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--num-workers", type=int, default=4)
+
     return p.parse_args()
 
 
@@ -360,38 +502,71 @@ if __name__ == "__main__":
 
     torch.manual_seed(0)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pretrained = not args.no_pretrained
 
-    # -- Load model (CLIP when text comparison is requested, VisionTransformer otherwise) --
-    clip_model = None
-    if args.text is not None:
-        from core.vision_encoder.pe import CLIP
-        print(f"Loading {args.model} (pretrained={pretrained}) …")
-        clip_model = CLIP.from_config(
-            args.model,
-            pretrained=pretrained,
-            checkpoint_path=args.checkpoint,
-        ).to(device).eval()
-        model = load_pe_extractor(
-            model_name=args.model,
-            device=device,
-            vision_encoder=clip_model.visual,
-        )
-    else:
-        model = load_pe_extractor(
-            model_name=args.model,
-            pretrained=pretrained,
-            checkpoint_path=args.checkpoint,
-            device=device,
-        )
-
-    # -- Prepare image --
     from core.vision_encoder import transforms as pe_transforms
+    from core.vision_encoder.pe import CLIP
+
+    # CLIP is always needed (distillation teacher or text comparison)
+    print(f"Loading {args.model} (pretrained={pretrained}) …")
+    clip_model = CLIP.from_config(
+        args.model,
+        pretrained=pretrained,
+        checkpoint_path=args.checkpoint,
+    ).to(device).eval()
+
+    model = load_pe_extractor(
+        model_name=args.model,
+        device=device,
+        vision_encoder=clip_model.visual,
+        head_checkpoint_path=args.head_checkpoint if not args.train else None,
+    )
+
     preprocess = pe_transforms.get_image_transform(model.encoder.image_size)
 
+    # ------------------------------------------------------------------
+    # Training mode
+    # ------------------------------------------------------------------
+    if args.train:
+        if args.data_dir is None or args.ann_file is None:
+            raise SystemExit("--train requires --data-dir and --ann-file.")
+
+        annotations = load_distillation_annotations(args.ann_file)
+        print(f"Training on {len(annotations)} annotations from {args.ann_file}")
+
+        dataset = BBoxDistillationDataset(
+            image_dir=args.data_dir,
+            annotations=annotations,
+            image_transform=preprocess,
+            crop_transform=preprocess,
+        )
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=_collate_distillation,
+        )
+
+        train_distillation(
+            model=model,
+            clip_model=clip_model,
+            dataloader=dataloader,
+            device=device,
+            epochs=args.epochs,
+            lr=args.lr,
+            save_path=args.head_checkpoint,
+        )
+        sys.exit(0)
+
+    # ------------------------------------------------------------------
+    # Inference mode
+    # ------------------------------------------------------------------
+    if args.bbox is None:
+        raise SystemExit("--bbox X Y W H is required for inference.")
+
     if args.image is not None:
-        from PIL import Image as PILImage
         pil_img = PILImage.open(args.image).convert("RGB")
         img_w, img_h = pil_img.size
         img_tensor = preprocess(pil_img)
@@ -436,14 +611,11 @@ if __name__ == "__main__":
 
         print("\n--- Text Comparison (cosine similarity) ---")
 
-        # feat is already in the shared CLIP output_dim space (via encoder.proj).
-        # Tokenize and encode all text phrases into the same space.
         tokenizer = get_text_tokenizer(clip_model.context_length)
         tokens = tokenizer(args.text).to(device)                        # [T, L]
         with torch.no_grad():
             text_feats = clip_model.encode_text(tokens, normalize=True) # [T, output_dim]
 
-        # Cosine similarity: feat · text_feats^T  (both L2-normalised)
         sims = (feat.unsqueeze(0) @ text_feats.T).squeeze(0)            # [T]
         logit_scale = clip_model.logit_scale.exp().item()
 
