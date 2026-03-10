@@ -176,6 +176,73 @@ def _collate_distillation(batch):
     return torch.stack(imgs), list(bboxes), torch.stack(crops)
 
 
+def _collate_cached(batch):
+    """Collate pre-computed (patch_tokens, bbox, teacher_embed) triples."""
+    patches, bboxes, teachers = zip(*batch)
+    return torch.stack(patches), list(bboxes), torch.stack(teachers)
+
+
+class CachedDataset(torch.utils.data.Dataset):
+    """
+    Holds pre-computed PE patch tokens and CLIP teacher embeddings in CPU RAM.
+    Eliminates frozen encoder forward passes from the training loop.
+    """
+
+    def __init__(
+        self,
+        patch_tokens: torch.Tensor,    # [n, N, D]
+        teacher_embeds: torch.Tensor,  # [n, D]
+        bboxes: list,
+    ):
+        self.patch_tokens   = patch_tokens
+        self.teacher_embeds = teacher_embeds
+        self.bboxes         = bboxes
+
+    def __len__(self) -> int:
+        return len(self.bboxes)
+
+    def __getitem__(self, idx: int):
+        return self.patch_tokens[idx], self.bboxes[idx], self.teacher_embeds[idx]
+
+
+def precompute_features(
+    model: "PEBBoxFeatureExtractor",
+    clip_model,
+    dataloader,
+    device: torch.device,
+) -> CachedDataset:
+    """
+    Single pass over the dataset to cache frozen PE patch tokens and CLIP
+    teacher embeddings on CPU.  Training epochs then only run the lightweight
+    cross-attention head, which is typically 50-100x cheaper.
+    """
+    print("Pre-computing frozen patch tokens and teacher embeddings…")
+    all_patches: list  = []
+    all_teachers: list = []
+    all_bboxes: list   = []
+
+    model.eval()
+    n_samples = len(dataloader.dataset)
+    with torch.no_grad():
+        for i, (imgs, bboxes, crops) in enumerate(dataloader):
+            imgs  = imgs.to(device)
+            crops = crops.to(device)
+            patches  = model._patch_tokens(imgs)                       # [B, N, D]
+            teachers = clip_model.encode_image(crops, normalize=True)  # [B, D]
+            all_patches.append(patches.cpu())
+            all_teachers.append(teachers.cpu())
+            all_bboxes.extend(bboxes)
+            done = min((i + 1) * dataloader.batch_size, n_samples)
+            print(f"\r  {done}/{n_samples} samples", end="", flush=True)
+
+    print(f"\r  Cached {len(all_bboxes)} samples.                ")
+    return CachedDataset(
+        patch_tokens   = torch.cat(all_patches,  dim=0),
+        teacher_embeds = torch.cat(all_teachers, dim=0),
+        bboxes         = all_bboxes,
+    )
+
+
 def load_distillation_annotations(ann_file: str) -> list:
     """
     Parse an annotation file into a list of {"file_name", "bbox"} dicts.
@@ -230,6 +297,8 @@ def train_distillation(
     epochs: int,
     lr: float,
     save_path: Optional[str],
+    precompute: bool = True,
+    use_amp: bool = True,
 ) -> None:
     """
     Train PositionCrossAttention via feature distillation.
@@ -237,31 +306,77 @@ def train_distillation(
     Teacher : clip_model.encode_image(crop)   — frozen CLIP crop embedding
     Student : model(image, bbox)              — cross-attention head output
     Loss    : 1 - cosine_similarity(student, teacher)  averaged over batch
+
+    Speed-ups applied:
+      - precompute=True : cache frozen PE tokens + teacher embeds before
+                          training; each epoch only runs the tiny head.
+      - use_amp=True    : bf16 autocast on CUDA (~1.5-2x faster).
+      - pin_memory      : faster CPU→GPU transfers.
+      - persistent_workers : avoid worker restart overhead between epochs.
+      - zero_grad(set_to_none=True) : skip zeroing, just drop grad tensors.
     """
+    use_amp = use_amp and device.type == "cuda"
+
+    if precompute:
+        cached_ds = precompute_features(model, clip_model, dataloader, device)
+        nw = min(4, dataloader.num_workers)
+        train_loader = torch.utils.data.DataLoader(
+            cached_ds,
+            batch_size=dataloader.batch_size,
+            shuffle=True,
+            num_workers=nw,
+            pin_memory=True,
+            persistent_workers=(nw > 0),
+            collate_fn=_collate_cached,
+        )
+    else:
+        train_loader = dataloader
+
     optimizer = torch.optim.AdamW(model.cross_attn_head.parameters(), lr=lr)
+    scaler    = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     for epoch in range(epochs):
-        model.train()
-        model.encoder.eval()   # PE stays frozen
+        model.cross_attn_head.train()
+        if not precompute:
+            model.encoder.eval()   # PE stays frozen
 
         total_loss = 0.0
-        for imgs, bboxes, crops in dataloader:
-            imgs  = imgs.to(device)
-            crops = crops.to(device)
 
-            with torch.no_grad():
-                teacher = clip_model.encode_image(crops, normalize=True)  # [B, D]
+        if precompute:
+            for patches, bboxes, teachers in train_loader:
+                patches  = patches.to(device, non_blocking=True)   # [B, N, D]
+                teachers = teachers.to(device, non_blocking=True)  # [B, D]
 
-            student = model(imgs, bboxes)                                  # [B, D]
-            loss    = (1.0 - F.cosine_similarity(student, teacher)).mean()
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                    enabled=use_amp):
+                    student = model._forward_from_patches(patches, bboxes)
+                    loss = (1.0 - F.cosine_similarity(student, teachers)).mean()
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                total_loss += loss.item()
+        else:
+            for imgs, bboxes, crops in train_loader:
+                imgs  = imgs.to(device, non_blocking=True)
+                crops = crops.to(device, non_blocking=True)
 
-            total_loss += loss.item()
+                with torch.no_grad():
+                    teachers = clip_model.encode_image(crops, normalize=True)
 
-        print(f"Epoch {epoch + 1}/{epochs}  loss={total_loss / len(dataloader):.6f}")
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                    enabled=use_amp):
+                    student = model(imgs, bboxes)
+                    loss = (1.0 - F.cosine_similarity(student, teachers)).mean()
+
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                total_loss += loss.item()
+
+        print(f"Epoch {epoch + 1}/{epochs}  loss={total_loss / len(train_loader):.6f}")
 
     if save_path is not None:
         torch.save(model.cross_attn_head.state_dict(), save_path)
@@ -410,6 +525,35 @@ class PEBBoxFeatureExtractor(nn.Module):
 
         return F.normalize(embeds, dim=-1)
 
+    def _forward_from_patches(
+        self,
+        all_tokens: torch.Tensor,  # [B, N, D]  pre-computed patch tokens
+        bboxes: list,
+    ) -> torch.Tensor:             # [B, output_dim]
+        """
+        Head-only forward used during cached training.
+        Skips the frozen PE encoder — patch tokens are already available.
+        """
+        B, _, D = all_tokens.shape
+        device  = all_tokens.device
+
+        query_list = []
+        for b, bbox in enumerate(bboxes):
+            idx = select_bbox_patches(bbox, self.patch_grid.to(device))
+            query_list.append(all_tokens[b, idx])
+
+        max_k = max(q.shape[0] for q in query_list)
+        query_padded = torch.zeros(B, max_k, D, device=device)
+        for b, q in enumerate(query_list):
+            query_padded[b, : q.shape[0]] = q
+
+        embeds = self.cross_attn_head(query_padded, all_tokens)  # [B, D]
+
+        if hasattr(self.encoder, "proj") and self.encoder.proj is not None:
+            embeds = embeds @ self.encoder.proj
+
+        return F.normalize(embeds, dim=-1)
+
     # ------------------------------------------------------------------
     # Convenience: single image + bbox at inference time
     # ------------------------------------------------------------------
@@ -527,6 +671,10 @@ def _parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--no-precompute", action="store_true",
+                   help="Disable feature pre-computation (use if RAM is limited).")
+    p.add_argument("--no-amp", action="store_true",
+                   help="Disable automatic mixed precision (AMP/bf16).")
 
     return p.parse_args()
 
@@ -575,11 +723,14 @@ if __name__ == "__main__":
             image_transform=preprocess,
             crop_transform=preprocess,
         )
+        nw = args.num_workers
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=args.num_workers,
+            num_workers=nw,
+            pin_memory=True,
+            persistent_workers=(nw > 0),
             collate_fn=_collate_distillation,
         )
 
@@ -591,6 +742,8 @@ if __name__ == "__main__":
             epochs=args.epochs,
             lr=args.lr,
             save_path=args.head_checkpoint,
+            precompute=not args.no_precompute,
+            use_amp=not args.no_amp,
         )
         sys.exit(0)
 
