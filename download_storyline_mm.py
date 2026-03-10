@@ -76,13 +76,13 @@ def download_s3_file(s3_client, uri: str, dest: Path) -> None:
 # Per-entry processing
 # ---------------------------------------------------------------------------
 
-def process_entry(entry: dict, out_root: Path, s3_client) -> list[str]:
+def process_entry(idx: int, entry: dict, out_root: Path, s3_client) -> list[str]:
     """
     Create the folder for this entry, write text.txt, download all s3_keys.
 
     Local structure mirrors the S3 path below datalake/<dependent_id>/:
       out_root/
-        <dependent_id>/
+        0000001/
           text.txt
           2025-09-01/
             image_selection/
@@ -96,7 +96,7 @@ def process_entry(entry: dict, out_root: Path, s3_client) -> list[str]:
     comment = entry.get("comment", "")
     s3_keys = entry.get("s3_keys", [])
 
-    folder = out_root / dependent_id
+    folder = out_root / f"{idx:07d}"
     folder.mkdir(parents=True, exist_ok=True)
     warnings = []
 
@@ -116,7 +116,7 @@ def process_entry(entry: dict, out_root: Path, s3_client) -> list[str]:
         try:
             _, key = parse_s3_uri(uri)
         except ValueError as e:
-            warnings.append(f"Entry {dependent_id}: {e}")
+            warnings.append(f"Entry {idx} (dependent_id={dependent_id}): {e}")
             continue
 
         if key.startswith(strip_prefix):
@@ -131,9 +131,9 @@ def process_entry(entry: dict, out_root: Path, s3_client) -> list[str]:
         try:
             download_s3_file(s3_client, uri, dest)
         except ClientError as e:
-            warnings.append(f"Entry {dependent_id}: S3 error for {uri!r}: {e}")
+            warnings.append(f"Entry {idx} (dependent_id={dependent_id}): S3 error for {uri!r}: {e}")
         except Exception as e:
-            warnings.append(f"Entry {dependent_id}: Unexpected error for {uri!r}: {e}")
+            warnings.append(f"Entry {idx} (dependent_id={dependent_id}): Unexpected error for {uri!r}: {e}")
 
     return warnings
 
@@ -183,16 +183,16 @@ def main():
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(process_entry, entry, out_root, s3): entry.get("dependent_id", i)
+            pool.submit(process_entry, args.start + i, entry, out_root, s3): args.start + i
             for i, entry in enumerate(entries_to_process)
         }
         for future in as_completed(futures):
-            dep_id = futures[future]
+            idx = futures[future]
             try:
                 warns = future.result()
                 all_warnings.extend(warns)
             except Exception as e:
-                all_warnings.append(f"Entry {dep_id}: Fatal error: {e}")
+                all_warnings.append(f"Entry {idx}: Fatal error: {e}")
 
             completed += 1
             if completed % 50 == 0 or completed == len(entries_to_process):
