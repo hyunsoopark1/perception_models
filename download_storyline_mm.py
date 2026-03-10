@@ -1,44 +1,53 @@
 #!/usr/bin/env python3
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 """
-Download a multi-modal storyline dataset from a spreadsheet + S3.
+Download a multi-modal storyline dataset from a JSON file + S3.
 
-Spreadsheet columns
--------------------
-  A : text
-  B : s3 image path  (required)
-  C : s3 image path  (optional)
-  D : s3 image path  (optional)
+JSON format
+-----------
+[
+  {
+    "dependent_id": 8615,
+    "comment": "9월 1일 스토리라인입니다.",
+    "s3_keys": [
+      "s3://bucket/datalake/8615/2025-09-01/image_selection/xxx.jpg",
+      "s3://bucket/datalake/8615/2025-09-01/video_generation/xxx.mp4",
+      ...
+    ]
+  },
+  ...
+]
 
 Output layout  ~/data/storyline_mm/
-  0000001/
+  8615/
     text.txt
-    image_0.<ext>
-    image_1.<ext>   (if column C is present)
-    image_2.<ext>   (if column D is present)
-  0000002/
-    ...
+    2025-09-01/
+      image_selection/
+        xxx.jpg
+        ...
+      video_generation/
+        xxx.mp4
+        ...
 
-S3 paths may be:
-  s3://bucket/key/path/image.jpg   (full URI)
-  bucket/key/path/image.jpg        (bucket + key, no scheme)
+S3 paths must be full s3:// URIs.  The sub-path below
+datalake/<dependent_id>/ is preserved as the local directory structure.
 
 Usage
 -----
-  python download_storyline_mm.py data.csv
-  python download_storyline_mm.py data.xlsx --out ~/data/storyline_mm --workers 8
-  python download_storyline_mm.py data.csv --profile my-aws-profile
+  python download_storyline_mm.py data.json
+  python download_storyline_mm.py data.json --out ~/data/storyline_mm --workers 8
+  python download_storyline_mm.py data.json --profile my-aws-profile
+  python download_storyline_mm.py data.json --start 5   # resume from entry index 5
 """
 
 import argparse
-import os
+import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 
 import boto3
-import pandas as pd
 from botocore.exceptions import ClientError
 
 
@@ -47,17 +56,13 @@ from botocore.exceptions import ClientError
 # ---------------------------------------------------------------------------
 
 def parse_s3_uri(uri: str) -> tuple[str, str]:
-    """Return (bucket, key) from an s3:// URI or 'bucket/key' string."""
+    """Return (bucket, key) from an s3:// URI."""
     uri = uri.strip()
-    if uri.startswith("s3://"):
-        parsed = urlparse(uri)
-        bucket = parsed.netloc
-        key = parsed.path.lstrip("/")
-    else:
-        parts = uri.split("/", 1)
-        if len(parts) < 2:
-            raise ValueError(f"Cannot parse S3 path: {uri!r}")
-        bucket, key = parts[0], parts[1]
+    if not uri.startswith("s3://"):
+        raise ValueError(f"Expected s3:// URI, got: {uri!r}")
+    parsed = urlparse(uri)
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
     return bucket, key
 
 
@@ -68,43 +73,67 @@ def download_s3_file(s3_client, uri: str, dest: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-row processing
+# Per-entry processing
 # ---------------------------------------------------------------------------
 
-def process_row(row_idx: int, row: pd.Series, out_root: Path, s3_client) -> list[str]:
+def process_entry(entry: dict, out_root: Path, s3_client) -> list[str]:
     """
-    Create the folder for this row, write text.txt, download images.
+    Create the folder for this entry, write text.txt, download all s3_keys.
+
+    Local structure mirrors the S3 path below datalake/<dependent_id>/:
+      out_root/
+        <dependent_id>/
+          text.txt
+          2025-09-01/
+            image_selection/
+              xxx.jpg
+            video_generation/
+              xxx.mp4
+
     Returns a list of warning strings (empty = success).
     """
-    folder = out_root / f"{row_idx:07d}"
+    dependent_id = str(entry["dependent_id"])
+    comment = entry.get("comment", "")
+    s3_keys = entry.get("s3_keys", [])
+
+    folder = out_root / dependent_id
     folder.mkdir(parents=True, exist_ok=True)
     warnings = []
 
-    # --- text ---
-    text = str(row.iloc[0]) if pd.notna(row.iloc[0]) else ""
-    (folder / "text.txt").write_text(text, encoding="utf-8")
+    # --- comment → text.txt ---
+    (folder / "text.txt").write_text(comment, encoding="utf-8")
 
-    # --- images (columns B, C, D → indices 1, 2, 3) ---
-    for img_idx, col_pos in enumerate([1, 2, 3]):
-        if col_pos >= len(row):
-            break
-        uri = row.iloc[col_pos]
-        if pd.isna(uri) or str(uri).strip() == "":
+    # --- download each S3 key ---
+    # Strip the leading "datalake/<dependent_id>/" from the S3 object key
+    # so the rest becomes the relative path under the local folder.
+    strip_prefix = f"datalake/{dependent_id}/"
+
+    for uri in s3_keys:
+        uri = uri.strip()
+        if not uri:
             continue
 
-        uri = str(uri).strip()
-        ext = Path(urlparse(uri).path).suffix or ".jpg"
-        dest = folder / f"image_{img_idx}{ext}"
+        try:
+            _, key = parse_s3_uri(uri)
+        except ValueError as e:
+            warnings.append(f"Entry {dependent_id}: {e}")
+            continue
 
+        if key.startswith(strip_prefix):
+            rel_path = key[len(strip_prefix):]          # e.g. 2025-09-01/image_selection/xxx.jpg
+        else:
+            rel_path = Path(key).name                   # fallback: flat filename
+
+        dest = folder / rel_path
         if dest.exists():
-            continue  # already downloaded (resume support)
+            continue  # resume support
 
         try:
             download_s3_file(s3_client, uri, dest)
         except ClientError as e:
-            warnings.append(f"Row {row_idx}: S3 error for {uri!r}: {e}")
+            warnings.append(f"Entry {dependent_id}: S3 error for {uri!r}: {e}")
         except Exception as e:
-            warnings.append(f"Row {row_idx}: Unexpected error for {uri!r}: {e}")
+            warnings.append(f"Entry {dependent_id}: Unexpected error for {uri!r}: {e}")
 
     return warnings
 
@@ -113,39 +142,17 @@ def process_row(row_idx: int, row: pd.Series, out_root: Path, s3_client) -> list
 # Main
 # ---------------------------------------------------------------------------
 
-def load_spreadsheet(path: str) -> pd.DataFrame:
-    p = Path(path)
-    if p.suffix.lower() in {".xlsx", ".xls"}:
-        df = pd.read_excel(p, header=None)
-    elif p.suffix.lower() == ".csv":
-        df = pd.read_csv(p, header=None)
-    else:
-        # Try CSV as fallback
-        df = pd.read_csv(p, header=None)
-
-    # Keep only the first 4 columns (A–D)
-    df = df.iloc[:, :4]
-
-    # Drop header row if it looks like one (non-numeric first cell of col B)
-    first_b = str(df.iloc[0, 1]) if len(df) > 0 else ""
-    if not first_b.startswith("s3://") and "/" not in first_b:
-        print(f"Skipping header row: {df.iloc[0].tolist()}")
-        df = df.iloc[1:].reset_index(drop=True)
-
-    return df
-
-
 def parse_args():
-    p = argparse.ArgumentParser(description="Download multi-modal storyline dataset")
-    p.add_argument("spreadsheet", help="Path to CSV or Excel file")
+    p = argparse.ArgumentParser(description="Download multi-modal storyline dataset from JSON")
+    p.add_argument("input_json", help="Path to JSON file")
     p.add_argument("--out", default="~/data/storyline_mm",
                    help="Output root directory (default: ~/data/storyline_mm)")
     p.add_argument("--workers", type=int, default=4,
                    help="Parallel download threads (default: 4)")
     p.add_argument("--profile", default=None,
                    help="AWS profile name (default: uses env / instance role)")
-    p.add_argument("--start", type=int, default=1,
-                   help="1-based row number to start from (for resuming)")
+    p.add_argument("--start", type=int, default=0,
+                   help="0-based entry index to start from (for resuming, default: 0)")
     return p.parse_args()
 
 
@@ -154,10 +161,17 @@ def main():
     out_root = Path(args.out).expanduser()
     out_root.mkdir(parents=True, exist_ok=True)
 
-    print(f"Reading spreadsheet: {args.spreadsheet}")
-    df = load_spreadsheet(args.spreadsheet)
-    total = len(df)
-    print(f"  {total} rows found.")
+    print(f"Reading JSON: {args.input_json}")
+    with open(args.input_json, encoding="utf-8") as f:
+        entries = json.load(f)
+
+    if not isinstance(entries, list):
+        print("ERROR: JSON root must be a list of entries.", file=sys.stderr)
+        sys.exit(1)
+
+    total = len(entries)
+    entries_to_process = entries[args.start:]
+    print(f"  {total} entries found, processing {len(entries_to_process)} (start={args.start})")
     print(f"Output directory   : {out_root}")
     print(f"Download threads   : {args.workers}\n")
 
@@ -167,32 +181,24 @@ def main():
     all_warnings = []
     completed = 0
 
-    # Row numbers are 1-based (matching spreadsheet line numbers)
-    rows = list(df.iterrows())  # (df_index, series)
-    rows_to_process = [
-        (df_idx + 1, series)           # 1-based row number
-        for df_idx, series in rows
-        if df_idx + 1 >= args.start
-    ]
-
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(process_row, row_num, series, out_root, s3): row_num
-            for row_num, series in rows_to_process
+            pool.submit(process_entry, entry, out_root, s3): entry.get("dependent_id", i)
+            for i, entry in enumerate(entries_to_process)
         }
         for future in as_completed(futures):
-            row_num = futures[future]
+            dep_id = futures[future]
             try:
                 warns = future.result()
                 all_warnings.extend(warns)
             except Exception as e:
-                all_warnings.append(f"Row {row_num}: Fatal error: {e}")
+                all_warnings.append(f"Entry {dep_id}: Fatal error: {e}")
 
             completed += 1
-            if completed % 50 == 0 or completed == len(rows_to_process):
-                print(f"  Progress: {completed}/{len(rows_to_process)}", flush=True)
+            if completed % 50 == 0 or completed == len(entries_to_process):
+                print(f"  Progress: {completed}/{len(entries_to_process)}", flush=True)
 
-    print(f"\nDone. {completed} rows processed.")
+    print(f"\nDone. {completed} entries processed.")
     if all_warnings:
         print(f"\n{len(all_warnings)} warning(s):")
         for w in all_warnings:
