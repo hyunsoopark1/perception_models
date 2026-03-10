@@ -19,15 +19,14 @@ JSON format
 ]
 
 Output layout  ~/data/storyline_mm/
-  8615/
+  0008615/
     text.txt
-    2025-09-01/
-      image_selection/
-        xxx.jpg
-        ...
-      video_generation/
-        xxx.mp4
-        ...
+    xxx.jpg
+    yyy.jpg
+    ...
+
+MP4 files are skipped. All image files are placed flat under the
+zero-padded 7-digit folder (no date sub-directory).
 
 S3 paths must be full s3:// URIs.  The sub-path below
 datalake/<dependent_id>/ is preserved as the local directory structure.
@@ -80,15 +79,12 @@ def process_entry(idx: int, entry: dict, out_root: Path, s3_client) -> list[str]
     """
     Create the folder for this entry, write text.txt, download all s3_keys.
 
-    Local structure mirrors the S3 path below datalake/<dependent_id>/:
+    All image files are placed flat under the 7-digit folder (mp4 files skipped):
       out_root/
         0000001/
           text.txt
-          2025-09-01/
-            image_selection/
-              xxx.jpg
-            video_generation/
-              xxx.mp4
+          xxx.jpg
+          yyy.jpg
 
     Returns a list of warning strings (empty = success).
     """
@@ -113,18 +109,18 @@ def process_entry(idx: int, entry: dict, out_root: Path, s3_client) -> list[str]
         if not uri:
             continue
 
+        # Skip video files
+        if uri.lower().endswith(".mp4"):
+            continue
+
         try:
             _, key = parse_s3_uri(uri)
         except ValueError as e:
             warnings.append(f"Entry {idx} (dependent_id={dependent_id}): {e}")
             continue
 
-        if key.startswith(strip_prefix):
-            rel_path = key[len(strip_prefix):]          # e.g. 2025-09-01/image_selection/xxx.jpg
-        else:
-            rel_path = Path(key).name                   # fallback: flat filename
-
-        dest = folder / rel_path
+        # Place all image files flat under the 7-digit folder (filename only)
+        dest = folder / Path(key).name
         if dest.exists():
             continue  # resume support
 
