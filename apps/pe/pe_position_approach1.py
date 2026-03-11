@@ -184,7 +184,7 @@ def _collate_cached(batch):
 
 class CachedDataset(torch.utils.data.Dataset):
     """
-    Holds pre-computed PE patch tokens and CLIP teacher embeddings in CPU RAM.
+    Holds pre-computed PE patch tokens and PE teacher embeddings in CPU RAM.
     Eliminates frozen encoder forward passes from the training loop.
     """
 
@@ -207,12 +207,12 @@ class CachedDataset(torch.utils.data.Dataset):
 
 def precompute_features(
     model: "PEBBoxFeatureExtractor",
-    clip_model,
+    pe_model,
     dataloader,
     device: torch.device,
 ) -> CachedDataset:
     """
-    Single pass over the dataset to cache frozen PE patch tokens and CLIP
+    Single pass over the dataset to cache frozen PE patch tokens and PE
     teacher embeddings on CPU.  Training epochs then only run the lightweight
     cross-attention head, which is typically 50-100x cheaper.
     """
@@ -227,8 +227,8 @@ def precompute_features(
         for i, (imgs, bboxes, crops) in enumerate(dataloader):
             imgs  = imgs.to(device)
             crops = crops.to(device)
-            patches  = model._patch_tokens(imgs)                       # [B, N, D]
-            teachers = clip_model.encode_image(crops, normalize=True)  # [B, D]
+            patches  = model._patch_tokens(imgs)                      # [B, N, D]
+            teachers = pe_model.encode_image(crops, normalize=True)   # [B, D]
             all_patches.append(patches.cpu())
             all_teachers.append(teachers.cpu())
             all_bboxes.extend(bboxes)
@@ -291,7 +291,7 @@ def load_distillation_annotations(ann_file: str) -> list:
 
 def train_distillation(
     model: "PEBBoxFeatureExtractor",
-    clip_model,
+    pe_model,
     dataloader,
     device: torch.device,
     epochs: int,
@@ -303,8 +303,8 @@ def train_distillation(
     """
     Train PositionCrossAttention via feature distillation.
 
-    Teacher : clip_model.encode_image(crop)   — frozen CLIP crop embedding
-    Student : model(image, bbox)              — cross-attention head output
+    Teacher : pe_model.encode_image(crop)   — frozen PE crop embedding
+    Student : model(image, bbox)            — cross-attention head output
     Loss    : 1 - cosine_similarity(student, teacher)  averaged over batch
 
     Speed-ups applied:
@@ -318,7 +318,7 @@ def train_distillation(
     use_amp = use_amp and device.type == "cuda"
 
     if precompute:
-        cached_ds = precompute_features(model, clip_model, dataloader, device)
+        cached_ds = precompute_features(model, pe_model, dataloader, device)
         nw = min(4, dataloader.num_workers)
         train_loader = torch.utils.data.DataLoader(
             cached_ds,
@@ -363,7 +363,7 @@ def train_distillation(
                 crops = crops.to(device, non_blocking=True)
 
                 with torch.no_grad():
-                    teachers = clip_model.encode_image(crops, normalize=True)
+                    teachers = pe_model.encode_image(crops, normalize=True)
 
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                                     enabled=use_amp):
@@ -690,9 +690,9 @@ if __name__ == "__main__":
     from core.vision_encoder import transforms as pe_transforms
     from core.vision_encoder.pe import CLIP
 
-    # CLIP is always needed (distillation teacher or text comparison)
+    # PE model is always needed (distillation teacher or text comparison)
     print(f"Loading {args.model} (pretrained={pretrained}) …")
-    clip_model = CLIP.from_config(
+    pe_model = CLIP.from_config(
         args.model,
         pretrained=pretrained,
         checkpoint_path=args.checkpoint,
@@ -701,7 +701,7 @@ if __name__ == "__main__":
     model = load_pe_extractor(
         model_name=args.model,
         device=device,
-        vision_encoder=clip_model.visual,
+        vision_encoder=pe_model.visual,
         head_checkpoint_path=args.head_checkpoint if not args.train else None,
     )
 
@@ -736,7 +736,7 @@ if __name__ == "__main__":
 
         train_distillation(
             model=model,
-            clip_model=clip_model,
+            pe_model=pe_model,
             dataloader=dataloader,
             device=device,
             epochs=args.epochs,
@@ -792,17 +792,17 @@ if __name__ == "__main__":
     print(f"L2 norm (≈1.0): {feat.norm().item():.6f}")
     print(f"First 8 values: {feat[:8].tolist()}")
 
-    # -- CLIP crop baseline (always computed when image is available) --
-    clip_feat = None
+    # -- PE crop baseline (always computed when image is available) --
+    pe_feat = None
     if pil_img is not None:
         crop_pil    = bbox.crop(pil_img)
-        crop_tensor = preprocess(crop_pil).unsqueeze(0).to(device)        # [1, C, H, W]
+        crop_tensor = preprocess(crop_pil).unsqueeze(0).to(device)       # [1, C, H, W]
         with torch.no_grad():
-            clip_feat = clip_model.encode_image(crop_tensor, normalize=True)  # [1, D]
+            pe_feat = pe_model.encode_image(crop_tensor, normalize=True)  # [1, D]
 
-        head_clip_sim = F.cosine_similarity(feat.unsqueeze(0), clip_feat).item()
-        print(f"\nHead ↔ CLIP crop similarity : {head_clip_sim:+.4f}"
-              f"  (distillation loss equiv: {1.0 - head_clip_sim:.4f})")
+        head_pe_sim = F.cosine_similarity(feat.unsqueeze(0), pe_feat).item()
+        print(f"\nHead ↔ PE crop similarity : {head_pe_sim:+.4f}"
+              f"  (distillation loss equiv: {1.0 - head_pe_sim:.4f})")
 
     # -- Text comparison --
     if args.text is not None:
@@ -810,25 +810,25 @@ if __name__ == "__main__":
 
         print("\n--- Text Comparison (cosine similarity) ---")
 
-        tokenizer = get_text_tokenizer(clip_model.context_length)
+        tokenizer = get_text_tokenizer(pe_model.context_length)
         tokens = tokenizer(args.text).to(device)                          # [T, L]
         with torch.no_grad():
-            text_feats = clip_model.encode_text(tokens, normalize=True)   # [T, D]
+            text_feats = pe_model.encode_text(tokens, normalize=True)     # [T, D]
 
         head_sims = (feat.unsqueeze(0) @ text_feats.T).squeeze(0)         # [T]
 
-        if clip_feat is not None:
-            clip_sims = (clip_feat @ text_feats.T).squeeze(0)             # [T]
+        if pe_feat is not None:
+            pe_sims = (pe_feat @ text_feats.T).squeeze(0)                 # [T]
         else:
-            clip_sims = torch.zeros(len(args.text), device=device)
-            print("  (CLIP crop baseline skipped — no source image)")
+            pe_sims = torch.zeros(len(args.text), device=device)
+            print("  (PE crop baseline skipped — no source image)")
 
-        logit_scale = clip_model.logit_scale.exp().item()
+        logit_scale = pe_model.logit_scale.exp().item()
         col_w = max(len(t) for t in args.text) + 2
 
-        print(f"  {'Phrase':<{col_w}}  {'Head sim':>10}  {'CLIP crop':>10}  {'Head logit':>11}  {'CLIP logit':>11}")
+        print(f"  {'Phrase':<{col_w}}  {'Head sim':>10}  {'PE crop':>10}  {'Head logit':>11}  {'PE logit':>11}")
         print(f"  {'-'*col_w}  {'----------':>10}  {'----------':>10}  {'-----------':>11}  {'-----------':>11}")
-        for phrase, h, c in zip(args.text, head_sims.tolist(), clip_sims.tolist()):
+        for phrase, h, c in zip(args.text, head_sims.tolist(), pe_sims.tolist()):
             print(
                 f"  {phrase:<{col_w}}  {h:>+10.4f}  {c:>+10.4f}"
                 f"  {h * logit_scale:>+11.4f}  {c * logit_scale:>+11.4f}"
