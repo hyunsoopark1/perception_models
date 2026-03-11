@@ -6,24 +6,19 @@ Usage
 -----
 # Compare base model vs a LoRA checkpoint on a folder of images:
 python infer_compare.py \
-    --images img1.jpg img2.jpg img3.jpg \
+    --image_dir ~/data/storyline_mm/0000042 \
     --finetuned_ckpt runs/storyline_mm/checkpoint-200 \
     --base_model meta-llama/Llama-3.2-11B-Vision-Instruct
 
-# Point at a whole directory (uses all image files found):
-python infer_compare.py \
-    --image_dir ~/data/storyline_mm/0000042 \
-    --finetuned_ckpt runs/storyline_mm/checkpoint-200
-
 # Skip the base-model comparison (only run fine-tuned):
 python infer_compare.py \
-    --images img1.jpg \
+    --image_dir ~/data/storyline_mm/0000042 \
     --finetuned_ckpt runs/storyline_mm/checkpoint-200 \
     --skip_base
 
 # Custom prompt:
 python infer_compare.py \
-    --images img1.jpg \
+    --image_dir ~/data/storyline_mm/0000042 \
     --finetuned_ckpt runs/storyline_mm/checkpoint-200 \
     --prompt "Describe what is happening in these images."
 """
@@ -192,29 +187,30 @@ def _banner(title: str, char: str = "=", width: int = 92):
 # Main
 # ---------------------------------------------------------------------------
 
-def collect_images(args) -> List[Path]:
-    """Return list of image paths from --images or --image_dir."""
+def collect_images(image_dir: str) -> List[Path]:
+    """Return image paths from a directory.
+
+    Tries the canonical image_0 … image_14 naming convention first
+    (matches the dataset layout from finetune_storyline_mm.py).
+    Falls back to all image files in the directory sorted by name.
+    """
+    d = Path(image_dir).expanduser()
+    if not d.is_dir():
+        raise NotADirectoryError(f"Not a directory: {d}")
+
     paths: List[Path] = []
+    for idx in range(15):
+        for ext in IMAGE_EXTENSIONS:
+            p = d / f"image_{idx}{ext}"
+            if p.exists():
+                paths.append(p)
+                break
 
-    if args.images:
-        paths = [Path(p) for p in args.images]
-    elif args.image_dir:
-        d = Path(args.image_dir).expanduser()
-        # Try canonical image_N naming first
-        for idx in range(15):
-            for ext in IMAGE_EXTENSIONS:
-                p = d / f"image_{idx}{ext}"
-                if p.exists():
-                    paths.append(p)
-                    break
-        if not paths:
-            paths = sorted(p for p in d.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
-    else:
-        raise ValueError("Provide --images or --image_dir.")
+    if not paths:
+        paths = sorted(p for p in d.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
 
-    missing = [p for p in paths if not p.exists()]
-    if missing:
-        raise FileNotFoundError(f"Images not found: {missing}")
+    if not paths:
+        raise FileNotFoundError(f"No image files found in: {d}")
     return paths
 
 
@@ -223,7 +219,7 @@ def run(args):
     hf_token = args.hf_token or None
 
     # ---- collect images ----
-    image_paths = collect_images(args)
+    image_paths = collect_images(args.image_dir)
     images = [Image.open(p).convert("RGB") for p in image_paths]
     print(f"[info] Loaded {len(images)} image(s): {[p.name for p in image_paths]}")
 
@@ -305,13 +301,8 @@ def parse_args():
     )
 
     # Images
-    img_grp = p.add_mutually_exclusive_group(required=True)
-    img_grp.add_argument(
-        "--images", nargs="+", metavar="IMG",
-        help="One or more image file paths.",
-    )
-    img_grp.add_argument(
-        "--image_dir", metavar="DIR",
+    p.add_argument(
+        "--image_dir", required=True, metavar="DIR",
         help="Directory containing image_0.jpg … or arbitrary image files.",
     )
 
