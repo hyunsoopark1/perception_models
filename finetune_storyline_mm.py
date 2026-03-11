@@ -91,7 +91,7 @@ class DataArgs:
     # Prompt sent to the model before the target text
     instruction: str = "Look at the image(s) and write a descriptive story."
 
-    batch_size: int = 2
+    batch_size: int = 1  # keep at 1 — samples have variable image counts that can't be batched together
     num_workers: int = 2
 
 
@@ -564,7 +564,7 @@ def train(model_args: ModelArgs, data_args: DataArgs, train_args: TrainArgs):
             }
 
             if use_amp:
-                with torch.cuda.amp.autocast(dtype=amp_dtype):
+                with torch.amp.autocast("cuda", dtype=amp_dtype):
                     loss = model(**batch).loss / train_args.grad_accum_steps
             else:
                 loss = model(**batch).loss / train_args.grad_accum_steps
