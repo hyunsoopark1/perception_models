@@ -222,6 +222,36 @@ class StorylineMMDataset(Dataset):
         input_ids = enc["input_ids"][0]
         attention_mask = enc["attention_mask"][0]
 
+        # Normalize pixel_values to (N, C, H, W).
+        # Some processors add a batch dim → (1, N, C, H, W); others don't.
+        pv = enc.get("pixel_values")
+        if pv is not None and pv.ndim == 5:
+            pv = pv[0]  # (1, N, C, H, W) → (N, C, H, W)
+
+        # The chat template inserts one image-token group per image we passed,
+        # but the processor may silently encode fewer images (e.g. due to an
+        # internal cap). Detect the mismatch and remove the excess token groups
+        # from input_ids so that tokens and features stay consistent.
+        img_tok_id = None
+        toks_per_img = 1
+        if pv is not None:
+            img_token = getattr(self.processor, "image_token", "<image>")
+            img_tok_id = self.processor.tokenizer.convert_tokens_to_ids(img_token)
+            n_img_toks = int((input_ids == img_tok_id).sum())
+            n_pv = pv.shape[0]
+            n_passed = len(images)
+            if n_img_toks > 0 and n_passed > 0:
+                toks_per_img = max(1, n_img_toks // n_passed)
+            if n_pv < n_passed and n_img_toks > 0:
+                # Processor encoded n_pv images; prompt has n_passed groups.
+                # Drop the trailing (n_passed - n_pv) image token groups.
+                n_excess = (n_passed - n_pv) * toks_per_img
+                img_pos = (input_ids == img_tok_id).nonzero(as_tuple=True)[0]
+                keep = torch.ones(input_ids.shape[0], dtype=torch.bool)
+                keep[img_pos[-n_excess:]] = False
+                input_ids = input_ids[keep]
+                attention_mask = attention_mask[keep]
+
         # Mask labels: set prompt tokens to -100
         prompt_len = len(
             self.processor.tokenizer(
@@ -231,23 +261,25 @@ class StorylineMMDataset(Dataset):
         labels = input_ids.clone()
         labels[:prompt_len] = -100  # ignore prompt + image tokens in loss
 
-        # Truncate after label masking so image token blocks stay intact
+        # Truncate text tail if still over budget; then re-sync pixel_values.
         if input_ids.shape[0] > self.max_seq_length:
             input_ids = input_ids[:self.max_seq_length]
             attention_mask = attention_mask[:self.max_seq_length]
             labels = labels[:self.max_seq_length]
+            if pv is not None and img_tok_id is not None and toks_per_img > 0:
+                n_remaining = int((input_ids == img_tok_id).sum())
+                pv = pv[: n_remaining // toks_per_img]
 
         sample = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
         }
-
-        # pixel_values / image_sizes are present when images were supplied
-        if "pixel_values" in enc:
-            sample["pixel_values"] = enc["pixel_values"][0]
+        if pv is not None:
+            sample["pixel_values"] = pv  # (N, C, H, W)
         if "image_sizes" in enc:
-            sample["image_sizes"] = enc["image_sizes"][0]
+            isz = enc["image_sizes"]
+            sample["image_sizes"] = isz[0] if isz.ndim >= 2 else isz
 
         return sample
 
@@ -266,12 +298,20 @@ def _collate(batch: List[Dict]) -> Dict[str, torch.Tensor]:
             for i, t in enumerate(tensors):
                 padded[i, : t.shape[0]] = t
             out[k] = padded
+        elif k == "pixel_values":
+            # Each sample contributes (N_i, C, H, W). With batch_size=1 this
+            # stack produces (1, N, C, H, W) which is the 5-D multi-image
+            # format LLaVA expects. Variable N across samples is only safe at
+            # batch_size=1; for larger batches all N_i must be equal.
+            try:
+                out[k] = torch.stack(tensors)  # (B, N, C, H, W)
+            except RuntimeError:
+                out[k] = tensors  # fallback: list of (N_i, C, H, W)
         else:
-            # pixel_values / image_sizes: stack if same shape, else leave as list
             try:
                 out[k] = torch.stack(tensors)
             except RuntimeError:
-                out[k] = tensors  # variable shape — model handles list
+                out[k] = tensors
     return out
 
 
