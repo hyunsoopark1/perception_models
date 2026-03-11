@@ -786,11 +786,23 @@ if __name__ == "__main__":
             crop.save(args.crop_out)
             print(f"Crop saved : {args.crop_out}  ({crop.width}x{crop.height} px)")
 
-    # -- Extract feature --
+    # -- Extract head feature --
     feat = model.encode(img_tensor, bbox)
     print(f"\nFeature shape : {feat.shape}")
     print(f"L2 norm (≈1.0): {feat.norm().item():.6f}")
     print(f"First 8 values: {feat[:8].tolist()}")
+
+    # -- CLIP crop baseline (always computed when image is available) --
+    clip_feat = None
+    if pil_img is not None:
+        crop_pil    = bbox.crop(pil_img)
+        crop_tensor = preprocess(crop_pil).unsqueeze(0).to(device)        # [1, C, H, W]
+        with torch.no_grad():
+            clip_feat = clip_model.encode_image(crop_tensor, normalize=True)  # [1, D]
+
+        head_clip_sim = F.cosine_similarity(feat.unsqueeze(0), clip_feat).item()
+        print(f"\nHead ↔ CLIP crop similarity : {head_clip_sim:+.4f}"
+              f"  (distillation loss equiv: {1.0 - head_clip_sim:.4f})")
 
     # -- Text comparison --
     if args.text is not None:
@@ -799,22 +811,16 @@ if __name__ == "__main__":
         print("\n--- Text Comparison (cosine similarity) ---")
 
         tokenizer = get_text_tokenizer(clip_model.context_length)
-        tokens = tokenizer(args.text).to(device)                         # [T, L]
+        tokens = tokenizer(args.text).to(device)                          # [T, L]
         with torch.no_grad():
-            text_feats = clip_model.encode_text(tokens, normalize=True)  # [T, D]
+            text_feats = clip_model.encode_text(tokens, normalize=True)   # [T, D]
 
-        # Trained head similarity (full image + bbox → cross-attn)
-        head_sims = (feat.unsqueeze(0) @ text_feats.T).squeeze(0)        # [T]
+        head_sims = (feat.unsqueeze(0) @ text_feats.T).squeeze(0)         # [T]
 
-        # CLIP crop baseline similarity (bbox crop → CLIP encode)
-        clip_sims = torch.zeros(len(args.text), device=device)
-        if pil_img is not None:
-            crop_pil    = bbox.crop(pil_img)
-            crop_tensor = preprocess(crop_pil).unsqueeze(0).to(device)   # [1, C, H, W]
-            with torch.no_grad():
-                clip_feat = clip_model.encode_image(crop_tensor, normalize=True)  # [1, D]
-            clip_sims = (clip_feat @ text_feats.T).squeeze(0)            # [T]
+        if clip_feat is not None:
+            clip_sims = (clip_feat @ text_feats.T).squeeze(0)             # [T]
         else:
+            clip_sims = torch.zeros(len(args.text), device=device)
             print("  (CLIP crop baseline skipped — no source image)")
 
         logit_scale = clip_model.logit_scale.exp().item()
