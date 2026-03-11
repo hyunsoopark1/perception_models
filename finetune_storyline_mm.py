@@ -144,7 +144,7 @@ def _find_images(folder: Path) -> List[Path]:
             if p.suffix.lower() in IMAGE_EXTENSIONS
         )
 
-    return images[:15]
+    return images[:5]
 
 
 def _load_folders(data_dir: Path) -> List[Path]:
