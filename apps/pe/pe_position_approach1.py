@@ -799,15 +799,31 @@ if __name__ == "__main__":
         print("\n--- Text Comparison (cosine similarity) ---")
 
         tokenizer = get_text_tokenizer(clip_model.context_length)
-        tokens = tokenizer(args.text).to(device)                        # [T, L]
+        tokens = tokenizer(args.text).to(device)                         # [T, L]
         with torch.no_grad():
-            text_feats = clip_model.encode_text(tokens, normalize=True) # [T, output_dim]
+            text_feats = clip_model.encode_text(tokens, normalize=True)  # [T, D]
 
-        sims = (feat.unsqueeze(0) @ text_feats.T).squeeze(0)            # [T]
+        # Trained head similarity (full image + bbox → cross-attn)
+        head_sims = (feat.unsqueeze(0) @ text_feats.T).squeeze(0)        # [T]
+
+        # CLIP crop baseline similarity (bbox crop → CLIP encode)
+        clip_sims = torch.zeros(len(args.text), device=device)
+        if pil_img is not None:
+            crop_pil    = bbox.crop(pil_img)
+            crop_tensor = preprocess(crop_pil).unsqueeze(0).to(device)   # [1, C, H, W]
+            with torch.no_grad():
+                clip_feat = clip_model.encode_image(crop_tensor, normalize=True)  # [1, D]
+            clip_sims = (clip_feat @ text_feats.T).squeeze(0)            # [T]
+        else:
+            print("  (CLIP crop baseline skipped — no source image)")
+
         logit_scale = clip_model.logit_scale.exp().item()
-
         col_w = max(len(t) for t in args.text) + 2
-        print(f"  {'Phrase':<{col_w}}  cosine sim   logit-scaled")
-        print(f"  {'-'*col_w}  ----------   ------------")
-        for phrase, sim in zip(args.text, sims.tolist()):
-            print(f"  {phrase:<{col_w}}  {sim:+.4f}       {sim * logit_scale:+.4f}")
+
+        print(f"  {'Phrase':<{col_w}}  {'Head sim':>10}  {'CLIP crop':>10}  {'Head logit':>11}  {'CLIP logit':>11}")
+        print(f"  {'-'*col_w}  {'----------':>10}  {'----------':>10}  {'-----------':>11}  {'-----------':>11}")
+        for phrase, h, c in zip(args.text, head_sims.tolist(), clip_sims.tolist()):
+            print(
+                f"  {phrase:<{col_w}}  {h:>+10.4f}  {c:>+10.4f}"
+                f"  {h * logit_scale:>+11.4f}  {c * logit_scale:>+11.4f}"
+            )
