@@ -252,14 +252,18 @@ class StorylineMMDataset(Dataset):
                 input_ids = input_ids[keep]
                 attention_mask = attention_mask[keep]
 
-        # Mask labels: set prompt tokens to -100
-        prompt_len = len(
-            self.processor.tokenizer(
-                prompt_only, add_special_tokens=False
-            )["input_ids"]
+        # Compute the true prompt length by encoding prompt_only with the full
+        # processor (including images).  Using the plain tokenizer gives 1 token
+        # per <image> placeholder, but enc["input_ids"] has 576 tokens per image,
+        # so the plain-tokenizer count is far too short and leaves thousands of
+        # <image> token positions unmasked — causing the model to waste all its
+        # gradient on predicting meaningless image tokens.
+        enc_prompt = self.processor(
+            text=prompt_only, images=images, return_tensors="pt"
         )
+        prompt_len = enc_prompt["input_ids"].shape[1]
         labels = input_ids.clone()
-        labels[:prompt_len] = -100  # ignore prompt + image tokens in loss
+        labels[:prompt_len] = -100  # ignore prompt + all image tokens in loss
 
         # Truncate text tail if still over budget; then re-sync pixel_values.
         if input_ids.shape[0] > self.max_seq_length:
