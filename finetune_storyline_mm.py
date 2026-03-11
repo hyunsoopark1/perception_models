@@ -299,12 +299,11 @@ def _collate(batch: List[Dict]) -> Dict[str, torch.Tensor]:
                 padded[i, : t.shape[0]] = t
             out[k] = padded
         elif k == "pixel_values":
-            # Each sample contributes (N_i, C, H, W). With batch_size=1 this
-            # stack produces (1, N, C, H, W) which is the 5-D multi-image
-            # format LLaVA expects. Variable N across samples is only safe at
-            # batch_size=1; for larger batches all N_i must be equal.
+            # Each sample contributes (N_i, C, H, W). Concatenate along dim 0
+            # to produce (sum(N_i), C, H, W) — the 4-D input CLIP's vision
+            # tower expects. For batch_size=1 this is just (N, C, H, W).
             try:
-                out[k] = torch.stack(tensors)  # (B, N, C, H, W)
+                out[k] = torch.cat(tensors, dim=0)  # (total_N, C, H, W)
             except RuntimeError:
                 out[k] = tensors  # fallback: list of (N_i, C, H, W)
         else:
