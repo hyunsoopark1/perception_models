@@ -125,7 +125,11 @@ class TrainArgs:
 # ---------------------------------------------------------------------------
 
 def _find_images(folder: Path) -> List[Path]:
-    """Return image_0, image_1, image_2 paths that exist in the folder."""
+    """Return up to 3 image paths from the folder.
+
+    First tries the canonical image_0/image_1/image_2 naming convention.
+    Falls back to any image files sorted by name (handles arbitrary *.jpg etc.).
+    """
     images = []
     for idx in range(3):
         for ext in IMAGE_EXTENSIONS:
@@ -133,6 +137,14 @@ def _find_images(folder: Path) -> List[Path]:
             if p.exists():
                 images.append(p)
                 break
+
+    if not images:
+        # Fallback: pick any image files in the folder, sorted, up to 3
+        images = sorted(
+            p for p in folder.iterdir()
+            if p.suffix.lower() in IMAGE_EXTENSIONS
+        )[:3]
+
     return images
 
 
