@@ -199,7 +199,7 @@ def collect_images(image_dir: str) -> List[Path]:
         raise NotADirectoryError(f"Not a directory: {d}")
 
     paths: List[Path] = []
-    for idx in range(15):
+    for idx in range(5):
         for ext in IMAGE_EXTENSIONS:
             p = d / f"image_{idx}{ext}"
             if p.exists():
@@ -207,7 +207,7 @@ def collect_images(image_dir: str) -> List[Path]:
                 break
 
     if not paths:
-        paths = sorted(p for p in d.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
+        paths = sorted(p for p in d.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)[:5]
 
     if not paths:
         raise FileNotFoundError(f"No image files found in: {d}")
