@@ -212,13 +212,12 @@ class StorylineMMDataset(Dataset):
             [messages[0]], add_generation_prompt=True, tokenize=False
         )
 
-        # Tokenize full sequence
+        # Tokenize full sequence — no truncation here because the processor
+        # can't safely truncate mid-image-token block (raises a mismatch error).
         enc = self.processor(
             text=full_prompt,
             images=images,
             return_tensors="pt",
-            truncation=True,
-            max_length=self.max_seq_length,
         )
 
         input_ids = enc["input_ids"][0]
@@ -232,6 +231,12 @@ class StorylineMMDataset(Dataset):
         )
         labels = input_ids.clone()
         labels[:prompt_len] = -100  # ignore prompt + image tokens in loss
+
+        # Truncate after label masking so image token blocks stay intact
+        if input_ids.shape[0] > self.max_seq_length:
+            input_ids = input_ids[:self.max_seq_length]
+            attention_mask = attention_mask[:self.max_seq_length]
+            labels = labels[:self.max_seq_length]
 
         sample = {
             "input_ids": input_ids,
