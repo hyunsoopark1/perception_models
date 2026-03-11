@@ -86,7 +86,7 @@ class ModelArgs:
 @dataclass
 class DataArgs:
     data_dir: str = "~/data/storyline_mm"
-    val_split: float = 0.1           # fraction of folders used for validation (9:1 train/val)
+    val_split: float = 0.05          # fraction of folders used for validation (19:1 train/val)
     max_seq_length: int = 1024       # max tokens for text (images handled separately)
     # Prompt sent to the model before the target text
     instruction: str = "Look at the image(s) and write a descriptive story."
