@@ -86,7 +86,7 @@ class ModelArgs:
 @dataclass
 class DataArgs:
     data_dir: str = "~/data/storyline_mm"
-    val_split: float = 0.05          # fraction of folders used for validation
+    val_split: float = 0.1           # fraction of folders used for validation (9:1 train/val)
     max_seq_length: int = 1024       # max tokens for text (images handled separately)
     # Prompt sent to the model before the target text
     instruction: str = "Look at the image(s) and write a descriptive story."
@@ -260,13 +260,24 @@ def _collate(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 
 
 def build_dataloaders(data_args: DataArgs, processor) -> Dict[str, Optional[DataLoader]]:
+    import random as _random
     data_dir = Path(data_args.data_dir).expanduser()
     folders = _load_folders(data_dir)
     logger.info(f"Found {len(folders)} samples in {data_dir}")
 
-    n_val = max(1, int(len(folders) * data_args.val_split))
-    val_folders = folders[-n_val:]
-    train_folders = folders[:-n_val]
+    if not folders:
+        raise FileNotFoundError(
+            f"No valid samples found in '{data_dir}'. "
+            "Each sample folder must contain text.txt and at least one image file."
+        )
+
+    # Reproducible random 9:1 train/val split
+    _random.seed(42)
+    shuffled = list(folders)
+    _random.shuffle(shuffled)
+    n_val = max(1, int(len(shuffled) * data_args.val_split))
+    val_folders = shuffled[:n_val]
+    train_folders = shuffled[n_val:]
     logger.info(f"Train: {len(train_folders)}  Val: {len(val_folders)}")
 
     def _make(fols, shuffle):
