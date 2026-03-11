@@ -115,7 +115,7 @@ class TrainArgs:
 
     log_freq: int = 10
     save_freq: int = 200
-    eval_freq: int = 100
+    eval_freq: int = 1000
 
     resume_from: str = ""
 
