@@ -301,11 +301,7 @@ def _resolve_dtype(name: str) -> torch.dtype:
 
 
 def build_model_and_processor(args: ModelArgs):
-    from transformers import AutoProcessor  # type: ignore
-    try:
-        from transformers import AutoModelForVision2Seq  # type: ignore
-    except ImportError:
-        from transformers import AutoModel as AutoModelForVision2Seq  # type: ignore
+    from transformers import AutoProcessor, AutoConfig  # type: ignore
 
     token = args.hf_token or os.environ.get("HF_TOKEN")
     dtype = _resolve_dtype(args.torch_dtype)
@@ -328,7 +324,26 @@ def build_model_and_processor(args: ModelArgs):
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
     processor.tokenizer.padding_side = "right"
 
-    model = AutoModelForVision2Seq.from_pretrained(
+    # Resolve the right model class from the config's architectures field so
+    # that both encoder-decoder VLMs (AutoModelForVision2Seq) and
+    # decoder-only VLMs like Llama-3.2-Vision (MllamaForConditionalGeneration)
+    # are handled correctly without requiring a minimum transformers version.
+    cfg = AutoConfig.from_pretrained(args.name, token=token, trust_remote_code=True)
+    arch = (cfg.architectures or [""])[0]
+
+    import transformers as _tr  # type: ignore
+    if hasattr(_tr, arch):
+        model_cls = getattr(_tr, arch)
+    else:
+        # Fallback: try AutoModelForVision2Seq, then AutoModel
+        try:
+            from transformers import AutoModelForVision2Seq  # type: ignore
+            model_cls = AutoModelForVision2Seq
+        except ImportError:
+            from transformers import AutoModel  # type: ignore
+            model_cls = AutoModel
+
+    model = model_cls.from_pretrained(
         args.name,
         quantization_config=bnb_config,
         torch_dtype=dtype if bnb_config is None else None,
