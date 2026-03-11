@@ -301,7 +301,11 @@ def _resolve_dtype(name: str) -> torch.dtype:
 
 
 def build_model_and_processor(args: ModelArgs):
-    from transformers import AutoProcessor, AutoModelForVision2Seq  # type: ignore
+    from transformers import AutoProcessor  # type: ignore
+    try:
+        from transformers import AutoModelForVision2Seq  # type: ignore
+    except ImportError:
+        from transformers import AutoModel as AutoModelForVision2Seq  # type: ignore
 
     token = args.hf_token or os.environ.get("HF_TOKEN")
     dtype = _resolve_dtype(args.torch_dtype)
