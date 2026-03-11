@@ -125,13 +125,13 @@ class TrainArgs:
 # ---------------------------------------------------------------------------
 
 def _find_images(folder: Path) -> List[Path]:
-    """Return up to 3 image paths from the folder.
+    """Return up to 5 image paths from the folder; extras are ignored.
 
-    First tries the canonical image_0/image_1/image_2 naming convention.
+    First tries the canonical image_0..image_4 naming convention.
     Falls back to any image files sorted by name (handles arbitrary *.jpg etc.).
     """
     images = []
-    for idx in range(3):
+    for idx in range(5):
         for ext in IMAGE_EXTENSIONS:
             p = folder / f"image_{idx}{ext}"
             if p.exists():
@@ -139,13 +139,12 @@ def _find_images(folder: Path) -> List[Path]:
                 break
 
     if not images:
-        # Fallback: pick any image files in the folder, sorted, up to 3
         images = sorted(
             p for p in folder.iterdir()
             if p.suffix.lower() in IMAGE_EXTENSIONS
-        )[:3]
+        )
 
-    return images
+    return images[:5]
 
 
 def _load_folders(data_dir: Path) -> List[Path]:
