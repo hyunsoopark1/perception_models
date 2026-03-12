@@ -535,13 +535,23 @@ def train_distillation(
 
 class PositionCrossAttention(nn.Module):
     """
-    Cross-attention with a learnable CLS token.
+    Two-stage attention head: self-attention then cross-attention.
 
-    Query sequence : [CLS, bbox_patch_0, ..., bbox_patch_k]   [B, k+1, D]
-    Key/value      : all patch tokens (full image)             [B, N,   D]
+    Stage 1 — Self-attention on [CLS, bbox_patches]:
+        CLS aggregates local information from the identity's bbox patches.
+        Without this stage, CLS only attends to the full-frame context
+        (cross-attention queries are independent), so every identity in the
+        same frame would produce the identical embedding.
 
-    Only the CLS output is returned — it aggregates local bbox context
-    from the full image without any manual pooling.
+    Stage 2 — Cross-attention with full frame:
+        The now-bbox-aware CLS attends to all patch tokens to gather
+        broader scene context.
+
+    Query sequence  : [CLS, bbox_patch_0, ..., bbox_patch_k]   [B, k+1, D]
+    Key/value (SA)  : same as query                             [B, k+1, D]
+    Key/value (XA)  : all patch tokens (full image)             [B, N,   D]
+
+    Only the CLS output is returned.
     """
 
     def __init__(self, embed_dim: int, num_heads: int = 8, dropout: float = 0.0):
@@ -549,6 +559,16 @@ class PositionCrossAttention(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
+        # Stage 1: self-attention so CLS can aggregate local bbox info
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_sa = nn.LayerNorm(embed_dim)
+
+        # Stage 2: cross-attention with full-frame patches
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
@@ -569,6 +589,11 @@ class PositionCrossAttention(nn.Module):
         cls = self.cls_token.expand(B, -1, -1)          # [B, 1, D]
         q   = torch.cat([cls, query_tokens], dim=1)     # [B, k+1, D]
 
+        # Stage 1: CLS aggregates local bbox-patch information (pre-norm + residual)
+        q_sa = self.norm_sa(q)
+        q    = q + self.self_attn(q_sa, q_sa, q_sa)[0]
+
+        # Stage 2: bbox-aware CLS cross-attends to full frame
         q  = self.norm_q(q)
         kv = self.norm_kv(context_tokens)
 
