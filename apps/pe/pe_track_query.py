@@ -117,6 +117,12 @@ def _parse_args():
     p.add_argument("--image-size", type=int, nargs=2, default=None, metavar=("W", "H"),
                    help="Original frame size in pixels — required for identity-format "
                         "and .txt track files.")
+    p.add_argument("--context-scale", type=float, default=2.0, metavar="S",
+                   help="Expand bbox by this factor around its center before "
+                        "patch selection (default: 2.0).")
+    p.add_argument("--softmax", action="store_true",
+                   help="Display softmax-normalised scores instead of raw "
+                        "cosine similarities.")
     p.add_argument("--frame-stride", type=int, default=1, metavar="N",
                    help="Process every Nth frame of the track (default: 1).")
     p.add_argument("--batch-size", type=int, default=32, metavar="N",
@@ -184,6 +190,7 @@ def _load_identity_track(
     path: str,
     identity: "str | None",
     image_size: "Tuple[int, int] | None",
+    context_scale: float = 2.0,
 ) -> "tuple[list[str], list]":
     """
     Parse an identity-format track file.
@@ -234,12 +241,15 @@ def _load_identity_track(
     bboxes: list          = []
     for entry in entries:
         frame_idx, cx, cy, w, h = entry
-        # Track format is (center_x, center_y, w, h) — convert to top-left
-        x1 = int(cx - w / 2)
-        y1 = int(cy - h / 2)
+        # Track format is (center_x, center_y, w, h).
+        # Expand by context_scale around center for richer patch context.
+        ew = w * context_scale
+        eh = h * context_scale
+        x1 = int(cx - ew / 2)
+        y1 = int(cy - eh / 2)
         frame_keys.append(f"{int(frame_idx):06d}")
         bboxes.append(BBoxPrompt(
-            pixel_coords=(x1, y1, int(w), int(h)),
+            pixel_coords=(x1, y1, int(ew), int(eh)),
             image_size=image_size,
         ))
 
@@ -355,6 +365,7 @@ if __name__ == "__main__":
             args.track_file,
             identity=args.identity,
             image_size=img_size_arg,
+            context_scale=args.context_scale,
         )
     else:
         track_paths, track_bboxes = load_track_file(
@@ -431,25 +442,29 @@ if __name__ == "__main__":
 
         logit_scale = pe_model.logit_scale.exp().item()
 
-        # Mean track embedding vs. text
-        mean_sims = mean_feat.to(device) @ text_feats.T          # [Q]
+        # Mean track embedding vs. text  (cosine similarity — both L2-normalised)
+        cos_sims   = mean_feat.to(device) @ text_feats.T                    # [Q]
+        mean_sims  = F.softmax(cos_sims, dim=0) if args.softmax else cos_sims
 
         # Per-frame vs. text
-        frame_sims = per_frame.to(device) @ text_feats.T         # [T, Q]
+        frame_cos  = per_frame.to(device) @ text_feats.T                    # [T, Q]
+        frame_sims = F.softmax(frame_cos, dim=-1) if args.softmax else frame_cos
 
+        score_label = "Softmax" if args.softmax else "CosSim"
         col_w = max(len(t) for t in args.text) + 2
-        print("\n--- Mean track embedding ↔ text ---")
-        print(f"  {'Phrase':<{col_w}}  {'Similarity':>10}  {'Logit':>11}"
+        print(f"\n--- Mean track embedding ↔ text  [{score_label}] ---")
+        print(f"  {'Phrase':<{col_w}}  {score_label:>10}  {'Logit':>11}"
               f"  {'Frame mean':>11}  {'Frame min':>10}  {'Frame max':>10}")
         print(f"  {'-'*col_w}  {'----------':>10}  {'-----------':>11}"
               f"  {'-----------':>11}  {'----------':>10}  {'----------':>10}")
         for q, phrase in enumerate(args.text):
             ms = mean_sims[q].item()
+            cs = cos_sims[q].item()
             fs = frame_sims[:, q]
             print(
                 f"  {phrase:<{col_w}}"
                 f"  {ms:>+10.4f}"
-                f"  {ms * logit_scale:>+11.4f}"
+                f"  {cs * logit_scale:>+11.4f}"
                 f"  {fs.mean().item():>+11.4f}"
                 f"  {fs.min().item():>+10.4f}"
                 f"  {fs.max().item():>+10.4f}"

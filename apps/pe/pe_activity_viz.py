@@ -141,6 +141,13 @@ def _parse_args():
                    help="Video frame rate — used to convert window-sec to frames. "
                         "Inferred from the feature file when possible; required "
                         "otherwise.")
+    p.add_argument("--context-scale", type=float, default=2.0, metavar="S",
+                   help="Expand bbox by this factor around its center before "
+                        "patch selection, to include surrounding context "
+                        "(default: 2.0 = twice the original size).")
+    p.add_argument("--softmax", action="store_true",
+                   help="Display softmax-normalised scores instead of raw "
+                        "cosine similarities (makes relative differences clearer).")
     return p.parse_args()
 
 
@@ -151,15 +158,21 @@ def _parse_args():
 def _load_all_tracks(
     path: str,
     image_size: Tuple[int, int],
-) -> "dict[str, tuple[list[str], list]]":
+    context_scale: float = 2.0,
+) -> "dict[str, tuple[list[str], list, list[int]]]":
     """
     Load every identity from an identity-format track file.
 
+    The bbox used for patch selection is expanded by ``context_scale`` around
+    its center so the cross-attention head sees surrounding context.
+    Out-of-bounds coordinates are clamped inside select_bbox_patches.
+
     Returns
     -------
-    dict mapping identity → (frame_keys, bboxes)
-        frame_keys : zero-padded frame indices, e.g. ["000000", "000003"]
-        bboxes     : list of BBoxPrompt
+    dict mapping identity → (frame_keys, bboxes, frame_indices)
+        frame_keys    : zero-padded frame indices, e.g. ["000000", "000003"]
+        bboxes        : list of BBoxPrompt (expanded for feature extraction)
+        frame_indices : original integer frame indices
     """
     from pe_position_approach1 import BBoxPrompt
 
@@ -174,13 +187,15 @@ def _load_all_tracks(
         fidxs:   list[int] = []
         for entry in entries:
             frame_idx, cx, cy, w, h = entry
-            # Track format is (center_x, center_y, w, h) — convert to top-left
-            x1 = int(cx - w / 2)
-            y1 = int(cy - h / 2)
+            # Expand bbox by context_scale around center
+            ew = w * context_scale
+            eh = h * context_scale
+            x1 = int(cx - ew / 2)
+            y1 = int(cy - eh / 2)
             fkeys.append(f"{int(frame_idx):06d}")
             fidxs.append(int(frame_idx))
             bboxes.append(BBoxPrompt(
-                pixel_coords=(x1, y1, int(w), int(h)),
+                pixel_coords=(x1, y1, int(ew), int(eh)),
                 image_size=image_size,
             ))
         result[identity] = (fkeys, bboxes, fidxs)
@@ -412,8 +427,10 @@ if __name__ == "__main__":
     # 4. Load all identity tracks + compute per-window embeddings
     # ------------------------------------------------------------------
     print(f"Loading tracks from {args.track_file} …")
-    all_tracks = _load_all_tracks(args.track_file, image_size)
-    print(f"  {len(all_tracks)} identities found.")
+    all_tracks = _load_all_tracks(
+        args.track_file, image_size, context_scale=args.context_scale
+    )
+    print(f"  {len(all_tracks)} identities found.  context_scale={args.context_scale}")
 
     # identity → {"windows": {wid: {label, score, all_scores, start_frame,
     #                                end_frame, start_sec, end_sec}},
@@ -455,15 +472,16 @@ if __name__ == "__main__":
             w_mean = F.normalize(
                 torch.cat(w_feats, dim=0).mean(dim=0), dim=-1
             )  # [E]
-            sims      = (w_mean.to(device) @ text_feats.T).cpu()  # [Q]
-            best_idx  = int(sims.argmax())
+            cos_sims  = (w_mean.to(device) @ text_feats.T).cpu()  # [Q], cosine sim
+            display   = F.softmax(cos_sims, dim=0) if args.softmax else cos_sims
+            best_idx  = int(display.argmax())
             start_fr  = wid * window_frames
             end_fr    = (wid + 1) * window_frames - 1
 
             windows[wid] = {
                 "label":       texts[best_idx],
-                "score":       sims[best_idx].item(),
-                "all_scores":  sims.tolist(),
+                "score":       display[best_idx].item(),
+                "all_scores":  display.tolist(),
                 "start_frame": start_fr,
                 "end_frame":   end_fr,
                 "start_sec":   start_fr / fps,
