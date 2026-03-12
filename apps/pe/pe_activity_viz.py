@@ -134,6 +134,13 @@ def _parse_args():
                    help="Draw a similarity bar chart in the video corner.")
     p.add_argument("--font-scale", type=float, default=0.55,
                    help="cv2 font scale for labels (default: 0.55).")
+    p.add_argument("--window-sec", type=float, default=5.0, metavar="S",
+                   help="Aggregate frames into windows of this many seconds "
+                        "and compute one similarity score per window (default: 5).")
+    p.add_argument("--fps", type=float, default=None, metavar="N",
+                   help="Video frame rate — used to convert window-sec to frames. "
+                        "Inferred from the feature file when possible; required "
+                        "otherwise.")
     return p.parse_args()
 
 
@@ -162,16 +169,21 @@ def _load_all_tracks(
     result: dict = {}
     for identity, entries in data.items():
         entries = sorted(entries, key=lambda e: e[0])
-        fkeys:  list[str] = []
-        bboxes: list      = []
+        fkeys:   list[str] = []
+        bboxes:  list      = []
+        fidxs:   list[int] = []
         for entry in entries:
-            frame_idx, x, y, w, h = entry
+            frame_idx, cx, cy, w, h = entry
+            # Track format is (center_x, center_y, w, h) — convert to top-left
+            x1 = int(cx - w / 2)
+            y1 = int(cy - h / 2)
             fkeys.append(f"{int(frame_idx):06d}")
+            fidxs.append(int(frame_idx))
             bboxes.append(BBoxPrompt(
-                pixel_coords=(int(x), int(y), int(w), int(h)),
+                pixel_coords=(x1, y1, int(w), int(h)),
                 image_size=image_size,
             ))
-        result[identity] = (fkeys, bboxes)
+        result[identity] = (fkeys, bboxes, fidxs)
     return result
 
 
@@ -186,9 +198,12 @@ def _build_frame_annotations(path: str) -> "dict[int, list[tuple]]":
     frame_anns: dict[int, list] = defaultdict(list)
     for identity, entries in data.items():
         for entry in entries:
-            frame_idx, x, y, w, h = entry
-            x1, y1 = int(x), int(y)
-            x2, y2 = int(x + w), int(y + h)
+            frame_idx, cx, cy, w, h = entry
+            # Track format is (center_x, center_y, w, h) — convert to corners
+            x1 = int(cx - w / 2)
+            y1 = int(cy - h / 2)
+            x2 = int(cx + w / 2)
+            y2 = int(cy + h / 2)
             frame_anns[int(frame_idx)].append((identity, x1, y1, x2, y2))
     return dict(frame_anns)
 
@@ -340,6 +355,20 @@ if __name__ == "__main__":
     if proj is not None:
         proj = proj.to(device)
 
+    # Determine FPS for window sizing
+    fps: float = (
+        args.fps
+        or feat_data.get("video_fps")
+        or feat_data.get("sample_fps")
+    )
+    if fps is None:
+        sys.exit(
+            "--fps is required when the feature file has no video_fps metadata "
+            "(e.g. when features were extracted from a frame directory)."
+        )
+    window_frames = max(1, int(args.window_sec * fps))
+    print(f"  fps={fps:.3f}  window={args.window_sec}s  ({window_frames} frames/window)")
+
     # ------------------------------------------------------------------
     # 2. Load cross-attention head
     # ------------------------------------------------------------------
@@ -380,72 +409,99 @@ if __name__ == "__main__":
     print(f"  {len(texts)} text descriptions encoded.")
 
     # ------------------------------------------------------------------
-    # 4. Load all identity tracks + compute mean embedding per identity
+    # 4. Load all identity tracks + compute per-window embeddings
     # ------------------------------------------------------------------
     print(f"Loading tracks from {args.track_file} …")
     all_tracks = _load_all_tracks(args.track_file, image_size)
     print(f"  {len(all_tracks)} identities found.")
 
-    # identity → {"mean_feat", "label", "score", "all_scores", "color"}
+    # identity → {"windows": {wid: {label, score, all_scores, start_frame,
+    #                                end_frame, start_sec, end_sec}},
+    #              "color": (B,G,R)}
     identity_info: dict[str, dict] = {}
 
-    for identity, (track_fkeys, track_bboxes) in all_tracks.items():
-        # Align to feature file
+    for identity, (track_fkeys, track_bboxes, track_fidxs) in all_tracks.items():
         try:
             feat_indices = _align_track_to_features(track_fkeys, feat_keys)
         except ValueError as e:
             print(f"  Skipping {identity}: {e}")
             continue
 
-        # Per-frame features (head only, batched)
-        frame_feats: list[torch.Tensor] = []
-        with torch.no_grad():
-            for start in range(0, len(feat_indices), args.batch_size):
-                end      = min(start + args.batch_size, len(feat_indices))
-                b_tokens = all_patch_tokens[feat_indices[start:end]]
-                b_bboxes = track_bboxes[start:end]
-                feats    = _head_forward_batch(
-                    head, b_tokens, b_bboxes, patch_grid, proj, device
-                )
-                frame_feats.append(feats.cpu())
+        # Group this identity's frames into window buckets
+        # wid = original_frame_index // window_frames
+        buckets: dict[int, tuple[list[int], list]] = {}
+        for feat_idx, bbox, frame_idx in zip(feat_indices, track_bboxes, track_fidxs):
+            wid = frame_idx // window_frames
+            if wid not in buckets:
+                buckets[wid] = ([], [])
+            buckets[wid][0].append(feat_idx)
+            buckets[wid][1].append(bbox)
 
-        per_frame  = torch.cat(frame_feats, dim=0)               # [T, E]
-        mean_feat  = F.normalize(per_frame.mean(dim=0), dim=-1)  # [E]
+        windows: dict[int, dict] = {}
+        for wid in sorted(buckets):
+            b_feat_idxs, b_bboxes = buckets[wid]
 
-        # Similarity against all text descriptions
-        sims       = (mean_feat.to(device) @ text_feats.T).cpu()  # [Q]
-        best_idx   = sims.argmax().item()
-        best_score = sims[best_idx].item()
-        best_label = texts[best_idx]
+            # Per-frame features for this window
+            w_feats: list[torch.Tensor] = []
+            with torch.no_grad():
+                for start in range(0, len(b_feat_idxs), args.batch_size):
+                    end      = min(start + args.batch_size, len(b_feat_idxs))
+                    b_tokens = all_patch_tokens[b_feat_idxs[start:end]]
+                    feats    = _head_forward_batch(
+                        head, b_tokens, b_bboxes[start:end], patch_grid, proj, device
+                    )
+                    w_feats.append(feats.cpu())
+
+            w_mean = F.normalize(
+                torch.cat(w_feats, dim=0).mean(dim=0), dim=-1
+            )  # [E]
+            sims      = (w_mean.to(device) @ text_feats.T).cpu()  # [Q]
+            best_idx  = int(sims.argmax())
+            start_fr  = wid * window_frames
+            end_fr    = (wid + 1) * window_frames - 1
+
+            windows[wid] = {
+                "label":       texts[best_idx],
+                "score":       sims[best_idx].item(),
+                "all_scores":  sims.tolist(),
+                "start_frame": start_fr,
+                "end_frame":   end_fr,
+                "start_sec":   start_fr / fps,
+                "end_sec":     (end_fr + 1) / fps,
+                "n_frames":    len(b_feat_idxs),
+            }
 
         identity_info[identity] = {
-            "mean_feat":  mean_feat,
-            "label":      best_label,
-            "score":      best_score,
-            "all_scores": sims.tolist(),
-            "color":      _identity_color(identity),
+            "windows":       windows,
+            "color":         _identity_color(identity),
+            "window_frames": window_frames,
         }
 
-        print(f"  {identity:>10}  [{len(feat_indices):4d} frames]  "
-              f"→  {best_label!r}  ({best_score:.3f})")
+        for wid, w in sorted(windows.items()):
+            print(f"  {identity:>10}  "
+                  f"[{w['start_sec']:5.1f}s – {w['end_sec']:5.1f}s  "
+                  f"{w['n_frames']:4d} frames]  "
+                  f"→  {w['label']!r}  ({w['score']:.3f})")
 
     # ------------------------------------------------------------------
-    # 5. Print full scores table
+    # 5. Print windowed scores table
     # ------------------------------------------------------------------
-    print("\n" + "─" * 80)
-    print(f"  {'Identity':<12}", end="")
-    for t in texts:
-        short = t[:18].ljust(20)
-        print(f"  {short}", end="")
-    print()
-    print("─" * 80)
+    col_w = 20
+    header = f"  {'Identity':<10}  {'Window':<14}" + "".join(
+        f"  {t[:col_w-2]:<{col_w}}" for t in texts
+    )
+    print("\n" + "─" * len(header))
+    print(header)
+    print("─" * len(header))
     for identity, info in identity_info.items():
-        print(f"  {identity:<12}", end="")
-        for sc in info["all_scores"]:
-            marker = "◆" if sc == max(info["all_scores"]) else " "
-            print(f"  {marker}{sc:+.3f}            ", end="")
-        print()
-    print("─" * 80)
+        for wid, w in sorted(info["windows"].items()):
+            time_str = f"{w['start_sec']:.1f}–{w['end_sec']:.1f}s"
+            print(f"  {identity:<10}  {time_str:<14}", end="")
+            for i, sc in enumerate(w["all_scores"]):
+                marker = "◆" if i == w["all_scores"].index(max(w["all_scores"])) else " "
+                print(f"  {marker}{sc:+.3f}{'':<{col_w-7}}", end="")
+            print()
+    print("─" * len(header))
 
     if args.no_video:
         sys.exit(0)
@@ -489,21 +545,32 @@ if __name__ == "__main__":
             info  = identity_info[identity]
             color = info["color"]
 
+            # Find which 5-second window this frame belongs to
+            wid   = frame_idx // info["window_frames"]
+            # Fall back to the nearest earlier window if this exact wid has no data
+            wins  = info["windows"]
+            if wid not in wins:
+                earlier = [k for k in wins if k <= wid]
+                if not earlier:
+                    continue
+                wid = max(earlier)
+            w = wins[wid]
+
             _draw_box_label(
                 frame, x1, y1, x2, y2,
-                label=info["label"],
-                score=info["score"],
+                label=w["label"],
+                score=w["score"],
                 color=color,
                 font_scale=args.font_scale,
             )
 
-            # Scores overlay: show for the first annotated identity per frame
+            # Scores overlay: show current-window scores for first identity
             if args.scores_overlay and identity == annotations[0][0]:
                 _draw_scores_overlay(
                     frame,
                     texts=texts,
-                    scores=info["all_scores"],
-                    title=identity,
+                    scores=w["all_scores"],
+                    title=f"{identity}  {w['start_sec']:.0f}–{w['end_sec']:.0f}s",
                     x=10, y=10,
                     font_scale=args.font_scale * 0.85,
                 )

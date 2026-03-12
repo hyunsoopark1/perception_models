@@ -233,10 +233,13 @@ def _load_identity_track(
     frame_keys: list[str] = []
     bboxes: list          = []
     for entry in entries:
-        frame_idx, x, y, w, h = entry
+        frame_idx, cx, cy, w, h = entry
+        # Track format is (center_x, center_y, w, h) — convert to top-left
+        x1 = int(cx - w / 2)
+        y1 = int(cy - h / 2)
         frame_keys.append(f"{int(frame_idx):06d}")
         bboxes.append(BBoxPrompt(
-            pixel_coords=(int(x), int(y), int(w), int(h)),
+            pixel_coords=(x1, y1, int(w), int(h)),
             image_size=image_size,
         ))
 
