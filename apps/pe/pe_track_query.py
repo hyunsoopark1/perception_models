@@ -24,8 +24,16 @@ Pipeline
                                                         │
              --text "..."  ──►  text encoder  ──►  similarity score
 
-Track file formats  (same as pe_position_approach1.py)
+Track file formats
 -------------------
+  Identity JSON  (tracker output — select identity with --identity):
+    {
+      "d14717": [[frame, x, y, w, h], [frame, x, y, w, h], ...],
+      "d14718": [...],
+      ...
+    }
+    Requires --image-size W H and --identity <id>.
+
   Compact JSON  (paired with feature file's sorted frame list):
     {"image_size": [W, H], "track": [[x,y,w,h], [x,y,w,h], ...]}
 
@@ -42,6 +50,15 @@ Usage
         --features     patch_features.pt \\
         --track-file   track.json \\
         --head-checkpoint head.pt
+
+    # Identity-format track (tracker output):
+    python apps/pe/pe_track_query.py \\
+        --features     patch_features.pt \\
+        --track-file   tracks.json \\
+        --identity     d14717 \\
+        --image-size   1920 1080 \\
+        --head-checkpoint head.pt \\
+        --text "a person walking"
 
     # With text comparison:
     python apps/pe/pe_track_query.py \\
@@ -94,8 +111,12 @@ def _parse_args():
                    help="PE checkpoint path for the text encoder.")
     p.add_argument("--no-pretrained", action="store_true",
                    help="Skip loading pretrained weights (smoke test).")
+    p.add_argument("--identity", default=None, metavar="ID",
+                   help="Identity key to query from an identity-format track file "
+                        "(e.g. 'd14717'). List available IDs by omitting this flag.")
     p.add_argument("--image-size", type=int, nargs=2, default=None, metavar=("W", "H"),
-                   help="Original image size — required for .txt track files.")
+                   help="Original frame size in pixels — required for identity-format "
+                        "and .txt track files.")
     p.add_argument("--frame-stride", type=int, default=1, metavar="N",
                    help="Process every Nth frame of the track (default: 1).")
     p.add_argument("--batch-size", type=int, default=32, metavar="N",
@@ -139,6 +160,87 @@ def _head_forward_batch(
         embeds = embeds @ proj            # [B, E]
 
     return F.normalize(embeds, dim=-1)   # [B, E]
+
+
+# ---------------------------------------------------------------------------
+# Identity-format track loader
+# ---------------------------------------------------------------------------
+
+def _is_identity_format(data: object) -> bool:
+    """Return True if data is a dict mapping identity strings to [[frame,x,y,w,h],…]."""
+    if not isinstance(data, dict):
+        return False
+    # Heuristic: first value must be a non-empty list whose first element is
+    # itself a list/tuple of 5 numbers starting with a frame index.
+    for v in data.values():
+        if not isinstance(v, list) or not v:
+            return False
+        first = v[0]
+        return isinstance(first, (list, tuple)) and len(first) == 5
+    return False
+
+
+def _load_identity_track(
+    path: str,
+    identity: "str | None",
+    image_size: "Tuple[int, int] | None",
+) -> "tuple[list[str], list]":
+    """
+    Parse an identity-format track file.
+
+    Format::
+
+        {
+          "d14717": [[frame, x, y, w, h], ...],
+          "d14718": [[frame, x, y, w, h], ...],
+        }
+
+    Parameters
+    ----------
+    path        : path to the JSON file
+    identity    : which ID to load; if None, lists available IDs and exits
+    image_size  : (W, H) of the original frames — required for BBoxPrompt
+
+    Returns
+    -------
+    frame_keys  : list of zero-padded frame-index strings (e.g. ["000000", "000003"])
+    bboxes      : list of BBoxPrompt, one per frame
+    """
+    import json
+    from pe_position_approach1 import BBoxPrompt
+
+    with open(path) as f:
+        data = json.load(f)
+
+    if identity is None:
+        ids = sorted(data.keys())
+        print("Available identities in track file:")
+        for id_ in ids:
+            print(f"  {id_}  ({len(data[id_])} frames)")
+        sys.exit("Re-run with --identity <id>")
+
+    if identity not in data:
+        sys.exit(f"Identity {identity!r} not found. "
+                 f"Available: {sorted(data.keys())}")
+
+    if image_size is None:
+        sys.exit("--image-size W H is required for identity-format track files.")
+
+    entries = data[identity]  # [[frame, x, y, w, h], ...]
+    # Sort by frame index in case the tracker output is unordered
+    entries = sorted(entries, key=lambda e: e[0])
+
+    frame_keys: list[str] = []
+    bboxes: list          = []
+    for entry in entries:
+        frame_idx, x, y, w, h = entry
+        frame_keys.append(f"{int(frame_idx):06d}")
+        bboxes.append(BBoxPrompt(
+            pixel_coords=(int(x), int(y), int(w), int(h)),
+            image_size=image_size,
+        ))
+
+    return frame_keys, bboxes
 
 
 # ---------------------------------------------------------------------------
@@ -240,12 +342,24 @@ if __name__ == "__main__":
     img_size_arg: Optional[Tuple[int, int]] = (
         tuple(args.image_size) if args.image_size else None   # type: ignore[arg-type]
     )
-    track_paths, track_bboxes = load_track_file(
-        args.track_file,
-        image_size=img_size_arg,
-    )
 
-    # Cross-reference track filenames → feature-file indices
+    import json as _json
+    with open(args.track_file) as _f:
+        _raw = _json.load(_f)
+
+    if _is_identity_format(_raw):
+        track_paths, track_bboxes = _load_identity_track(
+            args.track_file,
+            identity=args.identity,
+            image_size=img_size_arg,
+        )
+    else:
+        track_paths, track_bboxes = load_track_file(
+            args.track_file,
+            image_size=img_size_arg,
+        )
+
+    # Cross-reference track frame keys → feature-file indices
     feat_indices = _align_track_to_features(track_paths, feat_frame_paths)
 
     # Apply stride
