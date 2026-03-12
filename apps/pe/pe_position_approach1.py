@@ -141,20 +141,31 @@ def select_bbox_patches(
 ) -> torch.Tensor:
     """
     Returns indices of patches whose centers fall inside the bounding box.
-    Raises ValueError if the box selects no patches.
+
+    Normalized coordinates are clamped to [0, 1] so tracker boxes that
+    overflow the frame edge are handled gracefully.  If no patch center
+    falls inside the (clamped) box — e.g. a very thin sliver at the frame
+    edge — the single nearest patch by L2 distance is returned instead.
     """
     x1, y1, x2, y2 = bbox.normalized()
+    # Clamp to valid image space; tracker output can exceed frame bounds
+    x1, y1 = max(0.0, x1), max(0.0, y1)
+    x2, y2 = min(1.0, x2), min(1.0, y2)
+
     mask = (
         (patch_grid[:, 0] >= x1) & (patch_grid[:, 0] <= x2) &
         (patch_grid[:, 1] >= y1) & (patch_grid[:, 1] <= y2)
     )
     indices = mask.nonzero(as_tuple=True)[0]
+
     if len(indices) == 0:
-        raise ValueError(
-            f"No patches selected for bbox {bbox.pixel_coords} "
-            f"(normalized: {bbox.normalized()}). "
-            "Check that x2 > x1 and y2 > y1 in pixel coordinates."
-        )
+        # Box is a sub-patch sliver after clamping — fall back to nearest patch
+        cx = torch.tensor([(x1 + x2) / 2.0], device=patch_grid.device)
+        cy = torch.tensor([(y1 + y2) / 2.0], device=patch_grid.device)
+        center = torch.stack([cx, cy], dim=-1)          # [1, 2]
+        dists  = ((patch_grid - center) ** 2).sum(-1)   # [N]
+        indices = dists.argmin(keepdim=True)
+
     return indices
 
 
