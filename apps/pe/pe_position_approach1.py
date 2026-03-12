@@ -2,7 +2,7 @@
 PE Position-Prompted Scene Understanding — Approach 1
 Patch Token Selection + Cross-Attention (no retraining of PE required)
 
-Usage (bbox feature extraction):
+Usage (bbox feature extraction — single image):
     python apps/pe/pe_position_approach1.py \
         --image apps/pe/docs/assets/cat.png \
         --bbox 50 30 350 270 \
@@ -15,6 +15,31 @@ Usage (bbox feature extraction):
         --no-pretrained
 
     # --bbox takes X Y W H (top-left corner + width + height)
+
+Usage (video tracking — moving bounding box):
+    python apps/pe/pe_position_approach1.py \
+        --video-dir /path/to/frames/ \
+        --track-file track.json \
+        --feat-out features.pt \
+        --model PE-Core-G14-448
+
+    # track.json (compact form — pairs with sorted frames from --video-dir):
+    #   {"image_size": [W, H], "track": [[x,y,w,h], [x,y,w,h], ...]}
+    #
+    # track.json (explicit form — filenames included):
+    #   [{"file": "frame_000.jpg", "bbox": [x,y,w,h], "image_size": [W, H]}, ...]
+    #
+    # track.txt (one frame per line, requires --image-size W H):
+    #   frame_000.jpg  x  y  w  h
+    #   frame_001.jpg  x  y  w  h
+    #
+    # Outputs saved to features.pt:
+    #   {"per_frame": Tensor[T, D], "clip_embed": Tensor[D], "frame_paths": [...]}
+    #
+    # Optional flags:
+    #   --frame-stride 2        # process every 2nd frame
+    #   --video-batch-size 16   # frames per GPU batch
+    #   --text "a cat" "a dog"  # compare clip embedding to text
 
 Usage (distillation training from crop.txt):
     python apps/pe/pe_position_approach1.py \
@@ -283,6 +308,116 @@ def load_distillation_annotations(ann_file: str) -> list:
         for ann in data["annotations"]
         if ann["image_id"] in id_to_fn
     ]
+
+
+# ---------------------------------------------------------------------------
+# Video tracking utilities
+# ---------------------------------------------------------------------------
+
+def load_track_file(
+    track_file: str,
+    image_size: Optional[Tuple[int, int]] = None,
+    video_dir: Optional[str] = None,
+) -> "tuple[list[str], list[BBoxPrompt]]":
+    """
+    Parse a track file into (frame_paths, bboxes).
+
+    Supported formats
+    -----------------
+    **JSON — explicit list of objects** (image_size per entry or global):
+
+    .. code-block:: json
+
+        [
+          {"file": "frame_000.jpg", "bbox": [x, y, w, h], "image_size": [W, H]},
+          {"file": "frame_001.jpg", "bbox": [x, y, w, h]}
+        ]
+
+    ``"image_size"`` may be omitted per-entry if supplied as the
+    ``image_size`` argument or as a top-level key in an object variant:
+
+    .. code-block:: json
+
+        {"image_size": [W, H], "track": [[x, y, w, h], [x, y, w, h], ...]}
+
+    In the object variant the frame filenames are taken from ``video_dir``
+    sorted alphabetically.
+
+    **TXT — one entry per line**::
+
+        frame_000.jpg  x  y  w  h
+        frame_001.jpg  x  y  w  h
+
+    ``image_size`` must be supplied as the argument when using this format.
+
+    Returns
+    -------
+    frame_paths : list of absolute file path strings
+    bboxes      : list of :class:`BBoxPrompt` (one per frame)
+    """
+    path = Path(track_file)
+    frame_paths: list[str] = []
+    bboxes: list[BBoxPrompt] = []
+
+    if path.suffix.lower() == ".txt":
+        if image_size is None:
+            raise ValueError("image_size must be provided when loading a .txt track file")
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) != 5:
+                    raise ValueError(f"Expected 'filename x y w h', got: {line!r}")
+                fname, x, y, w, h = parts
+                fp = str(Path(video_dir) / fname) if video_dir else fname
+                frame_paths.append(fp)
+                bboxes.append(BBoxPrompt(
+                    pixel_coords=(int(x), int(y), int(w), int(h)),
+                    image_size=image_size,
+                ))
+        return frame_paths, bboxes
+
+    with open(path) as f:
+        data = json.load(f)
+
+    if isinstance(data, dict):
+        # {"image_size": [W, H], "track": [[x,y,w,h], ...]}
+        global_size: Tuple[int, int] = tuple(data["image_size"])  # type: ignore[assignment]
+        raw_track = data["track"]
+        if video_dir is None:
+            raise ValueError("--video-dir is required when track file uses the compact dict format")
+        sorted_frames = sorted(Path(video_dir).iterdir())
+        if len(sorted_frames) < len(raw_track):
+            raise ValueError(
+                f"video_dir has {len(sorted_frames)} frames but track has {len(raw_track)} entries"
+            )
+        for frame_path, xywh in zip(sorted_frames, raw_track):
+            frame_paths.append(str(frame_path))
+            bboxes.append(BBoxPrompt(
+                pixel_coords=tuple(int(v) for v in xywh),  # type: ignore[arg-type]
+                image_size=global_size,
+            ))
+    else:
+        # list of {"file": ..., "bbox": [...], "image_size": [...]}
+        global_size = image_size  # type: ignore[assignment]
+        for entry in data:
+            fname = entry["file"]
+            fp = str(Path(video_dir) / fname) if video_dir else fname
+            frame_paths.append(fp)
+            sz = tuple(entry["image_size"]) if "image_size" in entry else global_size  # type: ignore[assignment]
+            if sz is None:
+                raise ValueError(
+                    f"No image_size for frame {fname!r}. "
+                    "Supply it per-entry or pass --image-size."
+                )
+            bboxes.append(BBoxPrompt(
+                pixel_coords=tuple(int(v) for v in entry["bbox"]),  # type: ignore[arg-type]
+                image_size=sz,
+            ))
+
+    return frame_paths, bboxes
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +705,56 @@ class PEBBoxFeatureExtractor(nn.Module):
             image = image.unsqueeze(0)
         return self.forward(image, [bbox]).squeeze(0)
 
+    # ------------------------------------------------------------------
+    # Video: extract features for a tracked bounding box across frames
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def encode_track(
+        self,
+        frames: torch.Tensor,       # [T, C, H, W]
+        track: "list[BBoxPrompt]",  # length T — one bbox per frame
+        batch_size: int = 8,
+        reduction: str = "mean",    # "mean" → [D], "none" → [T, D]
+    ) -> torch.Tensor:
+        """
+        Extract features for a moving bounding box across T video frames.
+
+        Frames are processed in mini-batches of ``batch_size`` to avoid OOM
+        on long clips.  Each frame gets its own feature vector via the
+        cross-attention head, then an optional temporal reduction is applied.
+
+        Args:
+            frames     : preprocessed frame tensor [T, C, H, W].
+            track      : list of BBoxPrompts, one per frame.
+            batch_size : how many frames to forward through PE at once.
+            reduction  : ``"mean"`` returns a single [D] clip embedding;
+                         ``"none"`` returns per-frame embeddings [T, D].
+
+        Returns:
+            Tensor of shape [D] (mean) or [T, D] (none), L2-normalized.
+        """
+        if len(track) != frames.shape[0]:
+            raise ValueError(
+                f"len(track)={len(track)} must equal frames.shape[0]={frames.shape[0]}"
+            )
+        self.eval()
+        device = next(self.parameters()).device
+        per_frame: list[torch.Tensor] = []
+
+        for start in range(0, frames.shape[0], batch_size):
+            batch_frames = frames[start : start + batch_size].to(device)  # [B, C, H, W]
+            batch_bboxes = track[start : start + batch_size]
+            feats = self.forward(batch_frames, batch_bboxes)               # [B, D]
+            per_frame.append(feats.cpu())
+
+        all_feats = torch.cat(per_frame, dim=0)   # [T, D]
+
+        if reduction == "none":
+            return all_feats
+        # mean pool then re-normalize so the clip embedding is unit-length
+        return F.normalize(all_feats.mean(dim=0), dim=-1)  # [D]
+
 
 # ---------------------------------------------------------------------------
 # Model loader
@@ -659,6 +844,21 @@ def _parse_args():
                    metavar="PHRASE",
                    help="Text phrases to compare via cosine similarity.")
 
+    # ---- video / tracking ----
+    p.add_argument("--video-dir", type=str, default=None, metavar="DIR",
+                   help="Directory of video frames (images sorted alphabetically).")
+    p.add_argument("--track-file", type=str, default=None, metavar="FILE",
+                   help="Track file mapping frames → bboxes.  "
+                        "JSON list [{\"file\", \"bbox\", \"image_size\"?}] or "
+                        "dict {\"image_size\", \"track\": [[x,y,w,h],...]} or "
+                        ".txt 'filename x y w h' per line.")
+    p.add_argument("--frame-stride", type=int, default=1, metavar="N",
+                   help="Process every Nth frame (default: 1 = every frame).")
+    p.add_argument("--feat-out", type=str, default=None, metavar="PATH",
+                   help="Save per-frame features [T, D] as a .pt file.")
+    p.add_argument("--video-batch-size", type=int, default=8, metavar="N",
+                   help="Frames per GPU batch during video encoding (default: 8).")
+
     # ---- distillation training ----
     p.add_argument("--train", action="store_true",
                    help="Run distillation training instead of inference.")
@@ -745,6 +945,90 @@ if __name__ == "__main__":
             precompute=not args.no_precompute,
             use_amp=not args.no_amp,
         )
+        sys.exit(0)
+
+    # ------------------------------------------------------------------
+    # Video tracking mode
+    # ------------------------------------------------------------------
+    if args.video_dir is not None or args.track_file is not None:
+        if args.video_dir is None or args.track_file is None:
+            raise SystemExit("Both --video-dir and --track-file are required for video mode.")
+
+        img_size_arg: Optional[Tuple[int, int]] = (
+            tuple(args.image_size) if args.image_size is not None else None  # type: ignore[assignment]
+        )
+        frame_paths, track = load_track_file(
+            args.track_file,
+            image_size=img_size_arg,
+            video_dir=args.video_dir,
+        )
+
+        # Apply stride
+        stride = max(1, args.frame_stride)
+        frame_paths = frame_paths[::stride]
+        track       = track[::stride]
+        T = len(frame_paths)
+        print(f"Video track : {T} frames (stride={stride}), source: {args.video_dir}")
+
+        # Load and preprocess all frames
+        print("Loading frames…")
+        frame_tensors: list[torch.Tensor] = []
+        for fp in frame_paths:
+            pil = PILImage.open(fp).convert("RGB")
+            frame_tensors.append(preprocess(pil))
+        frames = torch.stack(frame_tensors)   # [T, C, H, W]
+
+        # Per-frame features
+        print(f"Encoding {T} frames (batch_size={args.video_batch_size})…")
+        per_frame_feats = model.encode_track(
+            frames, track,
+            batch_size=args.video_batch_size,
+            reduction="none",
+        )  # [T, D]
+
+        clip_feat = model.encode_track(
+            frames, track,
+            batch_size=args.video_batch_size,
+            reduction="mean",
+        )  # [D]
+
+        print(f"\nPer-frame features : {per_frame_feats.shape}  (L2 norms ≈ 1)")
+        print(f"Clip embedding     : {clip_feat.shape}   norm={clip_feat.norm().item():.6f}")
+
+        # Frame-to-frame similarity (motion smoothness proxy)
+        if T > 1:
+            diffs = F.cosine_similarity(
+                per_frame_feats[:-1], per_frame_feats[1:], dim=-1
+            )
+            print(f"Frame-to-frame cos sim : mean={diffs.mean().item():.4f}  "
+                  f"min={diffs.min().item():.4f}  max={diffs.max().item():.4f}")
+
+        # Save per-frame features
+        if args.feat_out is not None:
+            payload = {
+                "per_frame": per_frame_feats,   # [T, D]
+                "clip_embed": clip_feat,         # [D]
+                "frame_paths": frame_paths,
+            }
+            torch.save(payload, args.feat_out)
+            print(f"Features saved → {args.feat_out}")
+
+        # Optional text comparison against the clip embedding
+        if args.text is not None:
+            from core.vision_encoder.transforms import get_text_tokenizer
+            print("\n--- Text Comparison (clip embedding ↔ text) ---")
+            tokenizer  = get_text_tokenizer(pe_model.context_length)
+            tokens     = tokenizer(args.text).to(device)
+            with torch.no_grad():
+                text_feats = pe_model.encode_text(tokens, normalize=True)
+            sims = (clip_feat.to(device) @ text_feats.T)   # [T_text]
+            logit_scale = pe_model.logit_scale.exp().item()
+            col_w = max(len(t) for t in args.text) + 2
+            print(f"  {'Phrase':<{col_w}}  {'Similarity':>10}  {'Logit':>10}")
+            print(f"  {'-'*col_w}  {'----------':>10}  {'----------':>10}")
+            for phrase, s in zip(args.text, sims.tolist()):
+                print(f"  {phrase:<{col_w}}  {s:>+10.4f}  {s * logit_scale:>+10.4f}")
+
         sys.exit(0)
 
     # ------------------------------------------------------------------
