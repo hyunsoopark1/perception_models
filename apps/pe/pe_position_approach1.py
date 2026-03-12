@@ -840,7 +840,11 @@ def load_pe_extractor(
 
     if head_checkpoint_path is not None:
         state = torch.load(head_checkpoint_path, map_location=device)
-        model.cross_attn_head.load_state_dict(state)
+        missing, unexpected = model.cross_attn_head.load_state_dict(state, strict=False)
+        if missing:
+            print(f"  Warning: new head keys not in checkpoint (will use random init): {missing}")
+        if unexpected:
+            print(f"  Warning: checkpoint keys not in head (ignored): {unexpected}")
         print(f"  Head weights loaded ← {head_checkpoint_path}")
 
     return model

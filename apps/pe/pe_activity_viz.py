@@ -390,7 +390,11 @@ if __name__ == "__main__":
     head = PositionCrossAttention(embed_dim=width, num_heads=args.num_heads).to(device)
     if args.head_checkpoint is not None:
         state = torch.load(args.head_checkpoint, map_location=device, weights_only=True)
-        head.load_state_dict(state)
+        missing, unexpected = head.load_state_dict(state, strict=False)
+        if missing:
+            print(f"  Warning: new head keys not in checkpoint (will use random init): {missing}")
+        if unexpected:
+            print(f"  Warning: checkpoint keys not in head (ignored): {unexpected}")
         print(f"  Head weights loaded ← {args.head_checkpoint}")
     else:
         print("  Warning: --head-checkpoint not provided — using random head.")
