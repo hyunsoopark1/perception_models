@@ -240,20 +240,17 @@ if __name__ == "__main__":
 
     buf_imgs: list[torch.Tensor] = []
     buf_keys: list[str]          = []
-    processed = 0
 
     def _flush_buf():
-        nonlocal processed
         if not buf_imgs:
             return
         imgs   = torch.stack(buf_imgs).to(device)
         tokens = visual.forward_features(imgs, norm=True, strip_cls_token=True)
         all_tokens.append(tokens.cpu())
         frame_keys.extend(buf_keys)
-        processed += len(buf_imgs)
         buf_imgs.clear()
         buf_keys.clear()
-        print(f"\r  {processed} frames encoded", end="", flush=True)
+        print(f"\r  {len(frame_keys)} frames encoded", end="", flush=True)
 
     with torch.no_grad():
         for key, pil in frame_iter:

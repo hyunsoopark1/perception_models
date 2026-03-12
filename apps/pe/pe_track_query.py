@@ -175,7 +175,6 @@ def _align_track_to_features(
                 f"Track frame {tp!r} not found in the feature file.\n"
                 "Make sure pe_extract_patch_features.py was run on the same source."
             )
-        indices.append(stem_to_idx[key])
     return indices
 
 
