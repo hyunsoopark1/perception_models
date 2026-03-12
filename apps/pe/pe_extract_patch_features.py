@@ -1,60 +1,165 @@
 """
 PE Patch Feature Extractor  —  offline preprocessing step.
 
-Runs the frozen PE visual encoder over a directory of video frames and saves
-per-frame patch tokens to a single .pt file.  This is the expensive step;
-run it once, then use pe_track_query.py for fast repeated queries with any
-number of bounding-box tracks — no image encoder reload required.
+Runs the frozen PE visual encoder over a video file (or a directory of frames)
+and saves per-frame patch tokens to a single .pt file.  This is the expensive
+step; run it once, then use pe_track_query.py for fast repeated queries with
+any number of bounding-box tracks — no image encoder reload required.
 
 Saved file layout
 -----------------
-    patch_tokens : Tensor[T, N, D]   — frozen PE spatial patch tokens (float32)
-    proj         : Tensor[D, E] | None — visual projection matrix (D → CLIP dim)
-    frame_paths  : list[str]          — absolute paths, sorted
-    model_name   : str
-    image_size   : int                — encoder input resolution (e.g. 448)
-    patch_size   : int                — patch side in pixels  (e.g. 14)
-    width        : int  (D)           — patch token dimension
+    patch_tokens  : Tensor[T, N, D]   — frozen PE spatial patch tokens (float32)
+    proj          : Tensor[D, E] | None — visual projection matrix (D → CLIP dim)
+    frame_keys    : list[str]          — frame identifiers (see below)
+    model_name    : str
+    image_size    : int                — encoder input resolution (e.g. 448)
+    patch_size    : int                — patch side in pixels  (e.g. 14)
+    width         : int  (D)          — patch token dimension
+
+    # video source only:
+    source_video  : str               — absolute path to the input video
+    video_fps     : float             — original video frame rate
+    sample_fps    : float             — frame rate at which frames were sampled
+    frame_indices : list[int]         — original frame indices in the video
+
+    frame_keys for video  : "000000", "000001", …  (original frame index, zero-padded)
+    frame_keys for frames : filename of each image (e.g. "frame_000.jpg")
 
 Usage
 -----
-    # Extract from a directory of frames:
+    # From a video file (all frames):
     python apps/pe/pe_extract_patch_features.py \\
-        --frame-dir /path/to/frames \\
-        --out       patch_features.pt \\
-        --model     PE-Core-G14-448
+        --video  /path/to/video.mp4 \\
+        --out    patch_features.pt \\
+        --model  PE-Core-G14-448
 
-    # Custom batch size to fit GPU memory:
+    # Sample at 5 fps from a video:
     python apps/pe/pe_extract_patch_features.py \\
-        --frame-dir /path/to/frames \\
-        --out       patch_features.pt \\
-        --batch-size 4
+        --video  /path/to/video.mp4 \\
+        --out    patch_features.pt \\
+        --fps    5
 
-    # Smoke test without downloading weights:
+    # Process only frames 100–500 of a video:
+    python apps/pe/pe_extract_patch_features.py \\
+        --video        /path/to/video.mp4 \\
+        --out          patch_features.pt \\
+        --start-frame  100 \\
+        --end-frame    500
+
+    # From a directory of frames (original behaviour):
     python apps/pe/pe_extract_patch_features.py \\
         --frame-dir /path/to/frames \\
-        --out       /tmp/smoke.pt \\
-        --no-pretrained
+        --out       patch_features.pt
+
+    # Halve disk usage with float16 tokens:
+    python apps/pe/pe_extract_patch_features.py \\
+        --video /path/to/video.mp4 \\
+        --out   patch_features.pt \\
+        --half
 """
 
 import argparse
 import sys
 from pathlib import Path
+from typing import Iterator, Tuple
 
 import torch
 from PIL import Image as PILImage
 
-# Image extensions considered as video frames
+# Image extensions recognised when using --frame-dir
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
+# ---------------------------------------------------------------------------
+# Frame iterators
+# ---------------------------------------------------------------------------
+
+def _iter_video_frames(
+    video_path: str,
+    fps: float | None,
+    start_frame: int,
+    end_frame: int | None,
+) -> Iterator[Tuple[int, PILImage.Image]]:
+    """
+    Yield (original_frame_index, PIL RGB image) from a video file.
+
+    Parameters
+    ----------
+    fps         : target sampling rate; None = every frame
+    start_frame : first frame index to include (0-based)
+    end_frame   : last frame index (exclusive); None = until EOF
+    """
+    try:
+        import cv2
+    except ImportError:
+        sys.exit(
+            "opencv-python is required for video input.\n"
+            "Install with:  pip install opencv-python-headless"
+        )
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        sys.exit(f"Cannot open video: {video_path}")
+
+    video_fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total       = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    sample_fps  = fps if fps is not None else video_fps
+    stride      = max(1, round(video_fps / sample_fps))
+
+    print(f"  video fps={video_fps:.3f}  total_frames={total}"
+          f"  sample_fps={sample_fps:.3f}  stride={stride}")
+
+    # Seek to start_frame efficiently
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    frame_idx = start_frame
+    try:
+        while True:
+            ret, bgr = cap.read()
+            if not ret:
+                break
+            if end_frame is not None and frame_idx >= end_frame:
+                break
+
+            if (frame_idx - start_frame) % stride == 0:
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                yield frame_idx, PILImage.fromarray(rgb)
+
+            frame_idx += 1
+    finally:
+        cap.release()
+
+
+def _iter_dir_frames(
+    frame_dir: str,
+) -> Iterator[Tuple[str, PILImage.Image]]:
+    """Yield (filename, PIL RGB image) for every image in a directory (sorted)."""
+    paths = sorted(
+        p for p in Path(frame_dir).iterdir() if p.suffix.lower() in _IMG_EXTS
+    )
+    if not paths:
+        sys.exit(f"No images found in {frame_dir}  (extensions: {_IMG_EXTS})")
+    for p in paths:
+        yield p.name, PILImage.open(p).convert("RGB")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def _parse_args():
     p = argparse.ArgumentParser(
-        description="Extract PE patch tokens from video frames and save to disk.",
+        description="Extract PE patch tokens from a video file or frame directory.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--frame-dir", required=True, metavar="DIR",
-                   help="Directory of frame images (loaded in sorted order).")
+
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--video", metavar="PATH",
+                     help="Input video file (.mp4, .avi, .mov, …).")
+    src.add_argument("--frame-dir", metavar="DIR",
+                     help="Directory of frame images (sorted alphabetically).")
+
     p.add_argument("--out", required=True, metavar="PATH",
                    help="Output .pt file.")
     p.add_argument("--model", default="PE-Core-G14-448",
@@ -63,19 +168,32 @@ def _parse_args():
                    help="PE model variant (default: PE-Core-G14-448).")
     p.add_argument("--batch-size", type=int, default=8, metavar="N",
                    help="Frames per GPU batch (default: 8).")
-    p.add_argument("--checkpoint", type=str, default=None, metavar="PATH",
+    p.add_argument("--checkpoint", metavar="PATH",
                    help="Local .pt path for the PE encoder (overrides HF download).")
     p.add_argument("--no-pretrained", action="store_true",
                    help="Skip loading pretrained weights (smoke test).")
     p.add_argument("--half", action="store_true",
-                   help="Save patch tokens as float16 to halve disk/RAM usage.")
+                   help="Save patch tokens as float16 (~2× smaller file).")
+
+    # Video-only options
+    p.add_argument("--fps", type=float, default=None, metavar="N",
+                   help="[video] Sample at this frame rate; default = every frame.")
+    p.add_argument("--start-frame", type=int, default=0, metavar="N",
+                   help="[video] First frame index to process (default: 0).")
+    p.add_argument("--end-frame", type=int, default=None, metavar="N",
+                   help="[video] Last frame index, exclusive (default: until EOF).")
+
     return p.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     args = _parse_args()
 
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pretrained = not args.no_pretrained
 
     # ------------------------------------------------------------------
@@ -95,44 +213,86 @@ if __name__ == "__main__":
     preprocess = pe_transforms.get_image_transform(visual.image_size)
 
     # ------------------------------------------------------------------
-    # Discover frames
+    # Build frame iterator
     # ------------------------------------------------------------------
-    frame_dir  = Path(args.frame_dir)
-    frame_paths = sorted(
-        p for p in frame_dir.iterdir() if p.suffix.lower() in _IMG_EXTS
-    )
-    if not frame_paths:
-        sys.exit(f"No images found in {frame_dir}  (extensions: {_IMG_EXTS})")
-    T = len(frame_paths)
-    print(f"Found {T} frames in {frame_dir}")
+    is_video = args.video is not None
+
+    if is_video:
+        print(f"Source : video  {args.video}")
+        frame_iter = _iter_video_frames(
+            args.video,
+            fps=args.fps,
+            start_frame=args.start_frame,
+            end_frame=args.end_frame,
+        )
+    else:
+        print(f"Source : frames  {args.frame_dir}")
+        frame_iter = _iter_dir_frames(args.frame_dir)
 
     # ------------------------------------------------------------------
     # Extract patch tokens in batches
     # ------------------------------------------------------------------
-    all_tokens: list[torch.Tensor] = []
+    all_tokens:       list[torch.Tensor] = []
+    frame_keys:       list[str]          = []
+    frame_indices:    list[int]          = []   # video only
+    video_fps_value:  float              = 0.0
+    sample_fps_value: float              = 0.0
+
+    buf_imgs: list[torch.Tensor] = []
+    buf_keys: list[str]          = []
+    processed = 0
+
+    def _flush_buf():
+        nonlocal processed
+        if not buf_imgs:
+            return
+        imgs   = torch.stack(buf_imgs).to(device)
+        tokens = visual.forward_features(imgs, norm=True, strip_cls_token=True)
+        all_tokens.append(tokens.cpu())
+        frame_keys.extend(buf_keys)
+        processed += len(buf_imgs)
+        buf_imgs.clear()
+        buf_keys.clear()
+        print(f"\r  {processed} frames encoded", end="", flush=True)
 
     with torch.no_grad():
-        buf: list[torch.Tensor] = []
+        for key, pil in frame_iter:
+            if is_video:
+                # key is the original integer frame index
+                frame_indices.append(int(key))
+                buf_keys.append(f"{int(key):06d}")
+            else:
+                buf_keys.append(str(key))   # filename
 
-        def _flush():
-            if not buf:
-                return
-            imgs   = torch.stack(buf).to(device)
-            tokens = visual.forward_features(imgs, norm=True, strip_cls_token=True)
-            all_tokens.append(tokens.cpu())
-            buf.clear()
+            buf_imgs.append(preprocess(pil))
 
-        for i, fp in enumerate(frame_paths):
-            buf.append(preprocess(PILImage.open(fp).convert("RGB")))
-            if len(buf) == args.batch_size:
-                _flush()
-            if (i + 1) % 100 == 0 or (i + 1) == T:
-                print(f"\r  {i + 1}/{T}", end="", flush=True)
+            if len(buf_imgs) == args.batch_size:
+                _flush_buf()
 
-        _flush()
+        _flush_buf()
 
-    print(f"\nDone encoding.")
+    if not frame_keys:
+        sys.exit("No frames were read — check your input path and frame range.")
 
+    T = len(frame_keys)
+    print(f"\nDone. {T} frames encoded.")
+
+    # ------------------------------------------------------------------
+    # Gather video metadata (requires a second cap peek for fps)
+    # ------------------------------------------------------------------
+    if is_video:
+        try:
+            import cv2
+            cap = cv2.VideoCapture(args.video)
+            video_fps_value  = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            cap.release()
+        except Exception:
+            video_fps_value = 0.0
+        sample_fps_value = args.fps if args.fps is not None else video_fps_value
+
+    # ------------------------------------------------------------------
+    # Pack and save
+    # ------------------------------------------------------------------
     patch_tokens = torch.cat(all_tokens, dim=0)   # [T, N, D]
     if args.half:
         patch_tokens = patch_tokens.half()
@@ -143,27 +303,37 @@ if __name__ == "__main__":
         else None
     )
 
-    # ------------------------------------------------------------------
-    # Save
-    # ------------------------------------------------------------------
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    payload = {
-        "patch_tokens": patch_tokens,          # [T, N, D]
-        "proj":         proj,                  # [D, E] | None
-        "frame_paths":  [str(p) for p in frame_paths],
+    payload: dict = {
+        "patch_tokens": patch_tokens,
+        "proj":         proj,
+        "frame_keys":   frame_keys,
         "model_name":   args.model,
         "image_size":   visual.image_size,
         "patch_size":   visual.patch_size,
         "width":        visual.width,
     }
+    if is_video:
+        payload.update({
+            "source_video":  str(Path(args.video).resolve()),
+            "video_fps":     video_fps_value,
+            "sample_fps":    sample_fps_value,
+            "frame_indices": frame_indices,
+        })
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
 
     size_mb = patch_tokens.nbytes / 1e6
-    N       = patch_tokens.shape[1]
-    D       = patch_tokens.shape[2]
-    print(f"  patch_tokens : {patch_tokens.shape}  dtype={patch_tokens.dtype}  ({size_mb:.1f} MB)")
-    print(f"  proj         : {proj.shape if proj is not None else None}")
-    print(f"  grid         : {N} patches ({visual.image_size // visual.patch_size}²),  width={D}")
+    N, D    = patch_tokens.shape[1], patch_tokens.shape[2]
+    print(f"  patch_tokens : {tuple(patch_tokens.shape)}"
+          f"  dtype={patch_tokens.dtype}  ({size_mb:.1f} MB)")
+    print(f"  proj         : {tuple(proj.shape) if proj is not None else None}")
+    print(f"  grid         : {N} patches ({visual.image_size // visual.patch_size}²)"
+          f"  width={D}")
+    if is_video:
+        dur = T / sample_fps_value if sample_fps_value else 0
+        print(f"  video        : {video_fps_value:.3f} fps source"
+              f"  →  {sample_fps_value:.3f} fps sampled"
+              f"  ≈  {dur:.1f} s")
     print(f"Saved → {out_path}")

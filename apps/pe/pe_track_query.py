@@ -151,17 +151,29 @@ def _align_track_to_features(
 ) -> list[int]:
     """
     Return the feature-file index for each entry in the track.
-    Matches on filename stem (e.g. "frame_000") so absolute-path differences
-    between extraction time and query time are tolerated.
+
+    Supports both sources:
+    - Frame-directory features : feat_paths are filenames, matched on stem.
+    - Video features            : feat_paths are zero-padded frame indices
+                                  (e.g. "000042"); track_paths matched the
+                                  same way after stripping extension/path.
     """
-    stem_to_idx = {Path(p).name: i for i, p in enumerate(feat_paths)}
+    # Build lookup: bare key (no dir, no extension) → index
+    key_to_idx = {Path(p).stem: i for i, p in enumerate(feat_paths)}
+    # Also accept exact name match (handles "frame_000.jpg" → "frame_000.jpg")
+    key_to_idx.update({Path(p).name: i for i, p in enumerate(feat_paths)})
+
     indices: list[int] = []
     for tp in track_paths:
-        key = Path(tp).name
-        if key not in stem_to_idx:
+        # Try stem first (strips extension), then full name, then as-is
+        for candidate in (Path(tp).stem, Path(tp).name, str(tp)):
+            if candidate in key_to_idx:
+                indices.append(key_to_idx[candidate])
+                break
+        else:
             raise ValueError(
-                f"Track frame {key!r} not found in the feature file.\n"
-                "Make sure pe_extract_patch_features.py was run on the same frame directory."
+                f"Track frame {tp!r} not found in the feature file.\n"
+                "Make sure pe_extract_patch_features.py was run on the same source."
             )
         indices.append(stem_to_idx[key])
     return indices
@@ -192,7 +204,8 @@ if __name__ == "__main__":
 
     all_patch_tokens: torch.Tensor      = feat_data["patch_tokens"]   # [T_all, N, D]
     proj: Optional[torch.Tensor]        = feat_data.get("proj")       # [D, E] | None
-    feat_frame_paths: list[str]         = feat_data["frame_paths"]
+    # Support both old key ("frame_paths") and current key ("frame_keys")
+    feat_frame_paths: list[str] = feat_data.get("frame_keys") or feat_data["frame_paths"]
     model_name: str                     = feat_data["model_name"]
     image_size: int                     = feat_data["image_size"]
     patch_size: int                     = feat_data["patch_size"]
