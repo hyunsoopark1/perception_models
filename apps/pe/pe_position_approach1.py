@@ -251,24 +251,45 @@ def precompute_features(
     Single pass over the dataset to cache frozen PE patch tokens and PE
     teacher embeddings on CPU.  Training epochs then only run the lightweight
     cross-attention head, which is typically 50-100x cheaper.
+
+    A fresh num_workers=0 DataLoader is created for precomputation to avoid
+    the CUDA + forked-worker deadlock that occurs when the training DataLoader
+    (num_workers > 0) is reused for CUDA inference in the main process.
     """
     print("Pre-computing frozen patch tokens and teacher embeddings…")
     all_patches: list  = []
     all_teachers: list = []
     all_bboxes: list   = []
 
+    # Use a single-process loader to avoid CUDA + fork deadlocks.
+    precompute_loader = torch.utils.data.DataLoader(
+        dataloader.dataset,
+        batch_size=dataloader.batch_size,
+        shuffle=False,
+        num_workers=0,          # must be 0: CUDA ops run in this process
+        collate_fn=dataloader.collate_fn,
+    )
+
     model.eval()
-    n_samples = len(dataloader.dataset)
+    n_samples = len(precompute_loader.dataset)
     with torch.no_grad():
-        for i, (imgs, bboxes, crops) in enumerate(dataloader):
+        for i, (imgs, bboxes, crops) in enumerate(precompute_loader):
             imgs  = imgs.to(device)
             crops = crops.to(device)
-            patches  = model._patch_tokens(imgs)                      # [B, N, D]
-            teachers = pe_model.encode_image(crops, normalize=True)   # [B, D]
+            try:
+                patches  = model._patch_tokens(imgs)                      # [B, N, D]
+                teachers = pe_model.encode_image(crops, normalize=True)   # [B, D]
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    torch.cuda.empty_cache()
+                    raise RuntimeError(
+                        "CUDA OOM during precomputation — reduce --batch-size"
+                    ) from exc
+                raise
             all_patches.append(patches.cpu())
             all_teachers.append(teachers.cpu())
             all_bboxes.extend(bboxes)
-            done = min((i + 1) * dataloader.batch_size, n_samples)
+            done = min((i + 1) * precompute_loader.batch_size, n_samples)
             print(f"\r  {done}/{n_samples} samples", end="", flush=True)
 
     print(f"\r  Cached {len(all_bboxes)} samples.                ")
