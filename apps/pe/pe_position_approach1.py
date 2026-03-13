@@ -62,9 +62,12 @@ Available models:
 import argparse
 import json
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
+
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -238,7 +241,13 @@ class CachedDataset(torch.utils.data.Dataset):
         return len(self.bboxes)
 
     def __getitem__(self, idx: int):
-        return self.patch_tokens[idx], self.bboxes[idx], self.teacher_embeds[idx]
+        # .float() upcasts fp16 mmap tensors to fp32 for the training loop.
+        # For in-RAM tensors (already fp32) this is a no-op.
+        return (
+            self.patch_tokens[idx].float(),
+            self.bboxes[idx],
+            self.teacher_embeds[idx].float(),
+        )
 
 
 def precompute_features(
@@ -257,9 +266,7 @@ def precompute_features(
     (num_workers > 0) is reused for CUDA inference in the main process.
     """
     print("Pre-computing frozen patch tokens and teacher embeddings…")
-    all_patches: list  = []
-    all_teachers: list = []
-    all_bboxes: list   = []
+    all_bboxes: list = []
 
     # Use a single-process loader to avoid CUDA + fork deadlocks.
     precompute_loader = torch.utils.data.DataLoader(
@@ -272,6 +279,32 @@ def precompute_features(
 
     model.eval()
     n_samples = len(precompute_loader.dataset)
+
+    # Run one batch first to learn output shapes, then pre-allocate disk-backed
+    # memmaps.  This avoids accumulating tensors in RAM (31 GB+ for G14-448).
+    probe_loader = torch.utils.data.DataLoader(
+        dataloader.dataset, batch_size=1, num_workers=0,
+        collate_fn=dataloader.collate_fn,
+    )
+    probe_imgs, _, probe_crops = next(iter(probe_loader))
+    with torch.no_grad():
+        probe_patches = model._patch_tokens(probe_imgs.to(device))           # [1, N, D]
+        probe_teacher = pe_model.encode_image(probe_crops.to(device),
+                                              normalize=True)                 # [1, D_out]
+    N_patches = probe_patches.shape[1]
+    D_patch   = probe_patches.shape[2]
+    D_teacher = probe_teacher.shape[1]
+
+    # Allocate disk-backed arrays (float16 → half the I/O and disk usage).
+    tmp_dir      = Path(tempfile.mkdtemp(prefix="pe_cache_"))
+    patches_path  = tmp_dir / "patches.bin"
+    teachers_path = tmp_dir / "teachers.bin"
+    patches_mm  = np.memmap(patches_path,  dtype="float16", mode="w+",
+                             shape=(n_samples, N_patches, D_patch))
+    teachers_mm = np.memmap(teachers_path, dtype="float16", mode="w+",
+                             shape=(n_samples, D_teacher))
+
+    offset = 0
     with torch.no_grad():
         for i, (imgs, bboxes, crops) in enumerate(precompute_loader):
             imgs  = imgs.to(device)
@@ -286,16 +319,27 @@ def precompute_features(
                         "CUDA OOM during precomputation — reduce --batch-size"
                     ) from exc
                 raise
-            all_patches.append(patches.cpu())
-            all_teachers.append(teachers.cpu())
+            B = imgs.shape[0]
+            patches_mm[offset : offset + B]  = patches.cpu().half().numpy()
+            teachers_mm[offset : offset + B] = teachers.cpu().half().numpy()
             all_bboxes.extend(bboxes)
-            done = min((i + 1) * precompute_loader.batch_size, n_samples)
+            offset += B
+            done = min(offset, n_samples)
             print(f"\r  {done}/{n_samples} samples", end="", flush=True)
 
-    print(f"\r  Cached {len(all_bboxes)} samples.                ")
+    patches_mm.flush()
+    teachers_mm.flush()
+
+    # Re-open as read-only mmap and wrap with torch — zero RAM, lazy page-in.
+    patches_ro  = np.memmap(patches_path,  dtype="float16", mode="r",
+                             shape=(n_samples, N_patches, D_patch))
+    teachers_ro = np.memmap(teachers_path, dtype="float16", mode="r",
+                             shape=(n_samples, D_teacher))
+
+    print(f"\r  Cached {len(all_bboxes)} samples to {tmp_dir}  ")
     return CachedDataset(
-        patch_tokens   = torch.cat(all_patches,  dim=0),
-        teacher_embeds = torch.cat(all_teachers, dim=0),
+        patch_tokens   = torch.from_numpy(patches_ro),   # disk-backed, zero-copy
+        teacher_embeds = torch.from_numpy(teachers_ro),
         bboxes         = all_bboxes,
     )
 
