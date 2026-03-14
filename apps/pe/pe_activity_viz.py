@@ -57,7 +57,7 @@ Usage
         --out             annotated.mp4 \\
         --scores-overlay
 
-    # Custom activity labels:
+    # Custom activity labels via inline args:
     python apps/pe/pe_activity_viz.py \\
         --features        patch_features.pt \\
         --track-file      tracks.json \\
@@ -66,6 +66,17 @@ Usage
         --head-checkpoint head.pt \\
         --out             annotated.mp4 \\
         --text "a child running" "a child walking" "a child reading a book"
+
+    # Custom activity labels via text file (one query per line):
+    python apps/pe/pe_activity_viz.py \\
+        --features        patch_features.pt \\
+        --track-file      tracks.json \\
+        --video           input.mp4 \\
+        --image-size      1920 1080 \\
+        --head-checkpoint head.pt \\
+        --out             annotated.mp4 \\
+        --text-file       queries.txt \\
+        --window-sec      1.0
 """
 
 import argparse
@@ -117,6 +128,9 @@ def _parse_args():
                    help="Cross-attention heads — must match training (default: 8).")
     p.add_argument("--text", nargs="+", default=None, metavar="PHRASE",
                    help="Activity descriptions (default: 9 child-activity labels).")
+    p.add_argument("--text-file", default=None, metavar="PATH",
+                   help="Plain-text file with one activity description per line. "
+                        "Overrides --text and the built-in defaults.")
     p.add_argument("--model", default=None, metavar="NAME",
                    help="PE model name (inferred from features file when omitted).")
     p.add_argument("--checkpoint", default=None, metavar="PATH",
@@ -134,9 +148,9 @@ def _parse_args():
                    help="Draw a similarity bar chart in the video corner.")
     p.add_argument("--font-scale", type=float, default=0.55,
                    help="cv2 font scale for labels (default: 0.55).")
-    p.add_argument("--window-sec", type=float, default=5.0, metavar="S",
+    p.add_argument("--window-sec", type=float, default=1.0, metavar="S",
                    help="Aggregate frames into windows of this many seconds "
-                        "and compute one similarity score per window (default: 5).")
+                        "and compute one similarity score per window (default: 1).")
     p.add_argument("--fps", type=float, default=None, metavar="N",
                    help="Video frame rate — used to convert window-sec to frames. "
                         "Inferred from the feature file when possible; required "
@@ -348,7 +362,16 @@ if __name__ == "__main__":
 
     device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     image_size: Tuple[int, int] = tuple(args.image_size)   # type: ignore[assignment]
-    texts = args.text if args.text is not None else DEFAULT_TEXTS
+    if args.text_file is not None:
+        tf_path = Path(args.text_file)
+        if not tf_path.exists():
+            sys.exit(f"--text-file not found: {tf_path}")
+        texts = [ln.strip() for ln in tf_path.read_text().splitlines() if ln.strip()]
+        if not texts:
+            sys.exit(f"--text-file is empty: {tf_path}")
+        print(f"Loaded {len(texts)} queries from {tf_path}")
+    else:
+        texts = args.text if args.text is not None else DEFAULT_TEXTS
 
     # ------------------------------------------------------------------
     # 1. Load pre-saved patch tokens
