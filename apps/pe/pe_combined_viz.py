@@ -235,30 +235,48 @@ def _draw_label_row(
 def _draw_combined_box_labels(
     frame: np.ndarray,
     x1: int, y1: int, x2: int, y2: int,
-    head_label: str, head_score: float,
-    crop_label: str, crop_score: float,
+    head_top3: List[Tuple[str, float]],
+    crop_top3: List[Tuple[str, float]],
     color: Tuple[int, int, int],
     font_scale: float = 0.55,
 ) -> None:
+    """
+    Draw bounding box with top-3 labels for both H and C stacked above it.
+
+    Layout (bottom → top above the box):
+        C3  C2  C1  (crop, darker shade, rank 1 closest to box)
+        H3  H2  H1  (head, identity colour, rank 1 closest to C block)
+    """
     import cv2
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     crop_color = _darken(color)
+
     font = cv2.FONT_HERSHEY_SIMPLEX
     ft = 1
     (_, th), _ = cv2.getTextSize("A", font, font_scale, ft)
-    row_h = th + 2 * 3
-    row2_bottom = max(y1, 2 * row_h)
-    row2_top = _draw_label_row(
-        frame, x1, row2_bottom,
-        f"C: {crop_label}  {crop_score:.2f}",
-        crop_color, font_scale,
-    )
-    row1_bottom = max(row2_top, row_h)
-    _draw_label_row(
-        frame, x1, row1_bottom,
-        f"H: {head_label}  {head_score:.2f}",
-        color, font_scale,
-    )
+    row_h = th + 2 * 3  # single row height
+
+    # Start just above the box top; enforce minimum clearance
+    n_rows = len(head_top3) + len(crop_top3)
+    y_bottom = max(y1, n_rows * row_h + 4)
+
+    # Draw C rows first (bottom of the label block, closest to box)
+    for rank, (label, score) in enumerate(reversed(crop_top3)):
+        prefix = f"C{len(crop_top3) - rank}: "
+        y_bottom = _draw_label_row(
+            frame, x1, y_bottom,
+            f"{prefix}{label}  {score:.2f}",
+            crop_color, font_scale,
+        )
+
+    # Draw H rows above C rows
+    for rank, (label, score) in enumerate(reversed(head_top3)):
+        prefix = f"H{len(head_top3) - rank}: "
+        y_bottom = _draw_label_row(
+            frame, x1, y_bottom,
+            f"{prefix}{label}  {score:.2f}",
+            color, font_scale,
+        )
 
 
 def _draw_scores_panel(
@@ -512,25 +530,26 @@ if __name__ == "__main__":
                     )[0].cpu()                   # [E]
 
                 # ── Per-frame language similarity ─────────────────────
-                # Crop scores (always available)
+                top_k = min(3, len(texts))
+
+                # Crop top-3 (always available)
                 crop_sims = (crop_feat.unsqueeze(0).to(device) @ text_feats.T).cpu().squeeze(0)
                 crop_display = F.softmax(crop_sims, dim=0) if args.softmax else crop_sims
-                crop_best = int(crop_display.argmax())
-                crop_label = texts[crop_best]
-                crop_score = crop_display[crop_best].item()
+                crop_vals, crop_idxs = crop_display.topk(top_k)
+                crop_top3 = [(texts[i], crop_vals[r].item())
+                             for r, i in enumerate(crop_idxs.tolist())]
 
-                # Head scores (when patch tokens are available)
+                # Head top-3 (when patch tokens are available)
                 if head_feat is not None:
                     head_sims = (head_feat.unsqueeze(0).to(device) @ text_feats.T).cpu().squeeze(0)
                     head_display = F.softmax(head_sims, dim=0) if args.softmax else head_sims
-                    head_best = int(head_display.argmax())
-                    head_label = texts[head_best]
-                    head_score = head_display[head_best].item()
+                    head_vals, head_idxs = head_display.topk(top_k)
+                    head_top3 = [(texts[i], head_vals[r].item())
+                                 for r, i in enumerate(head_idxs.tolist())]
 
                     _draw_combined_box_labels(
                         bgr, x1, y1, x2, y2,
-                        head_label, head_score,
-                        crop_label, crop_score,
+                        head_top3, crop_top3,
                         color,
                         font_scale=args.font_scale,
                     )
@@ -547,13 +566,16 @@ if __name__ == "__main__":
                         )
                         first_identity_in_frame = False
                 else:
-                    # No head features — draw crop-only label
+                    # No head features — draw crop-only top-3
                     cv2.rectangle(bgr, (x1, y1), (x2, y2), color, 1)
-                    _draw_label_row(
-                        bgr, x1, max(y1, 20),
-                        f"C: {crop_label}  {crop_score:.2f}",
-                        _darken(color), args.font_scale,
-                    )
+                    y_bot = max(y1, top_k * (cv2.getTextSize(
+                        "A", cv2.FONT_HERSHEY_SIMPLEX, args.font_scale, 1)[0][1] + 6) + 4)
+                    for rank, (label, score) in enumerate(reversed(crop_top3)):
+                        y_bot = _draw_label_row(
+                            bgr, x1, y_bot,
+                            f"C{top_k - rank}: {label}  {score:.2f}",
+                            _darken(color), args.font_scale,
+                        )
 
         writer.write(bgr)
         frame_idx += 1
