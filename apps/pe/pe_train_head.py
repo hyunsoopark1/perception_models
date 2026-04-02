@@ -20,7 +20,7 @@ Track JSON format (same as pe_feature_similarity_viz.py / pe_combined_viz.py):
     }
 
 cx, cy is the bbox center in pixels; w, h is width/height.
-One frame per identity is sampled every --sample-interval seconds (default: 10).
+All tracked frames from every video are used.
 
 How bbox information enters the head (no positional encoding)
 -------------------------------------------------------------
@@ -257,17 +257,11 @@ def _collate_cached(batch):
 VIDEO_EXTENSIONS = {".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI"}
 
 
-def scan_video_folder(
-    data_dir:        str,
-    sample_interval: float = 10.0,
-) -> List[Tuple]:
+def scan_video_folder(data_dir: str) -> List[Tuple]:
     """
     Scan data_dir for paired video + JSON track files.
 
-    For each identity, the track entries are grouped into non-overlapping
-    windows of length sample_interval seconds.  The middle entry of each
-    window is kept.  This yields roughly one sample per identity per
-    sample_interval seconds of footage.
+    All tracked (frame, bbox) entries from every video are included.
 
     Returns a flat list of samples:
         (video_path, frame_idx, cx, cy, w, h, frame_w, frame_h)
@@ -294,42 +288,25 @@ def scan_video_folder(
 
     samples = []
     for video_path, json_path in pairs:
-        cap      = cv2.VideoCapture(str(video_path))
-        fps      = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        frame_w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap     = cv2.VideoCapture(str(video_path))
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cap.release()
-
-        # Number of frames per sampling window
-        frame_step = max(1, int(fps * sample_interval))
 
         with open(json_path) as f:
             data = json.load(f)
 
         n_before = len(samples)
         for identity, entries in data.items():
-            # Group track entries into sample_interval-second windows.
-            # Pick the middle entry of each window as the representative sample.
-            windows: Dict[int, List] = defaultdict(list)
             for entry in entries:
-                wid = int(entry[0]) // frame_step
-                windows[wid].append(entry)
-
-            for wid in sorted(windows):
-                window_entries = windows[wid]
-                mid = window_entries[len(window_entries) // 2]
-                fidx, cx, cy, w, h = mid
+                fidx, cx, cy, w, h = entry
                 samples.append((
                     str(video_path), int(fidx),
                     float(cx), float(cy), float(w), float(h),
                     frame_w, frame_h,
                 ))
 
-        duration_s = n_frames / fps
-        print(f"  {video_path.name}  "
-              f"{duration_s:.0f}s  fps={fps:.1f}  step={frame_step}fr  "
-              f"{len(samples) - n_before} samples")
+        print(f"  {video_path.name}  {len(samples) - n_before} samples")
 
     print(f"Total: {len(samples)} (frame, bbox) samples")
     return samples
@@ -391,11 +368,13 @@ def precompute_from_videos(
     all_bboxes: List[BBoxPrompt] = [None] * n_samples  # type: ignore[list-item]
     done = 0
 
-    # ── Process each video — direct seek per target frame ────────────
-    # Sampled frames are sparse (one per ~10s), so seeking is much faster
-    # than decoding every intermediate frame sequentially.
+    # ── Process each video with sequential read ───────────────────────
+    # All frames are needed, so sequential decoding is more efficient
+    # than repeated seeking.
     for vpath, frame_idx_map in video_frame_map.items():
-        cap = cv2.VideoCapture(vpath)
+        cap           = cv2.VideoCapture(vpath)
+        target_frames = set(frame_idx_map.keys())
+        frame_idx     = 0
 
         frame_batch: List[torch.Tensor]   = []
         frame_pils:  List[PILImage.Image] = []
@@ -451,20 +430,19 @@ def precompute_from_videos(
             frame_fidxs.clear()
             print(f"\r  {done}/{n_samples} samples", end="", flush=True)
 
-        # Seek directly to each target frame (sorted to minimise seek distance)
-        for fidx in sorted(frame_idx_map.keys()):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+        while True:
             ret, bgr = cap.read()
             if not ret:
-                print(f"\n  Warning: could not read frame {fidx} from {vpath}")
-                continue
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            pil = PILImage.fromarray(rgb)
-            frame_batch.append(image_transform(pil))
-            frame_pils.append(pil)
-            frame_fidxs.append(fidx)
-            if len(frame_batch) >= batch_size:
-                _flush_batch()
+                break
+            if frame_idx in target_frames:
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                pil = PILImage.fromarray(rgb)
+                frame_batch.append(image_transform(pil))
+                frame_pils.append(pil)
+                frame_fidxs.append(frame_idx)
+                if len(frame_batch) >= batch_size:
+                    _flush_batch()
+            frame_idx += 1
 
         _flush_batch()
         cap.release()
@@ -576,8 +554,6 @@ def _parse_args():
     p.add_argument("--lr",        type=float, default=1e-4)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--sample-interval", type=float, default=10.0,
-                   help="Sample one frame per identity every N seconds (default: 10.0).")
     p.add_argument("--context-scale", type=float, default=1.0,
                    help="BBox expansion factor, must match inference scripts (default: 1.0).")
     p.add_argument("--precompute-batch-size", type=int, default=16,
@@ -635,7 +611,7 @@ if __name__ == "__main__":
         print(f"  Resumed from {args.resume}")
 
     # ── Scan data folder ──────────────────────────────────────────────
-    samples = scan_video_folder(args.data_dir, sample_interval=args.sample_interval)
+    samples = scan_video_folder(args.data_dir)
 
     # ── Precompute features ───────────────────────────────────────────
     dataset = precompute_from_videos(
