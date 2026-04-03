@@ -1,28 +1,19 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 """
-Preprocessing stage for the video story compilation pipeline.
+Convenience wrapper: run split_videos + generate_descriptions in one command.
 
-Performs two steps:
-  1. Split each input video into fixed-duration clips (default: 2 seconds)
-  2. Generate a natural language description for each clip using PLM
+For more control — especially to re-run description generation with a
+different prompt or model without re-splitting — use the two stages directly:
 
-Outputs a JSON file (descriptions.json) that is consumed by
-compile_story_video.py to assemble the final story compilation.
+    python split_videos.py          --video_dir ./data/ --output_dir ./output/
+    python generate_descriptions.py --clips ./output/clips.json --output_dir ./output/ \\
+                                    --prompt "Describe the mood of this scene."
 
 Usage:
-    # Single video
-    python preprocess_videos.py --video input.mp4 --output_dir ./output/
-
-    # Directory of videos (recursive)
     python preprocess_videos.py --video_dir data/202503_a/ --output_dir ./output/
-
-    # Larger model, 3-second clips, more sampled frames
-    python preprocess_videos.py \\
-        --video_dir ./videos/ \\
-        --output_dir ./output/ \\
-        --ckpt facebook/Perception-LM-8B \\
-        --clip_duration 3.0 \\
-        --num_frames 12
+    python preprocess_videos.py --video input.MOV --output_dir ./output/ \\
+        --prompt "What objects are visible in this clip?" \\
+        --ckpt facebook/Perception-LM-8B
 """
 
 import argparse
@@ -33,11 +24,10 @@ import sys
 from pathlib import Path
 from typing import List
 
-import cv2
-import numpy as np
-
 from apps.plm.generate import load_consolidated_model_and_tokenizer
-from generate_video_description import collect_videos, generate_description
+from generate_descriptions import DEFAULT_PROMPT, describe_clips
+from generate_video_description import collect_videos
+from split_videos import split_video_into_clips
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,222 +35,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"}
-
-DEFAULT_PROMPT = (
-    "Describe what is happening in this video clip in one or two sentences."
-)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Orientation helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def _get_rotation(cap: cv2.VideoCapture) -> int:
-    """Return the clockwise rotation in degrees stored in the video container.
-
-    Uses OpenCV's CAP_PROP_ORIENTATION_META (available since OpenCV 4.x with
-    the FFMPEG backend). Returns 0 if the property is unavailable or the video
-    has no rotation metadata.
-    """
-    try:
-        rotation = int(cap.get(cv2.CAP_PROP_ORIENTATION_META))
-    except Exception:
-        rotation = 0
-    # Normalise to {0, 90, 180, 270}
-    return rotation % 360
-
-
-def _apply_rotation(frame: np.ndarray, rotation: int) -> np.ndarray:
-    """Rotate a frame to correct for container-level orientation metadata.
-
-    Args:
-        frame: BGR image array.
-        rotation: Clockwise rotation in degrees (0, 90, 180, or 270).
-
-    Returns:
-        Rotated frame. Width and height are swapped for 90° and 270°.
-    """
-    if rotation == 90:
-        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    if rotation == 180:
-        return cv2.rotate(frame, cv2.ROTATE_180)
-    if rotation == 270:
-        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return frame  # 0° — no rotation needed
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Step 1: Split videos into fixed-duration clips
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def split_video_into_clips(
-    video_path: str,
-    output_dir: str,
-    clip_duration: float = 2.0,
-) -> List[str]:
-    """Split a video into fixed-duration clips using OpenCV.
-
-    Detects and bakes in container-level rotation (portrait phone videos, etc.)
-    so that each saved clip has the correct orientation and aspect ratio with
-    no rotation metadata dependency.
-
-    Args:
-        video_path: Path to the source video file.
-        output_dir: Directory to save the generated clip files.
-        clip_duration: Duration in seconds for each clip (default: 2.0).
-
-    Returns:
-        List of clip file paths in temporal order.
-
-    Raises:
-        ValueError: If the video cannot be opened.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise ValueError(f"Cannot open video: {video_path}")
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 30.0
-        logger.warning(f"Could not detect FPS for {video_path}, defaulting to {fps}")
-
-    rotation = _get_rotation(cap)
-    raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    # After rotating 90° or 270°, width and height swap
-    if rotation in (90, 270):
-        out_w, out_h = raw_h, raw_w
-    else:
-        out_w, out_h = raw_w, raw_h
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frames_per_clip = max(1, int(round(fps * clip_duration)))
-    estimated_clips = max(1, total_frames // frames_per_clip)
-
-    logger.info(
-        f"  {Path(video_path).name}: {total_frames} frames @ {fps:.1f} fps, "
-        f"rotation={rotation}°, output {out_w}×{out_h} → "
-        f"~{estimated_clips} clips of {clip_duration}s"
-    )
-
-    clips: List[str] = []
-    clip_idx = 0
-    stem = Path(video_path).stem
-
-    while True:
-        frames_buffer: List[np.ndarray] = []
-        for _ in range(frames_per_clip):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames_buffer.append(_apply_rotation(frame, rotation))
-
-        if not frames_buffer:
-            break
-
-        # Drop very short trailing clips (< half the target duration)
-        if len(frames_buffer) < frames_per_clip // 2:
-            logger.debug(
-                f"Skipping short trailing clip: {len(frames_buffer)} frames "
-                f"(min required: {frames_per_clip // 2})"
-            )
-            break
-
-        clip_path = os.path.join(output_dir, f"{stem}_clip_{clip_idx:04d}.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(clip_path, fourcc, fps, (out_w, out_h))
-        for frame in frames_buffer:
-            writer.write(frame)
-        writer.release()
-
-        clips.append(clip_path)
-        clip_idx += 1
-
-    cap.release()
-    logger.info(f"  → {len(clips)} clips saved to: {output_dir}")
-    return clips
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Step 2: Generate PLM descriptions
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def describe_clips(
-    clip_paths: List[str],
-    model,
-    tokenizer,
-    config,
-    num_frames: int = 8,
-    temperature: float = 0.0,
-    max_gen_len: int = 200,
-    prompt: str = DEFAULT_PROMPT,
-) -> List[dict]:
-    """Generate a PLM description for each clip.
-
-    Args:
-        clip_paths: List of clip file paths.
-        model: Loaded PLM model.
-        tokenizer: PLM tokenizer.
-        config: Model configuration.
-        num_frames: Frames to sample per clip for PLM.
-        temperature: Sampling temperature (0.0 = greedy decoding).
-        max_gen_len: Maximum tokens to generate per description.
-        prompt: Text question/prompt for the model.
-
-    Returns:
-        List of dicts with keys: ``clip_path``, ``description``.
-    """
-    results: List[dict] = []
-    for i, clip_path in enumerate(clip_paths):
-        logger.info(f"  [{i + 1}/{len(clip_paths)}] {Path(clip_path).name}")
-        try:
-            result = generate_description(
-                video_path=clip_path,
-                model=model,
-                tokenizer=tokenizer,
-                config=config,
-                prompt=prompt,
-                num_frames=num_frames,
-                temperature=temperature,
-                max_gen_len=max_gen_len,
-            )
-            description = result["description"]
-        except Exception as exc:
-            logger.warning(f"    PLM failed: {exc}")
-            description = ""
-
-        logger.info(
-            f"    → {description[:100]}{'...' if len(description) > 100 else ''}"
-        )
-        results.append({"clip_path": clip_path, "description": description})
-
-    return results
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────────────────────────────────────
-
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Split videos into clips and generate PLM descriptions. "
-            "Outputs a descriptions.json consumed by compile_story_video.py."
+            "Split videos into clips and generate PLM descriptions in one step. "
+            "Produces clips.json and descriptions.json."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --video input.mp4 --output_dir ./output/
+  %(prog)s --video input.MOV --output_dir ./output/
   %(prog)s --video_dir data/202503_a/ --output_dir ./output/
-  %(prog)s --video_dir ./videos/ --output_dir ./output/ --ckpt facebook/Perception-LM-8B
+  %(prog)s --video_dir ./videos/ --output_dir ./output/ \\
+           --prompt "Describe the mood and setting." --ckpt facebook/Perception-LM-8B
         """,
     )
 
@@ -268,7 +56,7 @@ Examples:
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--video", type=str, help="Path to a single input video.")
     src.add_argument(
-        "--video_dir", type=str, help="Directory of input videos (searched recursively)."
+        "--video_dir", type=str, help="Directory of input videos (recursive)."
     )
 
     # ── Output ─────────────────────────────────────────────────────────────────
@@ -276,16 +64,13 @@ Examples:
         "--output_dir",
         type=str,
         default="./output",
-        help="Directory for clips and descriptions.json (default: ./output/).",
+        help="Root output directory (default: ./output/).",
     )
     parser.add_argument(
         "--descriptions_file",
         type=str,
         default=None,
-        help=(
-            "Path for the output JSON file "
-            "(default: <output_dir>/descriptions.json)."
-        ),
+        help="Explicit path for descriptions.json (default: <output_dir>/descriptions.json).",
     )
 
     # ── Clipping ───────────────────────────────────────────────────────────────
@@ -296,12 +81,20 @@ Examples:
         help="Duration of each clip in seconds (default: 2.0).",
     )
 
+    # ── Prompt ─────────────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=DEFAULT_PROMPT,
+        help="Instruction sent to PLM for every clip.",
+    )
+
     # ── Model ──────────────────────────────────────────────────────────────────
     parser.add_argument(
         "--ckpt",
         type=str,
         default="facebook/Perception-LM-3B",
-        help="PLM checkpoint path or HuggingFace ID (default: facebook/Perception-LM-3B).",
+        help="PLM checkpoint or HuggingFace ID (default: facebook/Perception-LM-3B).",
     )
     parser.add_argument(
         "--num_frames",
@@ -313,7 +106,7 @@ Examples:
         "--temperature",
         type=float,
         default=0.0,
-        help="Sampling temperature; 0.0 = greedy decoding (default: 0.0).",
+        help="Sampling temperature; 0.0 = greedy (default: 0.0).",
     )
     parser.add_argument(
         "--max_gen_len",
@@ -321,17 +114,12 @@ Examples:
         default=200,
         help="Max tokens to generate per description (default: 200).",
     )
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        default=DEFAULT_PROMPT,
-        help="Prompt to ask PLM about each clip.",
-    )
 
     args = parser.parse_args()
 
     output_dir = os.path.abspath(args.output_dir)
     clips_dir = os.path.join(output_dir, "clips")
+    clips_file = os.path.join(output_dir, "clips.json")
     descriptions_file = args.descriptions_file or os.path.join(
         output_dir, "descriptions.json"
     )
@@ -346,8 +134,8 @@ Examples:
             sys.exit(1)
         logger.info(f"Found {len(source_videos)} source video(s).")
 
-    # ── Step 1: Split into clips ───────────────────────────────────────────────
-    logger.info("\n=== Step 1/2: Splitting videos into clips ===")
+    # ── Stage 1: Split ─────────────────────────────────────────────────────────
+    logger.info("\n=== Stage 1/2: Splitting videos into clips ===")
     all_clips: List[str] = []
     for video_path in source_videos:
         video_clips_dir = os.path.join(clips_dir, Path(video_path).stem)
@@ -355,13 +143,17 @@ Examples:
         all_clips.extend(clips)
 
     if not all_clips:
-        logger.error("No clips were generated. Exiting.")
+        logger.error("No clips generated. Exiting.")
         sys.exit(1)
 
-    logger.info(f"Total clips: {len(all_clips)}")
+    os.makedirs(output_dir, exist_ok=True)
+    with open(clips_file, "w") as f:
+        json.dump(all_clips, f, indent=2)
+    logger.info(f"clips.json → {clips_file}")
 
-    # ── Step 2: Generate PLM descriptions ─────────────────────────────────────
-    logger.info(f"\n=== Step 2/2: Generating PLM descriptions ({args.ckpt}) ===")
+    # ── Stage 2: Describe ──────────────────────────────────────────────────────
+    logger.info(f"\n=== Stage 2/2: Generating PLM descriptions ({args.ckpt}) ===")
+    logger.info(f'Prompt: "{args.prompt}"')
     model, tokenizer, config = load_consolidated_model_and_tokenizer(args.ckpt)
 
     clips_with_desc = describe_clips(
@@ -369,23 +161,22 @@ Examples:
         model=model,
         tokenizer=tokenizer,
         config=config,
+        prompt=args.prompt,
         num_frames=args.num_frames,
         temperature=args.temperature,
         max_gen_len=args.max_gen_len,
-        prompt=args.prompt,
     )
 
-    # ── Save descriptions JSON ─────────────────────────────────────────────────
-    os.makedirs(os.path.dirname(descriptions_file), exist_ok=True)
     with open(descriptions_file, "w") as f:
         json.dump(clips_with_desc, f, indent=2)
 
-    logger.info(f"\nDone. {len(clips_with_desc)} clips described.")
-    logger.info(f"Descriptions saved to: {descriptions_file}")
+    logger.info(f"\nDone.")
+    logger.info(f"  clips.json       → {clips_file}")
+    logger.info(f"  descriptions.json → {descriptions_file}")
     logger.info(
-        "Next step:\n"
-        f"  python compile_story_video.py "
-        f"--descriptions {descriptions_file} --output story.mp4"
+        "\nTo re-describe with a different prompt (no re-splitting needed):\n"
+        f"  python generate_descriptions.py --clips {clips_file} "
+        f"--output_dir {output_dir} --prompt \"your new prompt\""
     )
 
 
