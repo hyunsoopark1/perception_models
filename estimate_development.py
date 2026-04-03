@@ -45,13 +45,22 @@ logger = logging.getLogger(__name__)
 # Kept short to avoid context-window echo issues.
 # PLM outputs feature scores; CDC mapping is done in Python.
 _PROMPT = """\
-Analyze this video and fill in the following flat JSON. \
-Set child_present to true only if a child is clearly visible. \
-If child_present is false, set everything else to false or null. \
-Score anchors: 0.0=not yet, 0.35=12mo, 0.6=18mo, 0.8=24mo, 1.0=36mo. \
-Set *_observed to false and scores/evidence to null when not visible. \
-For each observed domain write *_evidence as a short phrase (5-10 words) of what you saw. \
-Output only JSON, no extra text:
+Watch this child's video carefully and observe what they actually do.
+
+For each domain, describe the specific action you see in *_evidence \
+(e.g. "walks steadily across room", "reaches for toy alone", "points at dog"). \
+Never write vague phrases like "child present" — describe the observed behavior. \
+If a domain is not visible, set *_observed=false and all its fields to null.
+
+Score anchors (CDC milestones): 0.0=not yet present, 0.35=12mo, 0.6=18mo, 0.8=24mo, 1.0=36mo+.
+
+Motor — look for: walking, running, climbing, grasping, throwing.
+Autonomy — look for: reaching/acting without help, exploring independently.
+Attention — look for: sustained gaze, following objects, goal-directed play.
+Interaction — look for: eye contact, responding to others, seeking caregiver.
+Language — look for: babbling, words, pointing, waving, gestures.
+
+Output only this flat JSON with real values — no placeholders, no extra text:
 
 {"child_present":bool,\
 "motor_observed":bool,"locomotion":float|null,"coordination":float|null,"stability":float|null,"motor_evidence":string|null,\
