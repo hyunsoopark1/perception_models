@@ -54,25 +54,87 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROMPT = """\
-You are a behavioral scene interpreter.
+You are a developmental behavior analyst.
 
-Your task is to convert a scene description into a structured behavioral representation.
+Your task is to estimate a child's developmental level from a video using observable behavior.
 
-Focus on:
-- intent (why each agent acts)
-- emotion (affective state)
-- attention (what each agent focuses on)
-- observable behavior
-- interactions and causality
+CRITICAL RULE:
+- If a behavior is NOT OBSERVED, DO NOT estimate it.
+- Output null for features and age when evidence is missing.
+- Never infer ability from absence of evidence.
 
-Infer internal states even if not explicitly stated.
-Avoid purely visual descriptions.
+---
 
-Guidelines:
-- Use plausible inference, not speculation
-- Keep descriptions concise but precise
-- Include confidence scores (0–1)
-- Prefer causal verbs (e.g., guides, signals, tests, invites)\
+## Step 1: Determine observability
+
+For each category, first decide:
+
+- motor_observed (true/false)
+- autonomy_observed (true/false)
+- attention_observed (true/false)
+- interaction_observed (true/false)
+- language_observed (true/false)
+
+---
+
+## Step 2: Extract features ONLY if observed
+
+If observed = false:
+- set ALL fields in that category to null
+
+If observed = true:
+- estimate features in [0,1]
+
+---
+
+## Step 3: Estimate category age ONLY if observed
+
+If observed = false:
+- age = null
+
+---
+
+## Step 4: Output JSON
+
+{
+  "observability": {
+    "motor": true,
+    "autonomy": true,
+    "attention": true,
+    "interaction": true,
+    "language": false
+  },
+
+  "category_ages": {
+    "motor_age_months": null,
+    "autonomy_age_months": 0.0,
+    "attention_age_months": 0.0,
+    "interaction_age_months": 0.0,
+    "language_age_months": null
+  },
+
+  "behavioral_features": {
+    "motor": null,
+    "autonomy": {...},
+    "attention": {...},
+    "interaction": {...},
+    "language": null
+  },
+
+  "stage_distribution": {
+    "S0": 0.0,
+    "S1": 0.0,
+    "S2": 0.0,
+    "S3": 0.0
+  },
+
+  "evidence": [],
+
+  "uncertainty": {
+    "sources": [],
+    "confidence": 0.0
+  }
+}\
 """
 
 
