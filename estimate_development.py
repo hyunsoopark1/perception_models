@@ -46,12 +46,12 @@ logger = logging.getLogger(__name__)
 # PLM outputs feature scores; CDC mapping is done in Python.
 _PROMPT = """\
 Analyze this video and fill in the following flat JSON. \
-Set child_present to true only if a child (infant or young child) is clearly visible. \
-If child_present is false, set all other fields to false or null. \
-Use CDC milestones as score anchors: 0.0=not yet, 0.35=12mo, 0.6=18mo, 0.8=24mo, 1.0=36mo. \
-Set *_observed to false and scores/evidence to null if that domain is not visible. \
-For each observed domain write a short *_evidence string: one sentence of specific behaviors you saw. \
-Output only the JSON with no extra text:
+Set child_present to true only if a child is clearly visible. \
+If child_present is false, set everything else to false or null. \
+Score anchors: 0.0=not yet, 0.35=12mo, 0.6=18mo, 0.8=24mo, 1.0=36mo. \
+Set *_observed to false and scores/evidence to null when not visible. \
+For each observed domain write *_evidence as a short phrase (5-10 words) of what you saw. \
+Output only JSON, no extra text:
 
 {"child_present":bool,\
 "motor_observed":bool,"locomotion":float|null,"coordination":float|null,"stability":float|null,"motor_evidence":string|null,\
@@ -71,8 +71,14 @@ _DOMAIN_MAP = {
 }
 
 
+def _normalise_keys(flat: dict) -> dict:
+    """Normalise PLM dict keys: replace spaces with underscores."""
+    return {k.replace(" ", "_"): v for k, v in flat.items()}
+
+
 def _flat_to_domains(flat: dict) -> dict:
     """Reconstruct nested domain dict from the flat PLM output."""
+    flat = _normalise_keys(flat)
     domains = {}
     for domain, cfg in _DOMAIN_MAP.items():
         observed = flat.get(cfg["observed_key"], False)
@@ -84,6 +90,12 @@ def _flat_to_domains(flat: dict) -> dict:
         entry["evidence"] = flat.get(cfg["evidence_key"]) if observed else None
         domains[domain] = entry
     return domains
+
+
+def _regex_child_present(text: str) -> bool:
+    """Regex fallback: extract child_present from raw text when JSON parse fails."""
+    m = re.search(r"['\"]child_present['\"]\s*:\s*(true|false)", text, re.IGNORECASE)
+    return m.group(1).lower() == "true" if m else False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -440,7 +452,10 @@ def assess(video_path: str, model, tokenizer, config,
 
     stage_dist = stage_distribution(overall_age) if overall_age is not None else None
 
-    child_present = bool(parsed.get("child_present", False)) if parsed else False
+    child_present = (
+        bool(parsed.get("child_present", False))
+        if parsed else _regex_child_present(raw_text)
+    )
 
     return {
         "video_path": video_path,
@@ -571,8 +586,8 @@ Examples:
                         help="PLM checkpoint or HuggingFace ID.")
     parser.add_argument("--num_frames", type=int, default=8,
                         help="Frames to sample from the video (default: 8).")
-    parser.add_argument("--max_gen_len", type=int, default=512,
-                        help="Max tokens to generate (default: 512).")
+    parser.add_argument("--max_gen_len", type=int, default=1024,
+                        help="Max tokens to generate (default: 1024).")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature; 0.0 = greedy (default: 0.0).")
     parser.add_argument("--json_only", action="store_true",
