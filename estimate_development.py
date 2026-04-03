@@ -45,16 +45,41 @@ logger = logging.getLogger(__name__)
 # Kept short to avoid context-window echo issues.
 # PLM outputs feature scores; CDC mapping is done in Python.
 _PROMPT = """\
-Analyze this child's video. Score each observed feature using CDC milestones as anchors:
-0.0=not yet present, 0.35=12mo level, 0.6=18mo level, 0.8=24mo level, 1.0=36mo level.
-Set observed=false and features=null for anything not visible. Output only JSON:
+Analyze this child's video and fill in the following flat JSON. \
+Use CDC milestones as score anchors: 0.0=not yet, 0.35=12mo, 0.6=18mo, 0.8=24mo, 1.0=36mo. \
+Set *_observed to false and the related scores to null if that domain is not visible. \
+Output only the JSON with no extra text:
 
-{"motor":{"observed":bool,"locomotion":float|null,"coordination":float|null,"stability":float|null},\
-"autonomy":{"observed":bool,"independence":float|null,"initiative":float|null},\
-"attention":{"observed":bool,"duration":float|null,"goal_directed":float|null},\
-"interaction":{"observed":bool,"social_engagement":float|null,"caregiver_dependency":float|null},\
-"language":{"observed":bool,"verbal":float|null,"gesture":float|null}}\
+{"motor_observed":bool,"locomotion":float|null,"coordination":float|null,"stability":float|null,\
+"autonomy_observed":bool,"independence":float|null,"initiative":float|null,\
+"attention_observed":bool,"duration":float|null,"goal_directed":float|null,\
+"interaction_observed":bool,"social_engagement":float|null,"caregiver_dependency":float|null,\
+"language_observed":bool,"verbal":float|null,"gesture":float|null}\
 """
+
+# Mapping from flat JSON keys back to (domain, feature) structure
+_DOMAIN_MAP = {
+    "motor":       {"observed_key": "motor_observed",       "features": ["locomotion", "coordination", "stability"]},
+    "autonomy":    {"observed_key": "autonomy_observed",    "features": ["independence", "initiative"]},
+    "attention":   {"observed_key": "attention_observed",   "features": ["duration", "goal_directed"]},
+    "interaction": {"observed_key": "interaction_observed", "features": ["social_engagement", "caregiver_dependency"]},
+    "language":    {"observed_key": "language_observed",    "features": ["verbal", "gesture"]},
+}
+
+
+def _flat_to_domains(flat: dict) -> dict:
+    """Reconstruct nested domain dict from the flat PLM output."""
+    domains = {}
+    for domain, cfg in _DOMAIN_MAP.items():
+        observed = flat.get(cfg["observed_key"], False)
+        # Coerce to bool in case PLM returned 0/1
+        if isinstance(observed, (int, float)):
+            observed = bool(observed)
+        entry = {"observed": observed}
+        for feat in cfg["features"]:
+            entry[feat] = flat.get(feat) if observed else None
+        domains[domain] = entry
+    return domains
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -388,14 +413,15 @@ def assess(video_path: str, model, tokenizer, config,
     plm_features = {}
 
     if parsed:
+        # PLM now outputs a flat dict; reconstruct nested domain structure
+        nested = _flat_to_domains(parsed)
         for domain in DOMAINS:
-            domain_data = parsed.get(domain, {})
+            domain_data = nested.get(domain, {})
             observed = domain_data.get("observed", False)
             if not observed:
                 domain_ages[domain] = None
                 plm_features[domain] = None
                 continue
-            # Extract feature scores (exclude the "observed" key)
             features = {k: v for k, v in domain_data.items() if k != "observed"}
             plm_features[domain] = features
             domain_ages[domain] = domain_age(domain, features)
