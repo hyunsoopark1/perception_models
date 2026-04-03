@@ -53,9 +53,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_PROMPT = (
-    "Describe what is happening in this video clip in one or two sentences."
-)
+DEFAULT_PROMPT = """\
+You are a behavioral scene interpreter.
+
+Your task is to convert a scene description into a structured behavioral representation.
+
+Focus on:
+- intent (why each agent acts)
+- emotion (affective state)
+- attention (what each agent focuses on)
+- observable behavior
+- interactions and causality
+
+Infer internal states even if not explicitly stated.
+Avoid purely visual descriptions.
+
+Guidelines:
+- Use plausible inference, not speculation
+- Keep descriptions concise but precise
+- Include confidence scores (0–1)
+- Prefer causal verbs (e.g., guides, signals, tests, invites)\
+"""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
