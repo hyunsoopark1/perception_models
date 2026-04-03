@@ -45,9 +45,9 @@ logger = logging.getLogger(__name__)
 # Kept short to avoid context-window echo issues.
 # PLM outputs feature scores; CDC mapping is done in Python.
 _PROMPT = """\
-Analyze this child's video. For each domain set "observed" true/false. \
-If observed, score each feature in [0,1] based on what you see. \
-If not observed, set features to null. Output only JSON:
+Analyze this child's video. Score each observed feature using CDC milestones as anchors:
+0.0=not yet present, 0.35=12mo level, 0.6=18mo level, 0.8=24mo level, 1.0=36mo level.
+Set observed=false and features=null for anything not visible. Output only JSON:
 
 {"motor":{"observed":bool,"locomotion":float|null,"coordination":float|null,"stability":float|null},\
 "autonomy":{"observed":bool,"independence":float|null,"initiative":float|null},\
@@ -258,20 +258,59 @@ def _transcode_to_h264(video_path: str, tmp_path: str) -> str:
 
 
 def _extract_json(text: str) -> Optional[dict]:
-    """Extract the first valid JSON object from a (possibly noisy) PLM output."""
-    # Try direct parse first
-    try:
-        return json.loads(text.strip())
-    except json.JSONDecodeError:
-        pass
+    """Extract the first valid JSON/dict object from PLM output.
 
-    # Find first {...} block
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
+    LLMs often produce Python-dict syntax (single quotes, True/False/None)
+    instead of strict JSON. This function tries multiple normalisation
+    strategies before giving up.
+    """
+    import ast
+
+    def _try_json(s):
         try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
+            return json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def _try_ast(s):
+        # Normalise JSON literals → Python literals for ast.literal_eval
+        s = re.sub(r':\s*true\b',  ': True',  s)
+        s = re.sub(r':\s*false\b', ': False', s)
+        s = re.sub(r':\s*null\b',  ': None',  s)
+        try:
+            result = ast.literal_eval(s)
+            return result if isinstance(result, dict) else None
+        except (ValueError, SyntaxError):
+            return None
+
+    # 1. Direct JSON parse (model produced valid JSON)
+    result = _try_json(text.strip())
+    if result is not None:
+        return result
+
+    # 2. Extract first {...} block, then try JSON
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        return None
+    block = match.group()
+
+    result = _try_json(block)
+    if result is not None:
+        return result
+
+    # 3. ast.literal_eval on the block (handles single-quoted Python dicts)
+    result = _try_ast(block)
+    if result is not None:
+        return result
+
+    # 4. Replace single quotes → double quotes as last resort
+    try:
+        double_quoted = block.replace("'", '"')
+        result = _try_json(double_quoted)
+        if result is not None:
+            return result
+    except Exception:
+        pass
 
     return None
 
