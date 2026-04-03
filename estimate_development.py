@@ -45,12 +45,15 @@ logger = logging.getLogger(__name__)
 # Kept short to avoid context-window echo issues.
 # PLM outputs feature scores; CDC mapping is done in Python.
 _PROMPT = """\
-Analyze this child's video and fill in the following flat JSON. \
+Analyze this video and fill in the following flat JSON. \
+Set child_present to true only if a child (infant or young child) is clearly visible. \
+If child_present is false, set all other fields to false or null. \
 Use CDC milestones as score anchors: 0.0=not yet, 0.35=12mo, 0.6=18mo, 0.8=24mo, 1.0=36mo. \
 Set *_observed to false and the related scores to null if that domain is not visible. \
 Output only the JSON with no extra text:
 
-{"motor_observed":bool,"locomotion":float|null,"coordination":float|null,"stability":float|null,\
+{"child_present":bool,\
+"motor_observed":bool,"locomotion":float|null,"coordination":float|null,"stability":float|null,\
 "autonomy_observed":bool,"independence":float|null,"initiative":float|null,\
 "attention_observed":bool,"duration":float|null,"goal_directed":float|null,\
 "interaction_observed":bool,"social_engagement":float|null,"caregiver_dependency":float|null,\
@@ -436,8 +439,11 @@ def assess(video_path: str, model, tokenizer, config,
 
     stage_dist = stage_distribution(overall_age) if overall_age is not None else None
 
+    child_present = bool(parsed.get("child_present", False)) if parsed else False
+
     return {
         "video_path": video_path,
+        "child_present": child_present,
         "plm_features": plm_features,
         "domain_ages": domain_ages,
         "overall_age_months": round(overall_age, 1) if overall_age else None,
@@ -475,10 +481,19 @@ def print_report(result: dict) -> None:
     sep = "=" * 62
     thin = "-" * 62
 
+    child_present = result.get("child_present", False)
+    child_str = "YES" if child_present else "NO"
+
     print(f"\n{sep}")
     print(f"  Developmental Assessment")
     print(f"  {Path(result['video_path']).name}")
+    print(f"  Child present: {child_str}")
     print(sep)
+
+    if not child_present:
+        print("\n  No child detected in this video.\n")
+        print(f"{sep}\n")
+        return
 
     # Per-domain table
     print(f"\n{'Domain':<14} {'Features (PLM scores)':<30} {'Age est.'}")
