@@ -31,8 +31,8 @@ def main():
         help="Frames to sample from the video (default: 8).",
     )
     parser.add_argument(
-        "--max_gen_len", type=int, default=512,
-        help="Max tokens to generate (default: 512).",
+        "--max_gen_len", type=int, default=1024,
+        help="Max tokens to generate (default: 1024).",
     )
     parser.add_argument(
         "--temperature", type=float, default=0.0,

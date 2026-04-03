@@ -54,85 +54,47 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROMPT = """\
-You are a developmental behavior analyst.
+You are a developmental behavior analyst. Analyze this video clip and output a single JSON object estimating the child's developmental level from observable behavior only.
 
-Your task is to estimate a child's developmental level from a video using observable behavior.
-
-CRITICAL RULE:
-- If a behavior is NOT OBSERVED, DO NOT estimate it.
-- Output null for features and age when evidence is missing.
+Rules:
+- Only assess what is directly visible in the video.
+- Set any unobserved category's fields and age to null.
 - Never infer ability from absence of evidence.
 
----
-
-## Step 1: Determine observability
-
-For each category, first decide:
-
-- motor_observed (true/false)
-- autonomy_observed (true/false)
-- attention_observed (true/false)
-- interaction_observed (true/false)
-- language_observed (true/false)
-
----
-
-## Step 2: Extract features ONLY if observed
-
-If observed = false:
-- set ALL fields in that category to null
-
-If observed = true:
-- estimate features in [0,1]
-
----
-
-## Step 3: Estimate category age ONLY if observed
-
-If observed = false:
-- age = null
-
----
-
-## Step 4: Output JSON
+Output this JSON with real values filled in (no placeholders):
 
 {
   "observability": {
-    "motor": true,
-    "autonomy": true,
-    "attention": true,
-    "interaction": true,
-    "language": false
+    "motor": true or false,
+    "autonomy": true or false,
+    "attention": true or false,
+    "interaction": true or false,
+    "language": true or false
   },
-
   "category_ages": {
-    "motor_age_months": null,
-    "autonomy_age_months": 0.0,
-    "attention_age_months": 0.0,
-    "interaction_age_months": 0.0,
-    "language_age_months": null
+    "motor_age_months": number or null,
+    "autonomy_age_months": number or null,
+    "attention_age_months": number or null,
+    "interaction_age_months": number or null,
+    "language_age_months": number or null
   },
-
   "behavioral_features": {
-    "motor": null,
-    "autonomy": {...},
-    "attention": {...},
-    "interaction": {...},
-    "language": null
+    "motor": object with feature scores in [0,1] or null,
+    "autonomy": object with feature scores in [0,1] or null,
+    "attention": object with feature scores in [0,1] or null,
+    "interaction": object with feature scores in [0,1] or null,
+    "language": object with feature scores in [0,1] or null
   },
-
   "stage_distribution": {
-    "S0": 0.0,
-    "S1": 0.0,
-    "S2": 0.0,
-    "S3": 0.0
+    "S0": number,
+    "S1": number,
+    "S2": number,
+    "S3": number
   },
-
-  "evidence": [],
-
+  "evidence": ["list of observed behaviors"],
   "uncertainty": {
-    "sources": [],
-    "confidence": 0.0
+    "sources": ["list of uncertainty sources"],
+    "confidence": number between 0 and 1
   }
 }\
 """
