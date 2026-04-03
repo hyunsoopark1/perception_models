@@ -207,6 +207,56 @@ def stage_distribution(age_months: float, sigma: float = 4.0) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _transcode_to_h264(video_path: str, tmp_path: str) -> str:
+    """Re-encode a video to H.264 MP4 using OpenCV so torchcodec can decode it.
+
+    iPhone MOV files use HEVC/H.265 with non-standard NAL unit structures that
+    torchcodec cannot decode. Reading with OpenCV (FFmpeg backend) and writing
+    as plain H.264 produces a file that torchcodec handles correctly.
+
+    Rotation metadata is baked into the frames during re-encoding (same logic
+    as split_videos.py) so the output clip is already upright.
+
+    Args:
+        video_path: Source video path (any format OpenCV can read).
+        tmp_path: Destination path for the re-encoded file.
+
+    Returns:
+        tmp_path on success.
+
+    Raises:
+        RuntimeError: If OpenCV cannot open the source video.
+    """
+    import cv2
+    import numpy as np
+    from split_videos import _apply_rotation, _get_rotation
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"OpenCV cannot open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    rotation = _get_rotation(cap)
+    raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_w, out_h = (raw_h, raw_w) if rotation in (90, 270) else (raw_w, raw_h)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(tmp_path, fourcc, fps, (out_w, out_h))
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        writer.write(_apply_rotation(frame, rotation))
+
+    cap.release()
+    writer.release()
+    logger.info(f"  Re-encoded {Path(video_path).name} → {Path(tmp_path).name} "
+                f"({out_w}×{out_h}, rotation={rotation}°)")
+    return tmp_path
+
+
 def _extract_json(text: str) -> Optional[dict]:
     """Extract the first valid JSON object from a (possibly noisy) PLM output."""
     # Try direct parse first
@@ -229,25 +279,49 @@ def _extract_json(text: str) -> Optional[dict]:
 def run_plm(video_path: str, model, tokenizer, config,
             num_frames: int = 8, temperature: float = 0.0,
             max_gen_len: int = 512) -> Optional[dict]:
-    """Run PLM on a video and return the parsed domain feature dict."""
-    result = generate_description(
-        video_path=video_path,
-        model=model,
-        tokenizer=tokenizer,
-        config=config,
-        prompt=_PROMPT,
-        num_frames=num_frames,
-        temperature=temperature,
-        max_gen_len=max_gen_len,
-    )
-    raw_text = result["description"]
-    parsed = _extract_json(raw_text)
+    """Run PLM on a video and return the parsed domain feature dict.
 
-    if parsed is None:
-        logger.warning("Could not parse JSON from PLM output.")
-        logger.debug(f"Raw output:\n{raw_text}")
+    Automatically re-encodes the video to H.264 if torchcodec fails to decode
+    the original (common with iPhone HEVC recordings).
+    """
+    import tempfile
+    import os
 
-    return parsed, raw_text
+    def _run(path):
+        result = generate_description(
+            video_path=path,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            prompt=_PROMPT,
+            num_frames=num_frames,
+            temperature=temperature,
+            max_gen_len=max_gen_len,
+        )
+        return result["description"]
+
+    # First attempt with the original file
+    try:
+        raw_text = _run(video_path)
+        return _extract_json(raw_text), raw_text
+    except RuntimeError as e:
+        if "decoder" not in str(e).lower() and "NAL" not in str(e):
+            raise
+        logger.warning(
+            f"torchcodec could not decode {Path(video_path).name} "
+            f"({e}). Re-encoding to H.264 and retrying..."
+        )
+
+    # Fallback: transcode to a temp H.264 file and retry
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        _transcode_to_h264(video_path, tmp_path)
+        raw_text = _run(tmp_path)
+        return _extract_json(raw_text), raw_text
+    finally:
+        os.unlink(tmp_path)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
