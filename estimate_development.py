@@ -49,24 +49,25 @@ Analyze this video and fill in the following flat JSON. \
 Set child_present to true only if a child (infant or young child) is clearly visible. \
 If child_present is false, set all other fields to false or null. \
 Use CDC milestones as score anchors: 0.0=not yet, 0.35=12mo, 0.6=18mo, 0.8=24mo, 1.0=36mo. \
-Set *_observed to false and the related scores to null if that domain is not visible. \
+Set *_observed to false and scores/evidence to null if that domain is not visible. \
+For each observed domain write a short *_evidence string: one sentence of specific behaviors you saw. \
 Output only the JSON with no extra text:
 
 {"child_present":bool,\
-"motor_observed":bool,"locomotion":float|null,"coordination":float|null,"stability":float|null,\
-"autonomy_observed":bool,"independence":float|null,"initiative":float|null,\
-"attention_observed":bool,"duration":float|null,"goal_directed":float|null,\
-"interaction_observed":bool,"social_engagement":float|null,"caregiver_dependency":float|null,\
-"language_observed":bool,"verbal":float|null,"gesture":float|null}\
+"motor_observed":bool,"locomotion":float|null,"coordination":float|null,"stability":float|null,"motor_evidence":string|null,\
+"autonomy_observed":bool,"independence":float|null,"initiative":float|null,"autonomy_evidence":string|null,\
+"attention_observed":bool,"duration":float|null,"goal_directed":float|null,"attention_evidence":string|null,\
+"interaction_observed":bool,"social_engagement":float|null,"caregiver_dependency":float|null,"interaction_evidence":string|null,\
+"language_observed":bool,"verbal":float|null,"gesture":float|null,"language_evidence":string|null}\
 """
 
 # Mapping from flat JSON keys back to (domain, feature) structure
 _DOMAIN_MAP = {
-    "motor":       {"observed_key": "motor_observed",       "features": ["locomotion", "coordination", "stability"]},
-    "autonomy":    {"observed_key": "autonomy_observed",    "features": ["independence", "initiative"]},
-    "attention":   {"observed_key": "attention_observed",   "features": ["duration", "goal_directed"]},
-    "interaction": {"observed_key": "interaction_observed", "features": ["social_engagement", "caregiver_dependency"]},
-    "language":    {"observed_key": "language_observed",    "features": ["verbal", "gesture"]},
+    "motor":       {"observed_key": "motor_observed",       "evidence_key": "motor_evidence",       "features": ["locomotion", "coordination", "stability"]},
+    "autonomy":    {"observed_key": "autonomy_observed",    "evidence_key": "autonomy_evidence",    "features": ["independence", "initiative"]},
+    "attention":   {"observed_key": "attention_observed",   "evidence_key": "attention_evidence",   "features": ["duration", "goal_directed"]},
+    "interaction": {"observed_key": "interaction_observed", "evidence_key": "interaction_evidence", "features": ["social_engagement", "caregiver_dependency"]},
+    "language":    {"observed_key": "language_observed",    "evidence_key": "language_evidence",    "features": ["verbal", "gesture"]},
 }
 
 
@@ -75,12 +76,12 @@ def _flat_to_domains(flat: dict) -> dict:
     domains = {}
     for domain, cfg in _DOMAIN_MAP.items():
         observed = flat.get(cfg["observed_key"], False)
-        # Coerce to bool in case PLM returned 0/1
         if isinstance(observed, (int, float)):
             observed = bool(observed)
         entry = {"observed": observed}
         for feat in cfg["features"]:
             entry[feat] = flat.get(feat) if observed else None
+        entry["evidence"] = flat.get(cfg["evidence_key"]) if observed else None
         domains[domain] = entry
     return domains
 
@@ -507,7 +508,7 @@ def print_report(result: dict) -> None:
         if features is None:
             print(f"  {domain:<12} not observed{'':<22} {age_str}")
         else:
-            feature_names = _DOMAIN_FEATURES.get(domain, list(features.keys()))
+            feature_names = _DOMAIN_FEATURES.get(domain, [k for k in features if k != "evidence"])
             lines = []
             for fname in feature_names:
                 val = features.get(fname)
@@ -520,6 +521,16 @@ def print_report(result: dict) -> None:
             print(f"  {domain:<12} {lines[0]:<32} {age_str}")
             for line in lines[1:]:
                 print(f"  {'':<12} {line}")
+
+            # Evidence
+            evidence = features.get("evidence")
+            if evidence:
+                # Wrap to 54 chars so it fits within the report width
+                import textwrap
+                wrapped = textwrap.wrap(str(evidence), width=54)
+                print(f"  {'':<12} \033[3mEvidence: {wrapped[0]}\033[0m")
+                for w in wrapped[1:]:
+                    print(f"  {'':<12}           {w}")
 
     # Overall age
     overall = result["overall_age_months"]
