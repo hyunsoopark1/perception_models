@@ -53,6 +53,45 @@ DEFAULT_PROMPT = (
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Orientation helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _get_rotation(cap: cv2.VideoCapture) -> int:
+    """Return the clockwise rotation in degrees stored in the video container.
+
+    Uses OpenCV's CAP_PROP_ORIENTATION_META (available since OpenCV 4.x with
+    the FFMPEG backend). Returns 0 if the property is unavailable or the video
+    has no rotation metadata.
+    """
+    try:
+        rotation = int(cap.get(cv2.CAP_PROP_ORIENTATION_META))
+    except Exception:
+        rotation = 0
+    # Normalise to {0, 90, 180, 270}
+    return rotation % 360
+
+
+def _apply_rotation(frame: np.ndarray, rotation: int) -> np.ndarray:
+    """Rotate a frame to correct for container-level orientation metadata.
+
+    Args:
+        frame: BGR image array.
+        rotation: Clockwise rotation in degrees (0, 90, 180, or 270).
+
+    Returns:
+        Rotated frame. Width and height are swapped for 90° and 270°.
+    """
+    if rotation == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if rotation == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if rotation == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame  # 0° — no rotation needed
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Step 1: Split videos into fixed-duration clips
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -63,6 +102,10 @@ def split_video_into_clips(
     clip_duration: float = 2.0,
 ) -> List[str]:
     """Split a video into fixed-duration clips using OpenCV.
+
+    Detects and bakes in container-level rotation (portrait phone videos, etc.)
+    so that each saved clip has the correct orientation and aspect ratio with
+    no rotation metadata dependency.
 
     Args:
         video_path: Path to the source video file.
@@ -86,15 +129,24 @@ def split_video_into_clips(
         fps = 30.0
         logger.warning(f"Could not detect FPS for {video_path}, defaulting to {fps}")
 
+    rotation = _get_rotation(cap)
+    raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # After rotating 90° or 270°, width and height swap
+    if rotation in (90, 270):
+        out_w, out_h = raw_h, raw_w
+    else:
+        out_w, out_h = raw_w, raw_h
+
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frames_per_clip = max(1, int(round(fps * clip_duration)))
     estimated_clips = max(1, total_frames // frames_per_clip)
 
     logger.info(
-        f"  {Path(video_path).name}: {total_frames} frames @ {fps:.1f} fps → "
-        f"~{estimated_clips} clips of {clip_duration}s ({frames_per_clip} frames each)"
+        f"  {Path(video_path).name}: {total_frames} frames @ {fps:.1f} fps, "
+        f"rotation={rotation}°, output {out_w}×{out_h} → "
+        f"~{estimated_clips} clips of {clip_duration}s"
     )
 
     clips: List[str] = []
@@ -107,7 +159,7 @@ def split_video_into_clips(
             ret, frame = cap.read()
             if not ret:
                 break
-            frames_buffer.append(frame)
+            frames_buffer.append(_apply_rotation(frame, rotation))
 
         if not frames_buffer:
             break
@@ -122,7 +174,7 @@ def split_video_into_clips(
 
         clip_path = os.path.join(output_dir, f"{stem}_clip_{clip_idx:04d}.mp4")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(clip_path, fourcc, fps, (width, height))
+        writer = cv2.VideoWriter(clip_path, fourcc, fps, (out_w, out_h))
         for frame in frames_buffer:
             writer.write(frame)
         writer.release()

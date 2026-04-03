@@ -227,6 +227,42 @@ def _add_text_overlay(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _fit_frame_to_canvas(
+    frame: np.ndarray,
+    canvas_w: int,
+    canvas_h: int,
+) -> np.ndarray:
+    """Scale a frame to fill a canvas while preserving its aspect ratio.
+
+    The frame is scaled uniformly (no cropping) and centered on a black
+    canvas, producing letterbox bars for landscape-in-portrait or
+    pillarbox bars for portrait-in-landscape.
+
+    Args:
+        frame: BGR image array of any size.
+        canvas_w: Target canvas width in pixels.
+        canvas_h: Target canvas height in pixels.
+
+    Returns:
+        BGR image array of exactly (canvas_h, canvas_w).
+    """
+    h, w = frame.shape[:2]
+    if w == canvas_w and h == canvas_h:
+        return frame
+
+    scale = min(canvas_w / w, canvas_h / h)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    x0 = (canvas_w - new_w) // 2
+    y0 = (canvas_h - new_h) // 2
+    canvas[y0 : y0 + new_h, x0 : x0 + new_w] = resized
+    return canvas
+
+
 def create_compilation_video(
     ordered_clips: List[dict],
     output_path: str,
@@ -234,7 +270,10 @@ def create_compilation_video(
 ) -> str:
     """Concatenate ordered clips into a single compilation video.
 
-    Clips with different resolutions are resized to match the first clip.
+    The output canvas size is taken from the first clip. Clips with a
+    different size or aspect ratio are fitted into that canvas with
+    letterbox / pillarbox black bars so no content is cropped and the
+    aspect ratio of every clip is preserved.
 
     Args:
         ordered_clips: Ordered list of dicts with ``clip_path`` and
@@ -253,12 +292,15 @@ def create_compilation_video(
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    # Read dimensions from the first valid clip
+    # Canvas dimensions come from the first valid clip (already orientation-corrected
+    # by preprocess_videos.py, so no rotation metadata to worry about here).
     first_cap = cv2.VideoCapture(ordered_clips[0]["clip_path"])
     fps = first_cap.get(cv2.CAP_PROP_FPS) or 30.0
     out_w = int(first_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     out_h = int(first_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     first_cap.release()
+
+    logger.info(f"Output canvas: {out_w}×{out_h} @ {fps:.1f} fps")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
@@ -275,14 +317,15 @@ def create_compilation_video(
 
         clip_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         clip_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        needs_fit = (clip_w != out_w or clip_h != out_h)
         clip_frames = 0
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            if clip_w != out_w or clip_h != out_h:
-                frame = cv2.resize(frame, (out_w, out_h))
+            if needs_fit:
+                frame = _fit_frame_to_canvas(frame, out_w, out_h)
             if overlay_text and description:
                 frame = _add_text_overlay(frame, description)
             writer.write(frame)
@@ -290,9 +333,10 @@ def create_compilation_video(
             total_frames += 1
 
         cap.release()
+        ar_str = f"{clip_w}×{clip_h}"
         logger.info(
             f"  [{idx + 1}/{len(ordered_clips)}] {Path(clip_path).name} "
-            f"({clip_frames} frames)"
+            f"({ar_str}, {clip_frames} frames)"
         )
 
     writer.release()
