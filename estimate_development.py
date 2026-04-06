@@ -56,20 +56,28 @@ _PROMPT_CHILD = (
 # Caregiver choices are listed inside Interaction so PLM sees them in context.
 
 _PROMPT_DESCRIBE = """\
-Watch this child carefully. For each domain, copy the ONE phrase that best \
-represents what you observe right now. If a domain is not visible write "none".
+Watch this child carefully. Each domain below has its OWN list of choices. \
+Select the ONE phrase from THAT domain's list that best matches what you \
+directly observe. Only use phrases from each domain's own list — do NOT \
+copy a phrase into a domain whose list does not contain it. \
+Write "none" if nothing in that domain's list is visible.
 
-Motor: crawling | first steps | walking | toddling | walks steadily | \
+Motor (how the child moves and uses hands): \
+crawling | first steps | walking | toddling | walks steadily | \
 running | jumping | grasping | picks up objects | uses spoon | \
 stacking blocks | sitting | seated | stands alone | balances
-Autonomy: reaches for toy | explores independently | self-feeds | \
+Autonomy (self-care and independence): \
+reaches for toy | explores independently | self-feeds | \
 drinks from cup | removes shoes | washes hands | dresses self
-Attention: briefly looks | looks at toy | plays with toy | \
+Attention (focus and engagement): \
+briefly looks | looks at toy | plays with toy | \
 sustained attention | extended play | prolonged focus
-Interaction: responds to name | makes eye contact | waves at adult | \
+Interaction (social behaviour with people): \
+responds to name | makes eye contact | waves at adult | \
 parallel play | shows toy to adult | cooperative play | takes turns | \
 returns to caregiver | seeks caregiver | plays independently
-Language: babbling | single word | several words | two-word phrases | \
+Language (communication): \
+babbling | single word | several words | two-word phrases | \
 sentences | points at objects | waves | uses gestures\
 """
 
