@@ -681,7 +681,10 @@ def assess(video_path: str, model, tokenizer, config,
 
         # ---- PLM Call 2 on each segment, collect raw texts -------------------
         raw_texts = []
+        chunk_details = []   # stored in result for visualization
         for i, seg in enumerate(segments):
+            t_start = i * chunk_duration if chunk_duration else 0
+            t_end   = (i + 1) * chunk_duration if chunk_duration else None
             logger.info(f"Describing segment {i+1}/{len(segments)}: {seg}")
             txt = _run_plm_text(
                 seg, _PROMPT_DESCRIBE, model, tokenizer, config,
@@ -690,12 +693,18 @@ def assess(video_path: str, model, tokenizer, config,
             )
             logger.info(f"  -> {txt!r}")
             raw_texts.append(txt)
+            chunk_details.append({
+                "index":   i + 1,
+                "t_start": t_start,
+                "t_end":   t_end,
+                "raw_text": txt,
+                "sections": _extract_domain_sections(txt),
+            })
 
         # ---- Aggregate: join per-domain text across all chunks ---------------
-        # Extract domain sections from each chunk, then concatenate per domain.
         # Scoring happens once on the combined text — behaviours seen in any
         # chunk contribute to the final score.
-        all_sections = [_extract_domain_sections(t) for t in raw_texts]
+        all_sections = [c["sections"] for c in chunk_details]
         aggregated: dict = {
             domain: "  ".join(s.get(domain, "") for s in all_sections).strip()
             for domain in DOMAINS
@@ -748,6 +757,7 @@ def assess(video_path: str, model, tokenizer, config,
             "overall_age_months": round(overall_age, 1) if overall_age is not None else None,
             "stage_distribution": stage_dist,
             "raw_plm_output": combined_description,
+            "chunk_details": chunk_details,
         }
 
     finally:
@@ -780,6 +790,46 @@ def _bar(value: float, width: int = 20) -> str:
     return chr(0x2588) * filled + chr(0x2591) * (width - filled)
 
 
+def _print_chunk_timeline(chunk_details: list) -> None:
+    """Print a compact table showing what PLM observed in each chunk."""
+    if not chunk_details:
+        return
+
+    n = len(chunk_details)
+    thin = "-" * 62
+    domain_abbr = {"motor": "Motor", "autonomy": "Auto",
+                   "attention": "Attn", "interaction": "Inter", "language": "Lang"}
+
+    print(f"\n  Per-chunk descriptions ({n} chunk{'s' if n > 1 else ''})")
+    print(f"  {thin}")
+
+    for c in chunk_details:
+        idx      = c["index"]
+        t_start  = c["t_start"]
+        t_end    = c["t_end"]
+        sections = c["sections"]
+
+        if t_end is not None:
+            time_str = f"{int(t_start):3d}s – {int(t_end):3d}s"
+        else:
+            time_str = "full video"
+
+        header = f"  Chunk {idx:>2}  [{time_str}]"
+        print(header)
+
+        for domain in DOMAINS:
+            text = sections.get(domain, "").strip()
+            label = f"  {'':<11}{domain_abbr[domain]:<6}: "
+            if not text or re.search(r"\bnot\s+observed\b", text, re.IGNORECASE):
+                print(f"{label}—")
+            else:
+                # Truncate long lines to keep the table readable
+                display = text if len(text) <= 48 else text[:45] + "..."
+                print(f"{label}{display}")
+
+        print()
+
+
 def print_report(result: dict) -> None:
     sep = "=" * 62
     thin = "-" * 62
@@ -797,6 +847,11 @@ def print_report(result: dict) -> None:
         print("\n  No child detected in this video.\n")
         print(f"{sep}\n")
         return
+
+    # Per-chunk breakdown (only when chunking was used)
+    chunks = result.get("chunk_details", [])
+    if len(chunks) > 1:
+        _print_chunk_timeline(chunks)
 
     print(f"\n{'Domain':<14} {'Feature scores (keyword)':<30} {'Age est.'}")
     print(thin)
