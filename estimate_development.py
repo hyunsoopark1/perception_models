@@ -45,20 +45,33 @@ _PROMPT_CHILD = (
     "and active in this video? Answer only: yes or no."
 )
 
-# Ask for labelled free-text sections - PLM describes, Python scores.
-# Kept short to avoid context-window overflow on PLM-3B.
-# Note: include passive behaviours (sitting, looking) so the model does not
-# default to "not observed" for a stationary child.
-_PROMPT_DESCRIBE = """\
-Watch this child carefully. For each domain write 1-2 sentences about \
-what you actually see — even small or quiet actions count. \
-Only write "not observed" if the domain is completely invisible.
+# Keyword choices embedded in the prompt so PLM selects (recognises) rather
+# than generates from scratch.  Each phrase is drawn directly from _KEYWORDS
+# so the PLM's output will exact-match our scoring vocabulary.
+#
+# Format: "Domain: choice | choice | ..."
+# PLM copies the applicable choices, comma-separated.
+# Python scores based on which keywords appear in each domain section.
+#
+# Caregiver choices are listed inside Interaction so PLM sees them in context.
 
-Motor: Is the child sitting, standing, walking, running, reaching, grasping?
-Autonomy: Does the child reach or explore without help? Feed itself?
-Attention: What does the child look at? How long does it stay focused?
-Interaction: Does the child make eye contact, look at adults, seek the caregiver?
-Language: Any babbling, words, pointing, waving, or other gestures?\
+_PROMPT_DESCRIBE = """\
+Watch this child carefully. For each domain below, copy the phrases that \
+describe what you see, separated by commas. \
+Write "none" only if the domain is completely invisible.
+
+Motor: crawling | first steps | walking | toddling | walks steadily | \
+running | jumping | grasping | picks up objects | uses spoon | \
+stacking blocks | sitting | seated | stands alone | balances
+Autonomy: reaches for toy | explores independently | self-feeds | \
+drinks from cup | removes shoes | washes hands | dresses self
+Attention: briefly looks | looks at toy | plays with toy | \
+sustained attention | extended play | prolonged focus
+Interaction: responds to name | makes eye contact | waves at adult | \
+parallel play | shows toy to adult | cooperative play | takes turns | \
+returns to caregiver | seeks caregiver | plays independently
+Language: babbling | single word | several words | two-word phrases | \
+sentences | points at objects | waves | uses gestures\
 """
 
 
@@ -72,100 +85,138 @@ Language: Any babbling, words, pointing, waving, or other gestures?\
 # ------------------------------------------------------------------------------
 
 _KEYWORDS: dict = {
+    # Phrases marked  # ← prompt  appear verbatim in _PROMPT_DESCRIBE so PLM
+    # can copy them back directly, guaranteeing exact matches.
     "locomotion": [
-        (1.00, ["hopping", "galloping", "jumping", "jumps", "skipping", "runs confidently"]),
-        (0.80, ["running", "runs", "climbs stairs", "walks well", "walks steadily",
-                "walks independently", "walks without"]),
-        (0.60, ["walking", "walks", "toddling", "toddles", "walks around", "takes steps"]),
-        (0.35, ["cruising", "pulling to stand", "pulls to stand", "first steps",
-                "stands with support", "unsteady steps"]),
-        (0.10, ["crawling", "crawls", "creeping", "scooting"]),
+        (1.00, ["hopping", "galloping", "jumping", "jumps", "skipping",   # ← prompt: jumping
+                "runs confidently"]),
+        (0.80, ["running", "runs", "climbs stairs", "walks well",          # ← prompt: running
+                "walks steadily", "walks independently", "walks without"]),  # ← prompt: walks steadily
+        (0.60, ["walking", "walks", "toddling", "toddles", "walks around",  # ← prompt: walking, toddling
+                "takes steps"]),
+        (0.35, ["cruising", "pulling to stand", "pulls to stand",           # ← prompt: first steps
+                "first steps", "stands with support", "unsteady steps"]),
+        (0.10, ["crawling", "crawls", "creeping", "scooting"]),             # ← prompt: crawling
         (0.00, ["lying", "stationary", "does not walk", "seated only"]),
     ],
     "coordination": [
         (1.00, ["scissors", "draws circle", "catches ball", "strings beads", "buttons"]),
-        (0.80, ["kicks ball", "turns pages", "builds tower", "stacks blocks", "uses fork"]),
-        (0.60, ["throws", "scribbles", "uses spoon", "picks up small", "stacks", "pours"]),
-        (0.35, ["grasps", "pincer", "reaches for", "picks up", "holds toy", "transfers"]),
+        (0.80, ["kicks ball", "turns pages", "builds tower",
+                "stacks blocks", "uses fork"]),                             # ← prompt: stacking blocks
+        (0.60, ["throws", "scribbles", "uses spoon", "picks up small",
+                "stacks", "pours"]),                                        # ← prompt: uses spoon
+        (0.35, ["grasps", "pincer", "reaches for", "picks up", "holds toy",
+                "transfers", "grasping", "picks up objects"]),              # ← prompt: grasping, picks up objects
     ],
     "stability": [
-        (1.00, ["stands on one foot", "hops on one foot", "balances on one", "excellent balance"]),
-        (0.80, ["tiptoe", "walks on tiptoe", "steady balance", "good balance", "balances briefly"]),
-        (0.60, ["stands alone", "stands independently", "steady on feet", "walks without falling"]),
-        (0.35, ["sits independently", "sits alone", "sitting", "sitting up", "seated", "seated on",
+        (1.00, ["stands on one foot", "hops on one foot", "balances on one",
+                "excellent balance", "balances"]),                          # ← prompt: balances
+        (0.80, ["tiptoe", "walks on tiptoe", "steady balance",
+                "good balance", "balances briefly"]),
+        (0.60, ["stands alone", "stands independently",                    # ← prompt: stands alone
+                "steady on feet", "walks without falling"]),
+        (0.35, ["sits independently", "sits alone", "sitting", "sitting up",
+                "seated", "seated on",                                      # ← prompt: sitting, seated
                 "pulls to stand", "stands briefly", "standing"]),
     ],
     "independence": [
-        (1.00, ["dresses independently", "fully independent", "toilet", "brushes teeth"]),
-        (0.80, ["removes shoes", "washes hands", "partially dresses", "puts on clothing"]),
-        (0.60, ["feeds self", "drinks from cup", "uses spoon alone", "eats independently",
+        (1.00, ["dresses independently", "fully independent",
+                "toilet", "brushes teeth", "dresses self"]),                # ← prompt: dresses self
+        (0.80, ["removes shoes", "washes hands",                           # ← prompt: removes shoes, washes hands
+                "partially dresses", "puts on clothing"]),
+        (0.60, ["feeds self", "drinks from cup",                           # ← prompt: self-feeds, drinks from cup
+                "uses spoon alone", "eats independently",
                 "self-feeds", "self feeds"]),
-        (0.35, ["reaches for toy", "picks up food", "explores nearby", "grabs object"]),
+        (0.35, ["reaches for toy", "picks up food",                        # ← prompt: reaches for toy
+                "explores nearby", "grabs object",
+                "explores independently"]),                                 # ← prompt: explores independently
     ],
     "initiative": [
-        (1.00, ["complex pretend", "elaborate play", "self-directed", "plans activity",
-                "sequential", "organizes play"]),
-        (0.80, ["pretend play", "makes choices", "problem solv", "selects toy",
-                "leads play", "starts game"]),
-        (0.60, ["initiates play", "chooses toy", "opens container", "starts activity",
-                "initiates activity"]),
-        (0.35, ["initiates reaching", "explores independently", "moves toward", "approaches"]),
+        (1.00, ["complex pretend", "elaborate play", "self-directed",
+                "plans activity", "sequential", "organizes play"]),
+        (0.80, ["pretend play", "makes choices", "problem solv",           # ← prompt: pretend play, makes choices
+                "selects toy", "leads play", "starts game"]),
+        (0.60, ["initiates play", "chooses toy", "opens container",
+                "starts activity", "initiates activity"]),
+        (0.35, ["initiates reaching", "explores independently",
+                "moves toward", "approaches"]),
     ],
     "duration": [
-        (1.00, ["prolonged focus", "sustained engagement", "extended attention",
-                "maintains attention", "long period"]),
-        (0.80, ["extended play", "focused activity", "stays engaged", "continues playing",
-                "concentrates"]),
-        (0.60, ["sustained attention", "plays with toy", "attends for several",
-                "focused for", "watches attentively"]),
-        (0.35, ["briefly attends", "momentary attention", "looks at toy briefly",
-                "short attention", "glances", "looks at", "gazes", "watches", "observes"]),
+        (1.00, ["prolonged focus", "sustained engagement",                 # ← prompt: prolonged focus
+                "extended attention", "maintains attention", "long period"]),
+        (0.80, ["extended play", "focused activity",                       # ← prompt: extended play
+                "stays engaged", "continues playing", "concentrates"]),
+        (0.60, ["sustained attention", "plays with toy",                   # ← prompt: sustained attention, plays with toy
+                "attends for several", "focused for", "watches attentively"]),
+        (0.35, ["briefly attends", "momentary attention",
+                "looks at toy briefly", "short attention",
+                "glances", "looks at", "gazes", "watches", "observes",
+                "briefly looks", "looks at toy"]),                          # ← prompt: briefly looks, looks at toy
     ],
     "goal_directed": [
-        (1.00, ["plans ahead", "sequential actions", "multi-step", "complex problem",
-                "organized play"]),
-        (0.80, ["completes task", "works to finish", "purposefully arranges", "solves problem"]),
-        (0.60, ["purposeful play", "works toward goal", "tries to achieve", "persists"]),
-        (0.35, ["reaches for specific", "follows object", "tracks toy", "pursues toy"]),
+        (1.00, ["plans ahead", "sequential actions", "multi-step",
+                "complex problem", "organized play"]),
+        (0.80, ["completes task", "works to finish",
+                "purposefully arranges", "solves problem"]),
+        (0.60, ["purposeful play", "works toward goal",
+                "tries to achieve", "persists"]),
+        (0.35, ["reaches for specific", "follows object",
+                "tracks toy", "pursues toy"]),
     ],
     "social_engagement": [
-        (1.00, ["cooperative play", "takes turns", "plays with other children",
-                "group play", "shares toys"]),
-        (0.80, ["plays alongside", "shows affection", "parallel play with interaction",
-                "brings toy to", "shows toy to"]),
-        (0.60, ["parallel play", "makes eye contact", "shows objects", "imitates",
-                "waves at", "responds to"]),
-        (0.35, ["responds to name", "smiles at", "turns to voice", "reacts to adult"]),
+        (1.00, ["cooperative play", "takes turns",                         # ← prompt: cooperative play, takes turns
+                "plays with other children", "group play", "shares toys"]),
+        (0.80, ["plays alongside", "shows affection",
+                "parallel play with interaction",
+                "brings toy to", "shows toy to",
+                "shows toy to adult"]),                                     # ← prompt: shows toy to adult
+        (0.60, ["parallel play", "makes eye contact",                      # ← prompt: parallel play, makes eye contact
+                "shows objects", "imitates",
+                "waves at", "responds to",
+                "waves at adult"]),                                         # ← prompt: waves at adult
+        (0.35, ["responds to name", "smiles at",                           # ← prompt: responds to name
+                "turns to voice", "reacts to adult"]),
     ],
     # Decreasing curve: higher score = more caregiver-dependent = younger child
     "caregiver_dependency": [
         (0.80, ["clings to", "cries for caregiver", "separation anxiety",
-                "distressed without", "won't leave caregiver", "needs caregiver constantly"]),
-        (0.65, ["seeks caregiver", "returns to caregiver", "checks on caregiver",
-                "looks to caregiver", "looks back at parent", "looks at parent",
-                "looks at adult", "looks back at", "stays near adult", "keeps close to"]),
-        (0.45, ["occasionally checks", "glances at caregiver", "aware of caregiver"]),
-        (0.20, ["plays independently", "ignores caregiver", "fully independent from",
-                "comfortable away", "does not seek"]),
+                "distressed without", "won't leave caregiver",
+                "needs caregiver constantly"]),
+        (0.65, ["seeks caregiver", "returns to caregiver",                 # ← prompt: seeks caregiver, returns to caregiver
+                "checks on caregiver", "looks to caregiver",
+                "looks back at parent", "looks at parent",
+                "looks at adult", "looks back at",
+                "stays near adult", "keeps close to"]),
+        (0.45, ["occasionally checks", "glances at caregiver",
+                "aware of caregiver"]),
+        (0.20, ["plays independently", "ignores caregiver",                # ← prompt: plays independently
+                "fully independent from", "comfortable away",
+                "does not seek"]),
     ],
     "verbal": [
-        (1.00, ["sentences", "full sentence", "three-word", "conversation", "storytelling",
-                "talks in"]),
-        (0.80, ["two-word", "2-word", "combining words", "word combinations", "short phrases"]),
-        (0.60, ["several words", "multiple words", "vocabulary", "names objects",
-                "says words", "many words"]),
-        (0.35, ["babbling", "babbles", "single word", "mama", "dada", "first words",
+        (1.00, ["sentences", "full sentence", "three-word",                # ← prompt: sentences
+                "conversation", "storytelling", "talks in"]),
+        (0.80, ["two-word", "2-word", "combining words",                   # ← prompt: two-word phrases
+                "word combinations", "short phrases",
+                "two-word phrases"]),
+        (0.60, ["several words", "multiple words", "vocabulary",           # ← prompt: several words
+                "names objects", "says words", "many words"]),
+        (0.35, ["babbling", "babbles", "single word",                      # ← prompt: babbling, single word
+                "mama", "dada", "first words",
                 "one word", "jargon", "vocalizes"]),
-        (0.00, ["no words", "no speech", "silent", "no verbal", "does not speak"]),
+        (0.00, ["no words", "no speech", "silent",
+                "no verbal", "does not speak"]),
     ],
     "gesture": [
         (1.00, ["rich gestures", "complex gestures", "gestures with speech", "mime",
                 "elaborate gesture"]),
-        (0.80, ["gestures to communicate", "uses gestures", "points to show",
-                "shows object", "symbolic gesture"]),
-        (0.60, ["points at", "points to", "pointing at", "pointing to", "points",
-                "pointing", "uses pointing"]),
-        (0.35, ["waves", "waving", "arms up", "reaching gesture", "claps", "shakes head"]),
+        (0.80, ["gestures to communicate", "uses gestures",                # ← prompt: uses gestures
+                "points to show", "shows object", "symbolic gesture"]),
+        (0.60, ["points at objects", "points at", "points to",             # ← prompt: points at objects
+                "pointing at", "pointing to", "points", "pointing",
+                "uses pointing"]),
+        (0.35, ["waves", "waving", "arms up",                              # ← prompt: waves
+                "reaching gesture", "claps", "shakes head"]),
         (0.00, ["no gesture", "no pointing", "no waving", "does not gesture"]),
     ],
 }
@@ -285,7 +336,17 @@ def _score_feature(text: str, feature: str) -> tuple:
     best_score: Optional[float] = None
     best_phrase: Optional[str] = None
 
-    if model is not None:
+    # --- Phase 1: exact substring matching (always takes priority) -------------
+    for cdc_score, phrases in entries:
+        for phrase in phrases:
+            if phrase.lower() in text_lower:
+                if best_score is None or cdc_score > best_score:
+                    best_score = cdc_score
+                    best_phrase = f'"{phrase}" (exact)'
+                break  # one phrase per tier is enough
+
+    # --- Phase 2: semantic fallback (only when nothing exact-matched) ---------
+    if best_score is None and model is not None:
         from sentence_transformers import util
         text_emb = model.encode(text, convert_to_tensor=True)
 
@@ -297,28 +358,11 @@ def _score_feature(text: str, feature: str) -> tuple:
                 ))
                 if negated:
                     continue
-
-                # 1. Exact substring match (fast path — always reliable)
-                exact = phrase.lower() in text_lower
-
-                # 2. Semantic similarity (catches synonyms / paraphrases)
                 sim = util.cos_sim(text_emb, _cached_phrase_emb(phrase, model)).item()
-                semantic = sim >= _SEMANTIC_THRESHOLD
-
-                if exact or semantic:
+                if sim >= _SEMANTIC_THRESHOLD:
                     if best_score is None or cdc_score > best_score:
                         best_score = cdc_score
-                        tag = "exact" if exact else f"sim={sim:.2f}"
-                        best_phrase = f'"{phrase}" ({tag})'
-    else:
-        # Exact substring only (sentence-transformers not installed)
-        for cdc_score, phrases in entries:
-            for phrase in phrases:
-                if phrase.lower() in text_lower:
-                    if best_score is None or cdc_score > best_score:
-                        best_score = cdc_score
-                        best_phrase = f'"{phrase}" (exact)'
-                    break
+                        best_phrase = f'"{phrase}" (sim={sim:.2f})'
 
     return best_score, best_phrase
 
