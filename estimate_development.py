@@ -925,22 +925,15 @@ _COL_NONE    = (100, 100, 100) # grey
 _COL_MATCHED = (80, 255, 80)   # green  (keyword that drove the final score)
 
 
-def _draw_text_shadow(img, text, pos, font, scale, color, thickness=1):
-    """Draw text with a 1-px dark shadow for readability on any background."""
-    x, y = pos
-    cv2.putText(img, text, (x + 1, y + 1), font, scale, (0, 0, 0), thickness + 1,
-                cv2.LINE_AA)
-    cv2.putText(img, text, pos, font, scale, color, thickness, cv2.LINE_AA)
-
-
 def render_assessment_video(video_path: str, result: dict, output_path: str) -> None:
     """Burn chunk keyword overlays into the video and write to output_path.
 
     For each frame the overlay shows:
       - Chunk index / time range  (top-left header)
-      - Per-domain selected keywords from that chunk's PLM output
-      - Thin progress bar (current position within the full video)
-      - Matched keywords highlighted in the final aggregated score
+      - Per-domain selected keywords + per-domain age estimate
+      - Overall estimated age (bottom of panel)
+      - Thin progress bar (bottom edge) with chunk boundary ticks
+      - Domain lines are green when the domain drove the aggregated score
 
     Args:
         video_path: Source video (original — OpenCV reads HEVC fine).
@@ -950,40 +943,49 @@ def render_assessment_video(video_path: str, result: dict, output_path: str) -> 
     import cv2
     from split_videos import _apply_rotation, _get_rotation
 
+    # Local helper — needs cv2 in scope
+    def _puttext(img, text, pos, scale, color, thickness=1):
+        x, y = pos
+        cv2.putText(img, text, (x + 1, y + 1), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
+        cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, color, thickness, cv2.LINE_AA)
+
     chunk_details = result.get("chunk_details", [])
     if not chunk_details:
         logger.warning("No chunk_details in result; nothing to render.")
         return
 
-    # Build a lookup: feature -> matched keyword string (from aggregated score)
-    matched_kw: dict = {}  # feature -> phrase string e.g. '"walking" (exact)'
+    # Build feature -> matched phrase lookup (from aggregated scoring)
+    matched_kw: dict = {}
     for domain in DOMAINS:
         feat_data = result.get("plm_features", {}).get(domain) or {}
         for feat, phrase in feat_data.get("matched_keywords", {}).items():
             if phrase:
                 matched_kw[feat] = phrase
 
+    domain_ages = result.get("domain_ages", {})
+    overall_age = result.get("overall_age_months")
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
-    fps        = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    rotation   = _get_rotation(cap)
-    raw_w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    raw_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    rotation     = _get_rotation(cap)
+    raw_w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    raw_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     out_w, out_h = (raw_h, raw_w) if rotation in (90, 270) else (raw_w, raw_h)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
 
-    font       = cv2.FONT_HERSHEY_SIMPLEX
-    fscale     = max(0.40, min(0.65, out_w / 1440 * 0.65))
-    line_h     = int(fscale * 38)
-    pad        = 10
-    n_chunks   = len(chunk_details)
-    # Pre-index chunks by time for fast per-frame lookup
-    # chunk_details already ordered; last chunk's t_end may be None
+    fscale   = max(0.40, min(0.65, out_w / 1440 * 0.65))
+    line_h   = int(fscale * 38)
+    pad      = 10
+    n_chunks = len(chunk_details)
+
     def _chunk_for_time(t):
         for c in chunk_details:
             if c["t_end"] is None or t < c["t_end"]:
@@ -996,51 +998,59 @@ def render_assessment_video(video_path: str, result: dict, output_path: str) -> 
         if not ret:
             break
 
-        frame = _apply_rotation(frame, rotation)
-        t = frame_idx / fps
-        chunk = _chunk_for_time(t)
+        frame   = _apply_rotation(frame, rotation)
+        t       = frame_idx / fps
+        chunk   = _chunk_for_time(t)
         sections = chunk["sections"]
 
-        # --- semi-transparent dark panel on the left side ---
-        n_lines   = 1 + len(DOMAINS)            # header + 5 domain lines
-        panel_h   = n_lines * line_h + pad * 2
-        panel_w   = min(out_w, int(out_w * 0.55))
-        overlay   = frame.copy()
+        # --- semi-transparent panel ---
+        # Lines: header + 5 domains + separator + overall age
+        n_lines  = 1 + len(DOMAINS) + 2
+        panel_h  = n_lines * line_h + pad * 2
+        panel_w  = min(out_w, int(out_w * 0.60))
+        overlay  = frame.copy()
         cv2.rectangle(overlay, (0, 0), (panel_w, panel_h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
         # --- chunk header ---
-        t_s = int(chunk["t_start"])
-        t_e = int(chunk["t_end"]) if chunk["t_end"] is not None else "?"
+        t_s    = int(chunk["t_start"])
+        t_e    = int(chunk["t_end"]) if chunk["t_end"] is not None else "?"
         header = f"Chunk {chunk['index']}/{n_chunks}  [{t_s}s – {t_e}s]"
-        _draw_text_shadow(frame, header, (pad, pad + line_h), font, fscale, _COL_HEADER)
+        _puttext(frame, header, (pad, pad + line_h), fscale, _COL_HEADER)
 
-        # --- per-domain keyword lines ---
+        # --- per-domain lines: keywords  +  age estimate ---
         for row, domain in enumerate(DOMAINS, start=1):
-            text = sections.get(domain, "").strip()
+            text  = sections.get(domain, "").strip()
             label = _DOMAIN_ABBR[domain]
-            y = pad + (row + 1) * line_h
+            y     = pad + (row + 1) * line_h
 
-            # Determine color: green if this domain has a matched keyword
-            domain_feats = _DOMAIN_FEATURES[domain]
-            has_match = any(f in matched_kw for f in domain_feats)
+            has_match = any(f in matched_kw for f in _DOMAIN_FEATURES[domain])
             col = _COL_MATCHED if has_match else _COL_TEXT
 
+            age = domain_ages.get(domain)
+            age_str = f" [{age:.0f}mo]" if age is not None else ""
+
             if not text or re.search(r"\bnot\s+observed\b", text, re.IGNORECASE):
-                _draw_text_shadow(frame, f"{label}: —", (pad, y), font, fscale,
-                                  _COL_NONE)
+                _puttext(frame, f"{label}: —", (pad, y), fscale, _COL_NONE)
             else:
-                # Truncate so text fits in panel
-                max_chars = int(panel_w / (fscale * 13))
-                display = text if len(text) <= max_chars else text[:max_chars - 3] + "..."
-                _draw_text_shadow(frame, f"{label}: {display}", (pad, y), font,
-                                  fscale, col)
+                max_chars = int((panel_w - int(fscale * 60)) / (fscale * 13))
+                display   = text if len(text) <= max_chars else text[:max_chars - 3] + "..."
+                _puttext(frame, f"{label}: {display}{age_str}", (pad, y), fscale, col)
+
+        # --- overall age (bottom of panel) ---
+        y_overall = pad + (len(DOMAINS) + 2) * line_h
+        if overall_age is not None:
+            overall_str = f"Overall: {overall_age:.1f} months"
+        else:
+            overall_str = "Overall: insufficient data"
+        cv2.line(frame, (pad, y_overall - line_h // 2),
+                 (panel_w - pad, y_overall - line_h // 2), (80, 80, 80), 1)
+        _puttext(frame, overall_str, (pad, y_overall), fscale, _COL_HEADER)
 
         # --- progress bar (bottom edge) ---
         if total_frames > 0:
             bar_h  = max(4, int(out_h * 0.008))
             filled = int(out_w * frame_idx / total_frames)
-            # chunk boundary ticks
             for c in chunk_details:
                 if c["t_end"]:
                     tx = int(out_w * c["t_end"] * fps / total_frames)
