@@ -56,9 +56,8 @@ _PROMPT_CHILD = (
 # Caregiver choices are listed inside Interaction so PLM sees them in context.
 
 _PROMPT_DESCRIBE = """\
-Watch this child carefully. For each domain, copy ONLY the 1-3 phrases that \
-you can directly observe right now. Do not copy phrases for skills the child \
-does not clearly demonstrate. If a domain is invisible write "none".
+Watch this child carefully. For each domain, copy the ONE phrase that best \
+represents what you observe right now. If a domain is not visible write "none".
 
 Motor: crawling | first steps | walking | toddling | walks steadily | \
 running | jumping | grasping | picks up objects | uses spoon | \
@@ -428,6 +427,77 @@ def _score_domain(domain: str, text: str) -> Optional[dict]:
     return result
 
 
+def _score_chunk(sections: dict) -> dict:
+    """Score all domains for a single chunk's extracted domain sections.
+
+    Returns a dict:  {domain: {"scored": <_score_domain result or None>, "age": float|None}}
+    """
+    chunk_scores: dict = {}
+    for domain in DOMAINS:
+        text = sections.get(domain, "")
+        scored = _score_domain(domain, text) if text else None
+        if scored:
+            feats = {k: v for k, v in scored.items()
+                     if k not in ("evidence", "matched_keywords")}
+            age = domain_age(domain, feats)
+        else:
+            age = None
+        chunk_scores[domain] = {"scored": scored, "age": age}
+    return chunk_scores
+
+
+def _aggregate_chunk_scores(per_chunk_scores: list) -> tuple:
+    """Aggregate per-chunk domain scores by taking the *max* feature score.
+
+    Args:
+        per_chunk_scores: list of dicts, each returned by _score_chunk().
+
+    Returns:
+        (plm_features, domain_ages) — same shape as assess() currently builds
+        from the aggregated text approach.
+    """
+    agg_features: dict = {}
+    for domain in DOMAINS:
+        best_scores: dict = {}   # feat -> best score seen across chunks
+        best_phrases: dict = {}  # feat -> matched phrase string for best score
+        best_evidence: Optional[str] = None
+
+        for cs in per_chunk_scores:
+            data = cs.get(domain, {})
+            scored = data.get("scored")
+            if scored is None:
+                continue
+            if best_evidence is None:
+                best_evidence = scored.get("evidence")
+            for feat in _DOMAIN_FEATURES[domain]:
+                s = scored.get(feat)
+                if s is None:
+                    continue
+                if feat not in best_scores or s > best_scores[feat]:
+                    best_scores[feat] = s
+                    best_phrases[feat] = scored.get("matched_keywords", {}).get(feat)
+
+        if best_scores:
+            result: dict = dict(best_scores)
+            result["evidence"] = best_evidence
+            result["matched_keywords"] = {k: v for k, v in best_phrases.items() if v}
+            agg_features[domain] = result
+        else:
+            agg_features[domain] = None
+
+    agg_domain_ages: dict = {}
+    for domain in DOMAINS:
+        features = agg_features.get(domain)
+        if features:
+            feats = {k: v for k, v in features.items()
+                     if k not in ("evidence", "matched_keywords")}
+            agg_domain_ages[domain] = domain_age(domain, feats)
+        else:
+            agg_domain_ages[domain] = None
+
+    return agg_features, agg_domain_ages
+
+
 # ------------------------------------------------------------------------------
 # CDC mapping helpers
 # ------------------------------------------------------------------------------
@@ -682,7 +752,7 @@ def assess(video_path: str, model, tokenizer, config,
         else:
             segments = [plm_path]
 
-        # ---- PLM Call 2 on each segment, collect raw texts -------------------
+        # ---- PLM Call 2 on each segment, score per chunk --------------------
         raw_texts = []
         chunk_details = []   # stored in result for visualization
         for i, seg in enumerate(segments):
@@ -696,57 +766,54 @@ def assess(video_path: str, model, tokenizer, config,
             )
             logger.info(f"  -> {txt!r}")
             raw_texts.append(txt)
-            chunk_details.append({
-                "index":   i + 1,
-                "t_start": t_start,
-                "t_end":   t_end,
-                "raw_text": txt,
-                "sections": _extract_domain_sections(txt),
-            })
+            sections = _extract_domain_sections(txt)
+            chunk_scores = _score_chunk(sections)
+            chunk_domain_ages = {d: chunk_scores[d]["age"] for d in DOMAINS}
 
-        # ---- Aggregate: join per-domain text across all chunks ---------------
-        # Scoring happens once on the combined text — behaviours seen in any
-        # chunk contribute to the final score.
-        all_sections = [c["sections"] for c in chunk_details]
-        aggregated: dict = {
-            domain: "  ".join(s.get(domain, "") for s in all_sections).strip()
-            for domain in DOMAINS
-        }
+            if debug:
+                print(f"\n--- Chunk {i+1}/{len(segments)} [{t_start}s – {t_end}s] ---")
+                for d in DOMAINS:
+                    text_d = sections.get(d, "")
+                    age_d = chunk_domain_ages.get(d)
+                    print(f"  [{d}] {text_d!r}  -> {age_d:.1f}mo" if age_d is not None
+                          else f"  [{d}] {text_d!r}  -> n/a")
+                    scored_d = chunk_scores[d]["scored"]
+                    if scored_d and debug:
+                        for feat in _DOMAIN_FEATURES[d]:
+                            s = scored_d.get(feat)
+                            kw = scored_d.get("matched_keywords", {}).get(feat, "")
+                            match_str = f"  <- {kw}" if kw else ""
+                            print(f"    {feat}: {s}{match_str}")
+
+            chunk_details.append({
+                "index":        i + 1,
+                "t_start":      t_start,
+                "t_end":        t_end,
+                "raw_text":     txt,
+                "sections":     sections,
+                "scores":       chunk_scores,       # per-chunk feature scores
+                "domain_ages":  chunk_domain_ages,  # per-chunk domain ages
+            })
 
         combined_description = "\n".join(raw_texts)
 
+        # ---- Aggregate: max feature score across all chunks -----------------
+        per_chunk_scores = [c["scores"] for c in chunk_details]
+        plm_features, domain_ages = _aggregate_chunk_scores(per_chunk_scores)
+
         if debug:
-            print(f"\n--- Aggregated domain text ({len(segments)} chunk(s)) ---")
-            for d in DOMAINS:
-                print(f"  [{d}] {aggregated[d]!r}")
-
-        # ---- Score once on aggregated text -----------------------------------
-        plm_features: dict = {}
-        domain_ages: dict = {}
-
-        for domain in DOMAINS:
-            text = aggregated[domain]
-            scored = _score_domain(domain, text) if text else None
-
-            if debug:
-                print(f"\n--- Keyword scores: {domain} ---")
-                if not text:
-                    print("  (no section text)")
-                elif re.search(r"\bnot\s+observed\b", text, re.IGNORECASE):
-                    print(f"  '{text}' -> all chunks said not observed")
-                else:
+            print(f"\n--- Aggregated (max per feature across {len(segments)} chunk(s)) ---")
+            for domain in DOMAINS:
+                features = plm_features.get(domain)
+                age = domain_ages.get(domain)
+                print(f"  [{domain}] age={age:.1f}mo" if age is not None
+                      else f"  [{domain}] n/a")
+                if features:
                     for feat in _DOMAIN_FEATURES[domain]:
-                        s, phrase = _score_feature(text, feat)
-                        match_str = f"  <- {phrase}" if phrase else ""
-                        print(f"  {feat}: {s}{match_str}")
-
-            plm_features[domain] = scored
-            if scored:
-                features_for_age = {k: v for k, v in scored.items()
-                                    if k not in ("evidence", "matched_keywords")}
-                domain_ages[domain] = domain_age(domain, features_for_age)
-            else:
-                domain_ages[domain] = None
+                        s = features.get(feat)
+                        kw = features.get("matched_keywords", {}).get(feat, "")
+                        match_str = f"  <- {kw}" if kw else ""
+                        print(f"    {feat}: {s}{match_str}")
 
         observed_ages = [a for a in domain_ages.values() if a is not None]
         overall_age = sum(observed_ages) / len(observed_ages) if observed_ages else None
@@ -820,15 +887,18 @@ def _print_chunk_timeline(chunk_details: list) -> None:
         header = f"  Chunk {idx:>2}  [{time_str}]"
         print(header)
 
+        chunk_ages = c.get("domain_ages", {})
         for domain in DOMAINS:
             text = sections.get(domain, "").strip()
             label = f"  {'':<11}{domain_abbr[domain]:<6}: "
+            age_d = chunk_ages.get(domain)
+            age_tag = f"  [{age_d:.0f}mo]" if age_d is not None else ""
             if not text or re.search(r"\bnot\s+observed\b", text, re.IGNORECASE):
-                print(f"{label}—")
+                print(f"{label}—{age_tag}")
             else:
-                # Truncate long lines to keep the table readable
-                display = text if len(text) <= 48 else text[:45] + "..."
-                print(f"{label}{display}")
+                max_txt = 40
+                display = text if len(text) <= max_txt else text[:max_txt - 3] + "..."
+                print(f"{label}{display}{age_tag}")
 
         print()
 
@@ -1044,10 +1114,17 @@ def render_assessment_video(video_path: str, result: dict, output_path: str) -> 
 
         # --- per-domain: label line + feature breakdown line ---
         for row, domain in enumerate(DOMAINS):
-            feat_data = result.get("plm_features", {}).get(domain) or {}
-            kw_map    = feat_data.get("matched_keywords", {})
-            age       = domain_ages.get(domain)
-            age_str   = f"  [{age:.0f}mo]" if age is not None else ""
+            feat_data  = result.get("plm_features", {}).get(domain) or {}
+            kw_map     = feat_data.get("matched_keywords", {})
+            agg_age    = domain_ages.get(domain)
+            chunk_age  = chunk.get("domain_ages", {}).get(domain)
+            # Show per-chunk age → aggregated age when chunking is active
+            if n_chunks > 1:
+                ca_str  = f"{chunk_age:.0f}" if chunk_age is not None else "?"
+                agg_str = f"{agg_age:.0f}"   if agg_age  is not None else "?"
+                age_str = f"  [{ca_str}→{agg_str}mo]"
+            else:
+                age_str = f"  [{agg_age:.0f}mo]" if agg_age is not None else ""
             label     = _DOMAIN_ABBR[domain]
             y_label   = pad + (row * 2 + 2) * line_h_s
             y_feat    = y_label + line_h_s
@@ -1146,8 +1223,9 @@ Examples:
                         help="Sampling temperature; 0.0 = greedy (default).")
     parser.add_argument("--chunk_duration", type=float, default=None,
                         help="Split video into chunks of this many seconds and run PLM "
-                             "on each. All chunk texts are aggregated per domain before "
-                             "scoring. Omit to treat the full video as one chunk.")
+                             "on each. Each chunk is scored independently; the max "
+                             "feature score across chunks drives the final age estimate. "
+                             "Omit to treat the full video as one chunk.")
     parser.add_argument("--json_only", action="store_true",
                         help="Print only the JSON result (no formatted report).")
     parser.add_argument("--save", type=str, default=None,
