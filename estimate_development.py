@@ -910,6 +910,156 @@ def print_report(result: dict) -> None:
 
 
 # ------------------------------------------------------------------------------
+# Video overlay renderer
+# ------------------------------------------------------------------------------
+
+_DOMAIN_ABBR = {
+    "motor": "Motor", "autonomy": "Auto",
+    "attention": "Attn", "interaction": "Inter", "language": "Lang",
+}
+
+# Colors (BGR)
+_COL_HEADER  = (0, 220, 255)   # yellow-ish
+_COL_TEXT    = (255, 255, 255) # white
+_COL_NONE    = (100, 100, 100) # grey
+_COL_MATCHED = (80, 255, 80)   # green  (keyword that drove the final score)
+
+
+def _draw_text_shadow(img, text, pos, font, scale, color, thickness=1):
+    """Draw text with a 1-px dark shadow for readability on any background."""
+    x, y = pos
+    cv2.putText(img, text, (x + 1, y + 1), font, scale, (0, 0, 0), thickness + 1,
+                cv2.LINE_AA)
+    cv2.putText(img, text, pos, font, scale, color, thickness, cv2.LINE_AA)
+
+
+def render_assessment_video(video_path: str, result: dict, output_path: str) -> None:
+    """Burn chunk keyword overlays into the video and write to output_path.
+
+    For each frame the overlay shows:
+      - Chunk index / time range  (top-left header)
+      - Per-domain selected keywords from that chunk's PLM output
+      - Thin progress bar (current position within the full video)
+      - Matched keywords highlighted in the final aggregated score
+
+    Args:
+        video_path: Source video (original — OpenCV reads HEVC fine).
+        result:     Dict returned by assess(), must contain chunk_details.
+        output_path: Where to write the annotated MP4.
+    """
+    import cv2
+    from split_videos import _apply_rotation, _get_rotation
+
+    chunk_details = result.get("chunk_details", [])
+    if not chunk_details:
+        logger.warning("No chunk_details in result; nothing to render.")
+        return
+
+    # Build a lookup: feature -> matched keyword string (from aggregated score)
+    matched_kw: dict = {}  # feature -> phrase string e.g. '"walking" (exact)'
+    for domain in DOMAINS:
+        feat_data = result.get("plm_features", {}).get(domain) or {}
+        for feat, phrase in feat_data.get("matched_keywords", {}).items():
+            if phrase:
+                matched_kw[feat] = phrase
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
+    fps        = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    rotation   = _get_rotation(cap)
+    raw_w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    raw_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_w, out_h = (raw_h, raw_w) if rotation in (90, 270) else (raw_w, raw_h)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
+
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    fscale     = max(0.40, min(0.65, out_w / 1440 * 0.65))
+    line_h     = int(fscale * 38)
+    pad        = 10
+    n_chunks   = len(chunk_details)
+    # Pre-index chunks by time for fast per-frame lookup
+    # chunk_details already ordered; last chunk's t_end may be None
+    def _chunk_for_time(t):
+        for c in chunk_details:
+            if c["t_end"] is None or t < c["t_end"]:
+                return c
+        return chunk_details[-1]
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = _apply_rotation(frame, rotation)
+        t = frame_idx / fps
+        chunk = _chunk_for_time(t)
+        sections = chunk["sections"]
+
+        # --- semi-transparent dark panel on the left side ---
+        n_lines   = 1 + len(DOMAINS)            # header + 5 domain lines
+        panel_h   = n_lines * line_h + pad * 2
+        panel_w   = min(out_w, int(out_w * 0.55))
+        overlay   = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (panel_w, panel_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+        # --- chunk header ---
+        t_s = int(chunk["t_start"])
+        t_e = int(chunk["t_end"]) if chunk["t_end"] is not None else "?"
+        header = f"Chunk {chunk['index']}/{n_chunks}  [{t_s}s – {t_e}s]"
+        _draw_text_shadow(frame, header, (pad, pad + line_h), font, fscale, _COL_HEADER)
+
+        # --- per-domain keyword lines ---
+        for row, domain in enumerate(DOMAINS, start=1):
+            text = sections.get(domain, "").strip()
+            label = _DOMAIN_ABBR[domain]
+            y = pad + (row + 1) * line_h
+
+            # Determine color: green if this domain has a matched keyword
+            domain_feats = _DOMAIN_FEATURES[domain]
+            has_match = any(f in matched_kw for f in domain_feats)
+            col = _COL_MATCHED if has_match else _COL_TEXT
+
+            if not text or re.search(r"\bnot\s+observed\b", text, re.IGNORECASE):
+                _draw_text_shadow(frame, f"{label}: —", (pad, y), font, fscale,
+                                  _COL_NONE)
+            else:
+                # Truncate so text fits in panel
+                max_chars = int(panel_w / (fscale * 13))
+                display = text if len(text) <= max_chars else text[:max_chars - 3] + "..."
+                _draw_text_shadow(frame, f"{label}: {display}", (pad, y), font,
+                                  fscale, col)
+
+        # --- progress bar (bottom edge) ---
+        if total_frames > 0:
+            bar_h  = max(4, int(out_h * 0.008))
+            filled = int(out_w * frame_idx / total_frames)
+            # chunk boundary ticks
+            for c in chunk_details:
+                if c["t_end"]:
+                    tx = int(out_w * c["t_end"] * fps / total_frames)
+                    cv2.rectangle(frame, (tx - 1, out_h - bar_h - 4),
+                                  (tx + 1, out_h - 4), (180, 180, 180), -1)
+            cv2.rectangle(frame, (0, out_h - bar_h), (out_w, out_h),
+                          (60, 60, 60), -1)
+            cv2.rectangle(frame, (0, out_h - bar_h), (filled, out_h),
+                          (0, 200, 255), -1)
+
+        writer.write(frame)
+        frame_idx += 1
+
+    cap.release()
+    writer.release()
+    logger.info(f"Annotated video saved to: {output_path}  ({frame_idx} frames)")
+
+
+# ------------------------------------------------------------------------------
 # CLI
 # ------------------------------------------------------------------------------
 
@@ -943,6 +1093,8 @@ Examples:
                         help="Print only the JSON result (no formatted report).")
     parser.add_argument("--save", type=str, default=None,
                         help="Save full result as JSON to this path.")
+    parser.add_argument("--output_video", type=str, default=None,
+                        help="Render keyword overlays onto the video and save to this path.")
     parser.add_argument("--debug", action="store_true",
                         help="Print extracted domain sections and keyword scores.")
 
@@ -974,6 +1126,9 @@ Examples:
         with open(args.save, "w") as f:
             json.dump(result, f, indent=2)
         logger.info(f"Saved to: {args.save}")
+
+    if args.output_video:
+        render_assessment_video(args.video, result, args.output_video)
 
 
 if __name__ == "__main__":
