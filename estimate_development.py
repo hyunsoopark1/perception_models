@@ -92,8 +92,8 @@ _KEYWORDS: dict = {
         (1.00, ["stands on one foot", "hops on one foot", "balances on one", "excellent balance"]),
         (0.80, ["tiptoe", "walks on tiptoe", "steady balance", "good balance", "balances briefly"]),
         (0.60, ["stands alone", "stands independently", "steady on feet", "walks without falling"]),
-        (0.35, ["sits independently", "sits alone", "sitting", "sitting up", "pulls to stand",
-                "stands briefly", "standing"]),
+        (0.35, ["sits independently", "sits alone", "sitting", "sitting up", "seated", "seated on",
+                "pulls to stand", "stands briefly", "standing"]),
     ],
     "independence": [
         (1.00, ["dresses independently", "fully independent", "toilet", "brushes teeth"]),
@@ -142,9 +142,9 @@ _KEYWORDS: dict = {
         (0.80, ["clings to", "cries for caregiver", "separation anxiety",
                 "distressed without", "won't leave caregiver", "needs caregiver constantly"]),
         (0.65, ["seeks caregiver", "returns to caregiver", "checks on caregiver",
-                "looks to caregiver", "stays near adult", "keeps close to"]),
-        (0.45, ["occasionally checks", "glances at caregiver", "aware of caregiver",
-                "looks back at"]),
+                "looks to caregiver", "looks back at parent", "looks at parent",
+                "looks at adult", "looks back at", "stays near adult", "keeps close to"]),
+        (0.45, ["occasionally checks", "glances at caregiver", "aware of caregiver"]),
         (0.20, ["plays independently", "ignores caregiver", "fully independent from",
                 "comfortable away", "does not seek"]),
     ],
@@ -163,7 +163,8 @@ _KEYWORDS: dict = {
                 "elaborate gesture"]),
         (0.80, ["gestures to communicate", "uses gestures", "points to show",
                 "shows object", "symbolic gesture"]),
-        (0.60, ["points", "pointing", "uses pointing"]),
+        (0.60, ["points at", "points to", "pointing at", "pointing to", "points",
+                "pointing", "uses pointing"]),
         (0.35, ["waves", "waving", "arms up", "reaching gesture", "claps", "shakes head"]),
         (0.00, ["no gesture", "no pointing", "no waving", "does not gesture"]),
     ],
@@ -222,24 +223,104 @@ _DOMAIN_FEATURES = {
 # Keyword scoring helpers
 # ------------------------------------------------------------------------------
 
+# Cosine similarity threshold for semantic matching.
+# Lower = more recall (more matches), higher = more precision.
+# 0.40 works well for all-MiniLM-L6-v2 on short behavioural phrases.
+_SEMANTIC_THRESHOLD = 0.40
 
-def _score_feature(text: str, feature: str) -> Optional[float]:
-    """Return the highest keyword-matched CDC score for a feature.
+# Module-level singletons; populated lazily on first scoring call.
+_embed_model = None          # SentenceTransformer instance, or False if unavailable
+_phrase_emb_cache: dict = {} # phrase -> tensor, filled on first use
 
-    Scans all phrase lists for *feature* and returns the maximum score
-    whose phrases appear (case-insensitive substring match) in *text*.
-    Returns None if no phrase matches (feature not observable in text).
+
+def _get_embed_model():
+    """Lazily load all-MiniLM-L6-v2 for semantic phrase matching.
+
+    Returns the model instance, or None if sentence-transformers is not
+    installed (exact substring matching will be used as fallback).
+    """
+    global _embed_model
+    if _embed_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            logger.info("Loading sentence embedding model (all-MiniLM-L6-v2) ...")
+            _embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+            logger.info("Sentence embedding model ready.")
+        except ImportError:
+            logger.warning(
+                "sentence-transformers not installed; falling back to exact keyword matching. "
+                "Install with: pip install sentence-transformers"
+            )
+            _embed_model = False
+    return None if _embed_model is False else _embed_model
+
+
+def _cached_phrase_emb(phrase: str, model):
+    """Return (and cache) the sentence embedding for *phrase*."""
+    if phrase not in _phrase_emb_cache:
+        _phrase_emb_cache[phrase] = model.encode(phrase, convert_to_tensor=True)
+    return _phrase_emb_cache[phrase]
+
+
+def _score_feature(text: str, feature: str) -> tuple:
+    """Score a feature against the description text.
+
+    Returns (best_cdc_score, matched_phrase_str) or (None, None).
+
+    Matching strategy
+    -----------------
+    * If sentence-transformers is available: cosine similarity between the
+      domain text embedding and each keyword phrase embedding.  The highest
+      CDC score whose best phrase similarity exceeds _SEMANTIC_THRESHOLD is
+      returned.  A simple negation guard skips phrases preceded by "not/no".
+    * Otherwise: case-insensitive exact substring fallback.
     """
     entries = _KEYWORDS.get(feature, [])
-    best: Optional[float] = None
+    if not entries or not text:
+        return None, None
+
+    model = _get_embed_model()
     text_lower = text.lower()
-    for score, phrases in entries:
-        for phrase in phrases:
-            if phrase.lower() in text_lower:
-                if best is None or score > best:
-                    best = score
-                break  # one phrase per score tier is enough
-    return best
+
+    best_score: Optional[float] = None
+    best_phrase: Optional[str] = None
+
+    if model is not None:
+        from sentence_transformers import util
+        text_emb = model.encode(text, convert_to_tensor=True)
+
+        for cdc_score, phrases in entries:
+            for phrase in phrases:
+                negated = bool(re.search(
+                    rf"\b(?:not|no|never|cannot|can't)\b.{{0,25}}{re.escape(phrase)}",
+                    text_lower,
+                ))
+                if negated:
+                    continue
+
+                # 1. Exact substring match (fast path — always reliable)
+                exact = phrase.lower() in text_lower
+
+                # 2. Semantic similarity (catches synonyms / paraphrases)
+                sim = util.cos_sim(text_emb, _cached_phrase_emb(phrase, model)).item()
+                semantic = sim >= _SEMANTIC_THRESHOLD
+
+                if exact or semantic:
+                    if best_score is None or cdc_score > best_score:
+                        best_score = cdc_score
+                        tag = "exact" if exact else f"sim={sim:.2f}"
+                        best_phrase = f'"{phrase}" ({tag})'
+    else:
+        # Exact substring only (sentence-transformers not installed)
+        for cdc_score, phrases in entries:
+            for phrase in phrases:
+                if phrase.lower() in text_lower:
+                    if best_score is None or cdc_score > best_score:
+                        best_score = cdc_score
+                        best_phrase = f'"{phrase}" (exact)'
+                    break
+
+    return best_score, best_phrase
 
 
 def _extract_domain_sections(description: str) -> dict:
@@ -275,26 +356,28 @@ def _score_domain(domain: str, text: str) -> Optional[dict]:
     """Score all features of a domain from its description text.
 
     Returns None if the text indicates the domain was not observed.
-    Returns a dict mapping feature_name -> score (float or None) plus
-    an 'evidence' key with the first 200 characters of the description.
+    Returns a dict with feature scores, matched keyword strings, and evidence.
     """
     if re.search(r"\bnot\s+observed\b", text, re.IGNORECASE):
         return None
 
     feature_names = _DOMAIN_FEATURES[domain]
     result: dict = {}
+    matched_keywords: dict = {}
     any_scored = False
 
     for feat in feature_names:
-        score = _score_feature(text, feat)
+        score, phrase = _score_feature(text, feat)
         result[feat] = score
         if score is not None:
+            matched_keywords[feat] = phrase
             any_scored = True
 
     if not any_scored:
         return None
 
     result["evidence"] = text[:200].strip()
+    result["matched_keywords"] = matched_keywords
     return result
 
 
@@ -509,8 +592,9 @@ def assess(video_path: str, model, tokenizer, config,
                     print(f"  text='{text}' -> marked NOT OBSERVED")
                 else:
                     for feat in _DOMAIN_FEATURES[domain]:
-                        s = _score_feature(text, feat)
-                        print(f"  {feat}: {s}")
+                        s, phrase = _score_feature(text, feat)
+                        match_str = f"  <- {phrase}" if phrase else ""
+                        print(f"  {feat}: {s}{match_str}")
 
             plm_features[domain] = scored
             if scored:
@@ -589,17 +673,25 @@ def print_report(result: dict) -> None:
             continue
 
         feature_names = _DOMAIN_FEATURES[domain]
+        matched_kw = features.get("matched_keywords", {})
         lines = []
+        kw_lines = []
         for fname in feature_names:
             val = features.get(fname)
             if val is not None:
                 lines.append(f"{fname}: {val:.2f} {_bar(val, 10)}")
+                kw_lines.append(f"  matched: {matched_kw.get(fname, '?')}")
             else:
                 lines.append(f"{fname}: --")
+                kw_lines.append("")
 
         print(f"  {domain:<12} {lines[0]:<32} {age_str}")
-        for line in lines[1:]:
+        if kw_lines[0]:
+            print(f"  {'':<12} {kw_lines[0]}")
+        for line, kw_line in zip(lines[1:], kw_lines[1:]):
             print(f"  {'':<12} {line}")
+            if kw_line:
+                print(f"  {'':<12} {kw_line}")
 
         evidence = features.get("evidence")
         if evidence:
