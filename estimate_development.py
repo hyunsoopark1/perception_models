@@ -4,8 +4,11 @@ Developmental stage estimator for children's videos.
 
 Pipeline:
   1. PLM Call 1: Detect whether a child is visible (yes / no).
-  2. PLM Call 2: Free-text description of observed behaviour per domain.
-  3. Python keyword matching maps each domain description to CDC feature scores.
+  2. PLM Calls 2+: For each domain (and each chunk when chunking is enabled),
+     call PLM with a focused prompt listing developmental levels in order.
+     PLM selects ONE level per feature; no free-form generation.
+     Each (domain, chunk) pair is queried num_runs times; majority vote wins.
+  3. Aggregate across chunks: pick the most advanced level per feature.
   4. Inverse-interpolation of CDC milestone curves yields age estimates.
   5. A soft S0-S3 stage distribution is computed and a formatted report is printed.
 
@@ -17,7 +20,8 @@ CDC anchor reference:
 
 Usage:
     python estimate_development.py --video data/202503_a/zdgaa.MOV
-    python estimate_development.py --video clip.mp4 --num_frames 16 --json_only
+    python estimate_development.py --video clip.mp4 --num_frames 16 --num_runs 3
+    python estimate_development.py --video clip.mp4 --chunk_duration 10 --num_runs 3
 """
 
 import argparse
@@ -45,198 +49,157 @@ _PROMPT_CHILD = (
     "and active in this video? Answer only: yes or no."
 )
 
-# Keyword choices embedded in the prompt so PLM selects (recognises) rather
-# than generates from scratch.  Each phrase is drawn directly from _KEYWORDS
-# so the PLM's output will exact-match our scoring vocabulary.
-#
-# Format: "Domain: choice | choice | ..."
-# PLM copies the applicable choices, comma-separated.
-# Python scores based on which keywords appear in each domain section.
-#
-# Caregiver choices are listed inside Interaction so PLM sees them in context.
-
-_PROMPT_DESCRIBE = """\
-Watch this child carefully. Each domain has its OWN vocabulary list. \
-Choose the ONE phrase from THAT domain's list that best matches what you \
-observe. Do NOT copy a phrase into a domain whose list does not contain it. \
-Write "none" if nothing in that domain's list is visible.
-
-Motor (body movement and hand use):
-  crawling | first steps | walking | toddling | walks steadily | running | \
-jumping | grasping | picks up objects | uses spoon | stacking blocks | \
-sitting | seated | stands alone | balances
-
-Autonomy (self-care):
-  reaches for toy | explores independently | self-feeds | drinks from cup | \
-removes shoes | washes hands | dresses self
-
-Attention (focus):
-  briefly looks | looks at toy | plays with toy | sustained attention | \
-extended play | prolonged focus
-
-Interaction (social behaviour):
-  responds to name | makes eye contact | waves at adult | parallel play | \
-shows toy to adult | cooperative play | takes turns | returns to caregiver | \
-seeks caregiver | plays independently
-
-Language (communication):
-  babbling | single word | several words | two-word phrases | sentences | \
-points at objects | waves | uses gestures
-
-Reply in exactly this format — one selected phrase (or "none") per line:
-Motor: <phrase>
-Autonomy: <phrase>
-Attention: <phrase>
-Interaction: <phrase>
-Language: <phrase>\
-"""
-
+# Per-domain prompts are built at runtime from _FEATURE_LEVELS (see below).
 
 # ------------------------------------------------------------------------------
-# Keyword tables  (feature -> [(score, [phrase, ...]), ...])
+# Developmental level vocabulary
 #
-# Score anchors (CDC milestones): 0.35=12mo, 0.60=18mo, 0.80=24mo, 1.00=36mo.
-# _score_feature() returns the *highest* score whose phrases appear in the text.
-# Phrases use simple substring matching (case-insensitive).
-# caregiver_dependency is a DECREASING curve (more dependent = higher score).
+# Each feature has an ORDERED list of (cdc_score, phrase) pairs.
+# Scores are CDC-calibrated: 0 = birth-level, 1 = 36-month level.
+# Phrases are presented to PLM in developmental order (youngest → oldest).
+# PLM selects one phrase; we look it up directly — no matching needed.
+#
+# caregiver_dependency is a DECREASING curve (more dependent = higher score
+# = younger child).  Its list is still sorted youngest→oldest for the prompt.
 # ------------------------------------------------------------------------------
 
-_KEYWORDS: dict = {
-    # Phrases marked  # ← prompt  appear verbatim in _PROMPT_DESCRIBE so PLM
-    # can copy them back directly, guaranteeing exact matches.
+_FEATURE_LEVELS: dict = {
     "locomotion": [
-        (1.00, ["hopping", "galloping", "jumping", "jumps", "skipping",   # ← prompt: jumping
-                "runs confidently"]),
-        (0.80, ["running", "runs", "climbs stairs", "walks well",          # ← prompt: running
-                "walks steadily", "walks independently", "walks without"]),  # ← prompt: walks steadily
-        (0.60, ["walking", "walks", "toddling", "toddles", "walks around",  # ← prompt: walking, toddling
-                "takes steps"]),
-        (0.35, ["cruising", "pulling to stand", "pulls to stand",           # ← prompt: first steps
-                "first steps", "stands with support", "unsteady steps"]),
-        (0.10, ["crawling", "crawls", "creeping", "scooting"]),             # ← prompt: crawling
-        (0.00, ["lying", "stationary", "does not walk", "seated only"]),
+        (0.00, "lying"),
+        (0.10, "crawling"),
+        (0.25, "cruising"),
+        (0.35, "first steps"),
+        (0.60, "toddling"),
+        (0.70, "walking"),
+        (0.80, "walks steadily"),
+        (0.85, "running"),
+        (1.00, "jumping"),
     ],
     "coordination": [
-        (1.00, ["scissors", "draws circle", "catches ball", "strings beads", "buttons"]),
-        (0.80, ["kicks ball", "turns pages", "builds tower",
-                "stacks blocks", "uses fork"]),                             # ← prompt: stacking blocks
-        (0.60, ["throws", "scribbles", "uses spoon", "picks up small",
-                "stacks", "pours"]),                                        # ← prompt: uses spoon
-        (0.35, ["grasps", "pincer", "reaches for", "picks up", "holds toy",
-                "transfers", "grasping", "picks up objects"]),              # ← prompt: grasping, picks up objects
+        (0.15, "grasping"),
+        (0.35, "picks up objects"),
+        (0.60, "uses spoon"),
+        (0.80, "stacking blocks"),
+        (0.95, "draws circle"),
     ],
     "stability": [
-        (1.00, ["stands on one foot", "hops on one foot", "balances on one",
-                "excellent balance", "balances"]),                          # ← prompt: balances
-        (0.80, ["tiptoe", "walks on tiptoe", "steady balance",
-                "good balance", "balances briefly"]),
-        (0.60, ["stands alone", "stands independently",                    # ← prompt: stands alone
-                "steady on feet", "walks without falling"]),
-        (0.35, ["sits independently", "sits alone", "sitting", "sitting up",
-                "seated", "seated on",                                      # ← prompt: sitting, seated
-                "pulls to stand", "stands briefly", "standing"]),
+        (0.15, "cannot sit"),
+        (0.35, "sitting"),
+        (0.60, "stands alone"),
+        (0.70, "walks without falling"),
+        (0.80, "tiptoe"),
+        (1.00, "balances on one foot"),
     ],
     "independence": [
-        (1.00, ["dresses independently", "fully independent",
-                "toilet", "brushes teeth", "dresses self"]),                # ← prompt: dresses self
-        (0.80, ["removes shoes", "washes hands",                           # ← prompt: removes shoes, washes hands
-                "partially dresses", "puts on clothing"]),
-        (0.60, ["feeds self", "drinks from cup",                           # ← prompt: self-feeds, drinks from cup
-                "uses spoon alone", "eats independently",
-                "self-feeds", "self feeds"]),
-        (0.35, ["reaches for toy", "picks up food",                        # ← prompt: reaches for toy
-                "explores nearby", "grabs object",
-                "explores independently"]),                                 # ← prompt: explores independently
+        (0.10, "no self-care"),
+        (0.30, "reaches for toy"),
+        (0.55, "self-feeds"),
+        (0.55, "drinks from cup"),
+        (0.75, "removes shoes"),
+        (0.75, "washes hands"),
+        (0.85, "dresses self"),
     ],
     "initiative": [
-        (1.00, ["complex pretend", "elaborate play", "self-directed",
-                "plans activity", "sequential", "organizes play"]),
-        (0.80, ["pretend play", "makes choices", "problem solv",           # ← prompt: pretend play, makes choices
-                "selects toy", "leads play", "starts game"]),
-        (0.60, ["initiates play", "chooses toy", "opens container",
-                "starts activity", "initiates activity"]),
-        (0.35, ["initiates reaching", "explores independently",
-                "moves toward", "approaches"]),
+        (0.15, "no initiative"),
+        (0.35, "approaches toy"),
+        (0.60, "initiates play"),
+        (0.80, "pretend play"),
+        (0.90, "complex pretend"),
     ],
     "duration": [
-        (1.00, ["prolonged focus", "sustained engagement",                 # ← prompt: prolonged focus
-                "extended attention", "maintains attention", "long period"]),
-        (0.80, ["extended play", "focused activity",                       # ← prompt: extended play
-                "stays engaged", "continues playing", "concentrates"]),
-        (0.60, ["sustained attention", "plays with toy",                   # ← prompt: sustained attention, plays with toy
-                "attends for several", "focused for", "watches attentively"]),
-        (0.35, ["briefly attends", "momentary attention",
-                "looks at toy briefly", "short attention",
-                "glances", "looks at", "gazes", "watches", "observes",
-                "briefly looks", "looks at toy"]),                          # ← prompt: briefly looks, looks at toy
+        (0.20, "briefly looks"),
+        (0.40, "looks at toy"),
+        (0.65, "plays with toy"),
+        (0.80, "extended play"),
+        (0.90, "prolonged focus"),
     ],
     "goal_directed": [
-        (1.00, ["plans ahead", "sequential actions", "multi-step",
-                "complex problem", "organized play"]),
-        (0.80, ["completes task", "works to finish",
-                "purposefully arranges", "solves problem"]),
-        (0.60, ["purposeful play", "works toward goal",
-                "tries to achieve", "persists"]),
-        (0.35, ["reaches for specific", "follows object",
-                "tracks toy", "pursues toy"]),
+        (0.25, "glances at objects"),
+        (0.45, "pursues toy"),
+        (0.70, "purposeful play"),
+        (0.80, "completes task"),
+        (0.95, "multi-step play"),
     ],
     "social_engagement": [
-        (1.00, ["cooperative play", "takes turns",                         # ← prompt: cooperative play, takes turns
-                "plays with other children", "group play", "shares toys"]),
-        (0.80, ["plays alongside", "shows affection",
-                "parallel play with interaction",
-                "brings toy to", "shows toy to",
-                "shows toy to adult"]),                                     # ← prompt: shows toy to adult
-        (0.60, ["parallel play", "makes eye contact",                      # ← prompt: parallel play, makes eye contact
-                "shows objects", "imitates",
-                "waves at", "responds to",
-                "waves at adult"]),                                         # ← prompt: waves at adult
-        (0.35, ["responds to name", "smiles at",                           # ← prompt: responds to name
-                "turns to voice", "reacts to adult"]),
+        (0.20, "no social response"),
+        (0.35, "responds to name"),
+        (0.60, "makes eye contact"),
+        (0.65, "waves at adult"),
+        (0.75, "parallel play"),
+        (0.80, "shows toy to adult"),
+        (0.90, "cooperative play"),
     ],
-    # Decreasing curve: higher score = more caregiver-dependent = younger child
+    # Ordered youngest→oldest: most dependent (high score) → least dependent (low score)
     "caregiver_dependency": [
-        (0.80, ["clings to", "cries for caregiver", "separation anxiety",
-                "distressed without", "won't leave caregiver",
-                "needs caregiver constantly"]),
-        (0.65, ["seeks caregiver", "returns to caregiver",                 # ← prompt: seeks caregiver, returns to caregiver
-                "checks on caregiver", "looks to caregiver",
-                "looks back at parent", "looks at parent",
-                "looks at adult", "looks back at",
-                "stays near adult", "keeps close to"]),
-        (0.45, ["occasionally checks", "glances at caregiver",
-                "aware of caregiver"]),
-        (0.20, ["plays independently", "ignores caregiver",                # ← prompt: plays independently
-                "fully independent from", "comfortable away",
-                "does not seek"]),
+        (0.80, "clings to caregiver"),
+        (0.65, "seeks caregiver"),
+        (0.45, "occasionally checks"),
+        (0.20, "plays independently"),
     ],
     "verbal": [
-        (1.00, ["sentences", "full sentence", "three-word",                # ← prompt: sentences
-                "conversation", "storytelling", "talks in"]),
-        (0.80, ["two-word", "2-word", "combining words",                   # ← prompt: two-word phrases
-                "word combinations", "short phrases",
-                "two-word phrases"]),
-        (0.60, ["several words", "multiple words", "vocabulary",           # ← prompt: several words
-                "names objects", "says words", "many words"]),
-        (0.35, ["babbling", "babbles", "single word",                      # ← prompt: babbling, single word
-                "mama", "dada", "first words",
-                "one word", "jargon", "vocalizes"]),
-        (0.00, ["no words", "no speech", "silent",
-                "no verbal", "does not speak"]),
+        (0.00, "no speech"),
+        (0.20, "babbling"),
+        (0.40, "single word"),
+        (0.60, "several words"),
+        (0.70, "two-word phrases"),
+        (0.95, "sentences"),
     ],
     "gesture": [
-        (1.00, ["rich gestures", "complex gestures", "gestures with speech", "mime",
-                "elaborate gesture"]),
-        (0.80, ["gestures to communicate", "uses gestures",                # ← prompt: uses gestures
-                "points to show", "shows object", "symbolic gesture"]),
-        (0.60, ["points at objects", "points at", "points to",             # ← prompt: points at objects
-                "pointing at", "pointing to", "points", "pointing",
-                "uses pointing"]),
-        (0.35, ["waves", "waving", "arms up",                              # ← prompt: waves
-                "reaching gesture", "claps", "shakes head"]),
-        (0.00, ["no gesture", "no pointing", "no waving", "does not gesture"]),
+        (0.10, "no gestures"),
+        (0.35, "waves"),
+        (0.60, "points at objects"),
+        (0.80, "uses gestures"),
+        (0.90, "gestures with speech"),
     ],
 }
+
+# Features whose CDC score DECREASES with age.
+# When aggregating across chunks we take MIN (most independent = most advanced).
+_DECREASING_FEATURES = {"caregiver_dependency"}
+
+_DOMAIN_DESCRIPTIONS = {
+    "motor":       "movement and physical skill",
+    "autonomy":    "self-care and independence",
+    "attention":   "focus and play engagement",
+    "interaction": "social behaviour",
+    "language":    "communication",
+}
+
+
+def _feat_label(feat: str) -> str:
+    """Convert a feature key to its capitalised display label (used in prompts and parsing)."""
+    return feat.replace("_", " ").capitalize()
+
+
+def _build_domain_prompt(domain: str) -> str:
+    """Build a focused PLM prompt for one domain using ordered level vocabulary.
+
+    Options are listed youngest (◄) to most advanced (►).
+    PLM must output one option per feature in the exact answer block format.
+    """
+    features = _DOMAIN_FEATURES[domain]
+    desc = _DOMAIN_DESCRIPTIONS[domain]
+
+    level_lines = []
+    for feat in features:
+        levels = _FEATURE_LEVELS[feat]
+        if feat in _DECREASING_FEATURES:
+            ordered = levels        # already youngest→oldest
+        else:
+            ordered = sorted(levels, key=lambda x: x[0])
+        option_str = " < ".join(phrase for _, phrase in ordered)
+        level_lines.append(f"  {_feat_label(feat)}: {option_str}")
+
+    answer_block = "\n".join(f"{_feat_label(feat)}: <option>" for feat in features)
+
+    return (
+        f"Watch this child. For each {desc} skill, select the ONE option that "
+        f"best matches what you observe. Options run from youngest (left, ◄) to "
+        f"most developed (right, ►). Pick the rightmost option the child "
+        f"clearly demonstrates.\n\n"
+        + "\n".join(level_lines)
+        + f"\n\nReply in this exact format:\n{answer_block}"
+    )
 
 
 # ------------------------------------------------------------------------------
@@ -288,233 +251,135 @@ _DOMAIN_FEATURES = {
 
 
 # ------------------------------------------------------------------------------
-# Keyword scoring helpers
+# Output parser and aggregation helpers
 # ------------------------------------------------------------------------------
 
-# Cosine similarity threshold for semantic matching.
-# Lower = more recall (more matches), higher = more precision.
-# 0.40 works well for all-MiniLM-L6-v2 on short behavioural phrases.
-_SEMANTIC_THRESHOLD = 0.40
 
-# Module-level singletons; populated lazily on first scoring call.
-_embed_model = None          # SentenceTransformer instance, or False if unavailable
-_phrase_emb_cache: dict = {} # phrase -> tensor, filled on first use
+def _parse_domain_output(domain: str, text: str) -> dict:
+    """Extract selected levels from a single PLM domain response.
 
+    Scans for lines of the form  "Feature label: selected phrase"
+    and performs an exact lookup against _FEATURE_LEVELS.
+    No fuzzy or semantic matching — the PLM is constrained to the vocabulary.
 
-def _get_embed_model():
-    """Lazily load all-MiniLM-L6-v2 for semantic phrase matching.
-
-    Returns the model instance, or None if sentence-transformers is not
-    installed (exact substring matching will be used as fallback).
+    Returns {feature: (score, phrase)}.  Missing features are absent.
     """
-    global _embed_model
-    if _embed_model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            logger.info("Loading sentence embedding model (all-MiniLM-L6-v2) ...")
-            _embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-            logger.info("Sentence embedding model ready.")
-        except ImportError:
-            logger.warning(
-                "sentence-transformers not installed; falling back to exact keyword matching. "
-                "Install with: pip install sentence-transformers"
-            )
-            _embed_model = False
-    return None if _embed_model is False else _embed_model
-
-
-def _cached_phrase_emb(phrase: str, model):
-    """Return (and cache) the sentence embedding for *phrase*."""
-    if phrase not in _phrase_emb_cache:
-        _phrase_emb_cache[phrase] = model.encode(phrase, convert_to_tensor=True)
-    return _phrase_emb_cache[phrase]
-
-
-def _score_feature(text: str, feature: str) -> tuple:
-    """Score a feature against the description text.
-
-    Returns (best_cdc_score, matched_phrase_str) or (None, None).
-
-    Matching strategy
-    -----------------
-    * If sentence-transformers is available: cosine similarity between the
-      domain text embedding and each keyword phrase embedding.  The highest
-      CDC score whose best phrase similarity exceeds _SEMANTIC_THRESHOLD is
-      returned.  A simple negation guard skips phrases preceded by "not/no".
-    * Otherwise: case-insensitive exact substring fallback.
-    """
-    entries = _KEYWORDS.get(feature, [])
-    if not entries or not text:
-        return None, None
-
-    model = _get_embed_model()
-    text_lower = text.lower()
-
-    best_score: Optional[float] = None
-    best_phrase: Optional[str] = None
-
-    # --- Phase 1: exact substring matching (always takes priority) -------------
-    for cdc_score, phrases in entries:
-        for phrase in phrases:
-            if phrase.lower() in text_lower:
-                if best_score is None or cdc_score > best_score:
-                    best_score = cdc_score
-                    best_phrase = f'"{phrase}" (exact)'
-                break  # one phrase per tier is enough
-
-    # --- Phase 2: semantic fallback (only when nothing exact-matched) ---------
-    # Require at least 4 words before using semantic similarity; single words
-    # (e.g. PLM lazily copying "walking" for every domain) have very generic
-    # embeddings that produce cross-domain false positives.
-    if best_score is None and model is not None and len(text.split()) >= 4:
-        from sentence_transformers import util
-        text_emb = model.encode(text, convert_to_tensor=True)
-
-        for cdc_score, phrases in entries:
-            for phrase in phrases:
-                negated = bool(re.search(
-                    rf"\b(?:not|no|never|cannot|can't)\b.{{0,25}}{re.escape(phrase)}",
-                    text_lower,
-                ))
-                if negated:
-                    continue
-                sim = util.cos_sim(text_emb, _cached_phrase_emb(phrase, model)).item()
-                if sim >= _SEMANTIC_THRESHOLD:
-                    if best_score is None or cdc_score > best_score:
-                        best_score = cdc_score
-                        best_phrase = f'"{phrase}" (sim={sim:.2f})'
-
-    return best_score, best_phrase
-
-
-def _extract_domain_sections(description: str) -> dict:
-    """Split PLM free-text description into per-domain text sections.
-
-    Looks for labelled headers (Motor:, Autonomy:, ...) that the prompt
-    requests and splits the output into per-domain strings.
-    Falls back to the full description for all domains if no headers found.
-    """
-    # Match "Motor:", "Motor (anything):", "Motor - anything:", etc.
-    header_pattern = re.compile(
-        r"(?:^|\n)\s*(motor|autonomy|attention|interaction|language)\b[^:\n]*:",
-        re.IGNORECASE,
-    )
-    parts = header_pattern.split(description)
-    # parts = [pre_text, label1, body1, label2, body2, ...]
-
-    if len(parts) < 3:
-        # No headers found; use the full text for every domain
-        full = description.strip()
-        return {d: full for d in DOMAINS}
-
-    sections = {}
-    i = 1
-    while i + 1 < len(parts):
-        label = parts[i].strip().lower()
-        body = parts[i + 1].strip()
-        sections[label] = body
-        i += 2
-    return sections
-
-
-def _score_domain(domain: str, text: str) -> Optional[dict]:
-    """Score all features of a domain from its description text.
-
-    Returns None if the text indicates the domain was not observed.
-    Returns a dict with feature scores, matched keyword strings, and evidence.
-    """
-    if re.search(r"\bnot\s+observed\b", text, re.IGNORECASE):
-        return None
-
-    feature_names = _DOMAIN_FEATURES[domain]
+    features = _DOMAIN_FEATURES[domain]
     result: dict = {}
-    matched_keywords: dict = {}
-    any_scored = False
 
-    for feat in feature_names:
-        score, phrase = _score_feature(text, feat)
-        result[feat] = score
-        if score is not None:
-            matched_keywords[feat] = phrase
-            any_scored = True
+    for feat in features:
+        label = _feat_label(feat)
+        pattern = re.compile(
+            rf"^\s*{re.escape(label)}\s*:\s*(.+)$",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        m = pattern.search(text)
+        if not m:
+            continue
+        answer = m.group(1).strip().rstrip(".").lower()
+        for score, phrase in _FEATURE_LEVELS[feat]:
+            if answer == phrase.lower():
+                result[feat] = (score, phrase)
+                break
 
-    if not any_scored:
-        return None
-
-    result["evidence"] = text[:200].strip()
-    result["matched_keywords"] = matched_keywords
     return result
 
 
-def _score_chunk(sections: dict) -> dict:
-    """Score all domains for a single chunk's extracted domain sections.
-
-    Returns a dict:  {domain: {"scored": <_score_domain result or None>, "age": float|None}}
-    """
-    chunk_scores: dict = {}
-    for domain in DOMAINS:
-        text = sections.get(domain, "")
-        scored = _score_domain(domain, text) if text else None
-        if scored:
-            feats = {k: v for k, v in scored.items()
-                     if k not in ("evidence", "matched_keywords")}
-            age = domain_age(domain, feats)
-        else:
-            age = None
-        chunk_scores[domain] = {"scored": scored, "age": age}
-    return chunk_scores
-
-
-def _aggregate_chunk_scores(per_chunk_scores: list) -> tuple:
-    """Aggregate per-chunk domain scores by taking the *max* feature score.
+def _majority_vote_features(runs: list) -> dict:
+    """Majority vote across multiple PLM runs per feature.
 
     Args:
-        per_chunk_scores: list of dicts, each returned by _score_chunk().
+        runs: list of {feat: (score, phrase)} dicts, one per PLM run.
 
     Returns:
-        (plm_features, domain_ages) — same shape as assess() currently builds
-        from the aggregated text approach.
+        {feat: (score, phrase)} — most common phrase wins.
+        On a tie the phrase with the highest CDC score is preferred.
     """
-    agg_features: dict = {}
-    for domain in DOMAINS:
-        best_scores: dict = {}   # feat -> best score seen across chunks
-        best_phrases: dict = {}  # feat -> matched phrase string for best score
-        best_evidence: Optional[str] = None
+    from collections import Counter
 
-        for cs in per_chunk_scores:
-            data = cs.get(domain, {})
-            scored = data.get("scored")
-            if scored is None:
-                continue
-            if best_evidence is None:
-                best_evidence = scored.get("evidence")
-            for feat in _DOMAIN_FEATURES[domain]:
-                s = scored.get(feat)
-                if s is None:
-                    continue
-                if feat not in best_scores or s > best_scores[feat]:
-                    best_scores[feat] = s
-                    best_phrases[feat] = scored.get("matched_keywords", {}).get(feat)
+    all_feats: set = {feat for r in runs for feat in r}
+    result: dict = {}
+    for feat in all_feats:
+        candidates = [(s, p) for r in runs for f, (s, p) in r.items() if f == feat]
+        if not candidates:
+            continue
+        phrase_counter = Counter(p for _, p in candidates)
+        top_count = phrase_counter.most_common(1)[0][1]
+        tied = {p for p, cnt in phrase_counter.items() if cnt == top_count}
+        best = max(((s, p) for s, p in candidates if p in tied), key=lambda x: x[0])
+        result[feat] = best
+    return result
 
-        if best_scores:
-            result: dict = dict(best_scores)
-            result["evidence"] = best_evidence
-            result["matched_keywords"] = {k: v for k, v in best_phrases.items() if v}
-            agg_features[domain] = result
-        else:
-            agg_features[domain] = None
 
-    agg_domain_ages: dict = {}
-    for domain in DOMAINS:
-        features = agg_features.get(domain)
-        if features:
-            feats = {k: v for k, v in features.items()
-                     if k not in ("evidence", "matched_keywords")}
-            agg_domain_ages[domain] = domain_age(domain, feats)
-        else:
-            agg_domain_ages[domain] = None
+def _assess_domain(seg: str, domain: str, num_runs: int, model, tokenizer, config,
+                   num_frames: int, temperature: float, max_gen_len: int,
+                   debug: bool = False) -> dict:
+    """Run PLM num_runs times for one domain on one video segment.
 
-    return agg_features, agg_domain_ages
+    Returns:
+        {
+            "features":    {feat: score},
+            "phrases":     {feat: phrase},
+            "age":         float | None,
+            "raw_outputs": [str, ...],
+        }
+    """
+    prompt = _build_domain_prompt(domain)
+    runs: list = []
+    raw_outputs: list = []
+
+    for run_idx in range(num_runs):
+        txt = _run_plm_text(
+            seg, prompt, model, tokenizer, config,
+            num_frames=num_frames, temperature=temperature,
+            max_gen_len=max_gen_len,
+        )
+        raw_outputs.append(txt)
+        parsed = _parse_domain_output(domain, txt)
+        if parsed:
+            runs.append(parsed)
+        if debug:
+            logger.info(f"    [{domain}] run {run_idx + 1}: {txt!r}")
+            logger.info(f"    parsed: {parsed}")
+
+    if not runs:
+        return {"features": {}, "phrases": {}, "age": None, "raw_outputs": raw_outputs}
+
+    voted = _majority_vote_features(runs)
+    features = {feat: score for feat, (score, _) in voted.items()}
+    phrases  = {feat: phrase for feat, (_, phrase) in voted.items()}
+    return {
+        "features":    features,
+        "phrases":     phrases,
+        "age":         domain_age(domain, features),
+        "raw_outputs": raw_outputs,
+    }
+
+
+def _aggregate_domain_scores(per_chunk: list, domain: str) -> dict:
+    """Aggregate per-chunk domain results: most developmentally advanced per feature.
+
+    For normal (increasing) features: max score across chunks.
+    For caregiver_dependency (decreasing): min score (= most independent = oldest).
+
+    Returns same shape as _assess_domain() but without raw_outputs.
+    """
+    best_features: dict = {}
+    best_phrases:  dict = {}
+
+    for chunk_data in per_chunk:
+        for feat, score in chunk_data.get("features", {}).items():
+            is_better = (
+                feat not in best_features
+                or (feat in _DECREASING_FEATURES and score < best_features[feat])
+                or (feat not in _DECREASING_FEATURES and score > best_features[feat])
+            )
+            if is_better:
+                best_features[feat] = score
+                best_phrases[feat]  = chunk_data["phrases"].get(feat, "")
+
+    age = domain_age(domain, best_features) if best_features else None
+    return {"features": best_features, "phrases": best_phrases, "age": age}
 
 
 # ------------------------------------------------------------------------------
@@ -708,20 +573,19 @@ def _split_into_chunks(video_path: str, chunk_duration: float) -> list:
 
 def assess(video_path: str, model, tokenizer, config,
            num_frames: int = 8, temperature: float = 0.0,
-           max_gen_len: int = 512, chunk_duration: Optional[float] = None,
-           debug: bool = False) -> dict:
-    """Run the full two-call developmental assessment pipeline.
+           max_gen_len: int = 128, chunk_duration: Optional[float] = None,
+           num_runs: int = 1, debug: bool = False) -> dict:
+    """Run the full developmental assessment pipeline.
 
     Call 1: child detection on the full video (yes/no).
-    Call 2: keyword-choice description, once per chunk.
-             All chunk texts are aggregated per domain, then scored once.
+    Calls 2+: for each domain (and each chunk), ask PLM to select ONE
+              developmental level from an ordered vocabulary. Repeated
+              num_runs times per (domain, chunk) pair; majority vote wins.
+    Aggregate across chunks: most advanced level per feature.
 
     Args:
-        chunk_duration: If set, split the video into chunks of this many
-            seconds and run PLM on each.  All descriptions are joined per
-            domain before scoring, so behaviours observed in any chunk
-            contribute to the final score.  If None, the full video is
-            treated as one chunk (original behaviour).
+        num_runs:       PLM calls per (domain, chunk). 1=fast, 3+=reliable.
+        chunk_duration: Split video into N-second chunks; None=full video.
     """
     import os
     import tempfile
@@ -771,82 +635,84 @@ def assess(video_path: str, model, tokenizer, config,
         else:
             segments = [plm_path]
 
-        # ---- PLM Call 2 on each segment, score per chunk --------------------
-        raw_texts = []
-        chunk_details = []   # stored in result for visualization
+        # ---- Assess each segment per domain ---------------------------------
+        n_chunks = len(segments)
+        total_plm = n_chunks * len(DOMAINS) * num_runs
+        logger.info(f"Assessment: {n_chunks} chunk(s) × {len(DOMAINS)} domains "
+                    f"× {num_runs} run(s) = {total_plm} PLM calls")
+
+        chunk_details: list = []
         for i, seg in enumerate(segments):
             t_start = i * chunk_duration if chunk_duration else 0
             t_end   = (i + 1) * chunk_duration if chunk_duration else None
-            logger.info(f"Describing segment {i+1}/{len(segments)}: {seg}")
-            txt = _run_plm_text(
-                seg, _PROMPT_DESCRIBE, model, tokenizer, config,
-                num_frames=num_frames, temperature=temperature,
-                max_gen_len=max_gen_len,
+            logger.info(f"Segment {i + 1}/{n_chunks}: {seg}")
+
+            domain_scores: dict = {}
+            for domain in DOMAINS:
+                ds = _assess_domain(
+                    seg, domain, num_runs, model, tokenizer, config,
+                    num_frames=num_frames, temperature=temperature,
+                    max_gen_len=max_gen_len, debug=debug,
+                )
+                domain_scores[domain] = ds
+                if debug:
+                    age_d = ds["age"]
+                    print(f"  [{domain}] age={'%.1f' % age_d if age_d is not None else 'n/a'}"
+                          f"  phrases={ds['phrases']}")
+
+            # Compact text for overlay bottom panel
+            raw_text = "\n".join(
+                (f"{d}: " + ", ".join(f"{f}={p}"
+                                      for f, p in domain_scores[d]["phrases"].items()))
+                if domain_scores[d]["phrases"] else f"{d}: none"
+                for d in DOMAINS
             )
-            logger.info(f"  -> {txt!r}")
-            raw_texts.append(txt)
-            sections = _extract_domain_sections(txt)
-            chunk_scores = _score_chunk(sections)
-            chunk_domain_ages = {d: chunk_scores[d]["age"] for d in DOMAINS}
-
-            if debug:
-                print(f"\n--- Chunk {i+1}/{len(segments)} [{t_start}s – {t_end}s] ---")
-                for d in DOMAINS:
-                    text_d = sections.get(d, "")
-                    age_d = chunk_domain_ages.get(d)
-                    print(f"  [{d}] {text_d!r}  -> {age_d:.1f}mo" if age_d is not None
-                          else f"  [{d}] {text_d!r}  -> n/a")
-                    scored_d = chunk_scores[d]["scored"]
-                    if scored_d and debug:
-                        for feat in _DOMAIN_FEATURES[d]:
-                            s = scored_d.get(feat)
-                            kw = scored_d.get("matched_keywords", {}).get(feat, "")
-                            match_str = f"  <- {kw}" if kw else ""
-                            print(f"    {feat}: {s}{match_str}")
-
             chunk_details.append({
-                "index":        i + 1,
-                "t_start":      t_start,
-                "t_end":        t_end,
-                "raw_text":     txt,
-                "sections":     sections,
-                "scores":       chunk_scores,       # per-chunk feature scores
-                "domain_ages":  chunk_domain_ages,  # per-chunk domain ages
+                "index":         i + 1,
+                "t_start":       t_start,
+                "t_end":         t_end,
+                "domain_scores": domain_scores,
+                "domain_ages":   {d: domain_scores[d]["age"] for d in DOMAINS},
+                "raw_text":      raw_text,
             })
 
-        combined_description = "\n".join(raw_texts)
+        # ---- Aggregate: most advanced level per feature across chunks --------
+        plm_features: dict = {}
+        domain_ages:  dict = {}
 
-        # ---- Aggregate: max feature score across all chunks -----------------
-        per_chunk_scores = [c["scores"] for c in chunk_details]
-        plm_features, domain_ages = _aggregate_chunk_scores(per_chunk_scores)
+        for domain in DOMAINS:
+            per_chunk = [c["domain_scores"][domain] for c in chunk_details]
+            agg = _aggregate_domain_scores(per_chunk, domain)
 
-        if debug:
-            print(f"\n--- Aggregated (max per feature across {len(segments)} chunk(s)) ---")
-            for domain in DOMAINS:
-                features = plm_features.get(domain)
-                age = domain_ages.get(domain)
-                print(f"  [{domain}] age={age:.1f}mo" if age is not None
-                      else f"  [{domain}] n/a")
-                if features:
-                    for feat in _DOMAIN_FEATURES[domain]:
-                        s = features.get(feat)
-                        kw = features.get("matched_keywords", {}).get(feat, "")
-                        match_str = f"  <- {kw}" if kw else ""
-                        print(f"    {feat}: {s}{match_str}")
+            if agg["features"]:
+                entry = dict(agg["features"])
+                entry["evidence"] = ", ".join(
+                    f"{f}={p}" for f, p in agg["phrases"].items()
+                )
+                entry["matched_keywords"] = dict(agg["phrases"])
+                plm_features[domain] = entry
+            else:
+                plm_features[domain] = None
+            domain_ages[domain] = agg["age"]
+
+            if debug:
+                print(f"\n--- Aggregated [{domain}] age={agg['age']} ---")
+                for feat, score in agg["features"].items():
+                    print(f"  {feat}: {score:.2f}  ({agg['phrases'].get(feat, '')})")
 
         observed_ages = [a for a in domain_ages.values() if a is not None]
         overall_age = sum(observed_ages) / len(observed_ages) if observed_ages else None
         stage_dist = stage_distribution(overall_age) if overall_age is not None else None
 
         return {
-            "video_path": video_path,
-            "child_present": True,
-            "plm_features": plm_features,
-            "domain_ages": domain_ages,
+            "video_path":         video_path,
+            "child_present":      True,
+            "plm_features":       plm_features,
+            "domain_ages":        domain_ages,
             "overall_age_months": round(overall_age, 1) if overall_age is not None else None,
             "stage_distribution": stage_dist,
-            "raw_plm_output": combined_description,
-            "chunk_details": chunk_details,
+            "raw_plm_output":     "\n\n".join(c["raw_text"] for c in chunk_details),
+            "chunk_details":      chunk_details,
         }
 
     finally:
@@ -893,31 +759,24 @@ def _print_chunk_timeline(chunk_details: list) -> None:
     print(f"  {thin}")
 
     for c in chunk_details:
-        idx      = c["index"]
-        t_start  = c["t_start"]
-        t_end    = c["t_end"]
-        sections = c["sections"]
+        t_s = int(c["t_start"])
+        t_e = int(c["t_end"]) if c["t_end"] is not None else "?"
+        time_str = f"{t_s:3d}s – {t_e:3d}s" if c["t_end"] is not None else "full video"
+        print(f"  Chunk {c['index']:>2}  [{time_str}]")
 
-        if t_end is not None:
-            time_str = f"{int(t_start):3d}s – {int(t_end):3d}s"
-        else:
-            time_str = "full video"
-
-        header = f"  Chunk {idx:>2}  [{time_str}]"
-        print(header)
-
-        chunk_ages = c.get("domain_ages", {})
+        domain_scores = c.get("domain_scores", {})
+        domain_ages   = c.get("domain_ages", {})
         for domain in DOMAINS:
-            text = sections.get(domain, "").strip()
-            label = f"  {'':<11}{domain_abbr[domain]:<6}: "
-            age_d = chunk_ages.get(domain)
+            label   = f"  {'':<11}{domain_abbr[domain]:<6}: "
+            age_d   = domain_ages.get(domain)
             age_tag = f"  [{age_d:.0f}mo]" if age_d is not None else ""
-            if not text or re.search(r"\bnot\s+observed\b", text, re.IGNORECASE):
-                print(f"{label}—{age_tag}")
+            phrases = domain_scores.get(domain, {}).get("phrases", {})
+            if phrases:
+                summary = ", ".join(f"{f}={p}" for f, p in phrases.items())
+                summary = summary if len(summary) <= 44 else summary[:41] + "..."
+                print(f"{label}{summary}{age_tag}")
             else:
-                max_txt = 40
-                display = text if len(text) <= max_txt else text[:max_txt - 3] + "..."
-                print(f"{label}{display}{age_tag}")
+                print(f"{label}—{age_tag}")
 
         print()
 
@@ -1133,36 +992,31 @@ def render_assessment_video(video_path: str, result: dict, output_path: str) -> 
 
         # --- per-domain: label line + feature breakdown line ---
         for row, domain in enumerate(DOMAINS):
-            feat_data  = result.get("plm_features", {}).get(domain) or {}
-            kw_map     = feat_data.get("matched_keywords", {})
-            agg_age    = domain_ages.get(domain)
-            chunk_age  = chunk.get("domain_ages", {}).get(domain)
-            # Show per-chunk age → aggregated age when chunking is active
+            agg_age   = domain_ages.get(domain)
+            chunk_age = chunk.get("domain_ages", {}).get(domain)
+            chunk_ds  = chunk.get("domain_scores", {}).get(domain, {})
+            chunk_phr = chunk_ds.get("phrases", {})
+
             if n_chunks > 1:
-                ca_str  = f"{chunk_age:.0f}" if chunk_age is not None else "?"
-                agg_str = f"{agg_age:.0f}"   if agg_age  is not None else "?"
-                age_str = f"  [{ca_str}→{agg_str}mo]"
+                ca  = f"{chunk_age:.0f}" if chunk_age is not None else "?"
+                aa  = f"{agg_age:.0f}"   if agg_age   is not None else "?"
+                age_str = f"  [{ca}→{aa}mo]"
             else:
                 age_str = f"  [{agg_age:.0f}mo]" if agg_age is not None else ""
-            label     = _DOMAIN_ABBR[domain]
-            y_label   = pad + (row * 2 + 2) * line_h_s
-            y_feat    = y_label + line_h_s
 
-            has_match = bool(kw_map)
-            col = _COL_MATCHED if has_match else _COL_TEXT
-
-            # Domain label row
+            label   = _DOMAIN_ABBR[domain]
+            y_label = pad + (row * 2 + 2) * line_h_s
+            y_feat  = y_label + line_h_s
+            col     = _COL_MATCHED if chunk_phr else _COL_TEXT
             _puttext(frame, f"{label}{age_str}", (pad, y_label), fscale_s, col)
 
-            # Feature breakdown row (smaller, indented)
+            # "locom=crawling  |  coord=grasping  |  stab=sitting"
             feat_parts = []
             for feat in _DOMAIN_FEATURES[domain]:
-                score = feat_data.get(feat)
-                if score is not None:
-                    kw = kw_map.get(feat, "")
-                    # Strip surrounding quotes and match tag for brevity
-                    kw_clean = re.sub(r'\s*\(.*?\)\s*$', '', kw).strip('"')
-                    feat_parts.append(f"{feat[:5]}:{score:.2f} {kw_clean}")
+                phrase = chunk_phr.get(feat, "")
+                score  = chunk_ds.get("features", {}).get(feat)
+                if phrase and score is not None:
+                    feat_parts.append(f"{feat[:5]}={phrase}")
             feat_line = "  " + "  |  ".join(feat_parts) if feat_parts else "  —"
             max_chars = int((panel_w - pad * 2) / (fscale_s * 0.75 * 12))
             if len(feat_line) > max_chars:
@@ -1236,15 +1090,18 @@ Examples:
                         help="PLM checkpoint or HuggingFace ID.")
     parser.add_argument("--num_frames", type=int, default=8,
                         help="Frames to sample per PLM call (default: 8).")
-    parser.add_argument("--max_gen_len", type=int, default=512,
-                        help="Max tokens for description call (default: 512).")
+    parser.add_argument("--max_gen_len", type=int, default=128,
+                        help="Max tokens per domain call (default: 128).")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature; 0.0 = greedy (default).")
     parser.add_argument("--chunk_duration", type=float, default=None,
-                        help="Split video into chunks of this many seconds and run PLM "
-                             "on each. Each chunk is scored independently; the max "
-                             "feature score across chunks drives the final age estimate. "
+                        help="Split video into chunks of this many seconds. "
+                             "Each chunk is assessed per-domain independently; "
+                             "the most advanced level across chunks is used. "
                              "Omit to treat the full video as one chunk.")
+    parser.add_argument("--num_runs", type=int, default=1,
+                        help="PLM calls per (domain, chunk). "
+                             "1=fastest; 3=majority vote for reliability (default: 1).")
     parser.add_argument("--json_only", action="store_true",
                         help="Print only the JSON result (no formatted report).")
     parser.add_argument("--save", type=str, default=None,
@@ -1268,6 +1125,7 @@ Examples:
         temperature=args.temperature,
         max_gen_len=args.max_gen_len,
         chunk_duration=args.chunk_duration,
+        num_runs=args.num_runs,
         debug=args.debug,
     )
 
