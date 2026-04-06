@@ -982,9 +982,30 @@ def render_assessment_video(video_path: str, result: dict, output_path: str) -> 
     writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
 
     fscale   = max(0.40, min(0.65, out_w / 1440 * 0.65))
+    fscale_s = fscale * 0.80          # smaller font for raw-text panel
     line_h   = int(fscale * 38)
+    line_h_s = int(fscale_s * 36)
     pad      = 10
     n_chunks = len(chunk_details)
+
+    # Pre-compute wrapped raw text per chunk (constant across frames)
+    # Estimate chars per line from frame width and small font scale
+    chars_per_line = max(40, int(out_w / (fscale_s * 12.5)))
+
+    def _wrap(text, width):
+        """Wrap text to lines of at most *width* characters."""
+        import textwrap
+        lines = []
+        for raw_line in text.splitlines():
+            if not raw_line.strip():
+                continue
+            lines.extend(textwrap.wrap(raw_line, width) or [raw_line])
+        return lines
+
+    chunk_wrapped = {
+        c["index"]: _wrap(c.get("raw_text", ""), chars_per_line)
+        for c in chunk_details
+    }
 
     def _chunk_for_time(t):
         for c in chunk_details:
@@ -1046,6 +1067,21 @@ def render_assessment_video(video_path: str, result: dict, output_path: str) -> 
         cv2.line(frame, (pad, y_overall - line_h // 2),
                  (panel_w - pad, y_overall - line_h // 2), (80, 80, 80), 1)
         _puttext(frame, overall_str, (pad, y_overall), fscale, _COL_HEADER)
+
+        # --- bottom panel: raw PLM text for this chunk ---
+        raw_lines  = chunk_wrapped.get(chunk["index"], [])
+        txt_panel_h = (len(raw_lines) + 1) * line_h_s + pad  # +1 for "PLM:" header
+        txt_y0 = out_h - txt_panel_h - 8   # 8px gap above progress bar
+        overlay2 = frame.copy()
+        cv2.rectangle(overlay2, (0, txt_y0), (out_w, txt_y0 + txt_panel_h),
+                      (0, 0, 0), -1)
+        cv2.addWeighted(overlay2, 0.60, frame, 0.40, 0, frame)
+
+        _puttext(frame, "PLM output:", (pad, txt_y0 + line_h_s),
+                 fscale_s, _COL_HEADER)
+        for li, line in enumerate(raw_lines):
+            y_txt = txt_y0 + (li + 2) * line_h_s
+            _puttext(frame, line, (pad, y_txt), fscale_s, _COL_TEXT)
 
         # --- progress bar (bottom edge) ---
         if total_frames > 0:
