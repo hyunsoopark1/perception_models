@@ -56,9 +56,9 @@ _PROMPT_CHILD = (
 # Caregiver choices are listed inside Interaction so PLM sees them in context.
 
 _PROMPT_DESCRIBE = """\
-Watch this child carefully. For each domain below, copy the phrases that \
-describe what you see, separated by commas. \
-Write "none" only if the domain is completely invisible.
+Watch this child carefully. For each domain, copy ONLY the 1-3 phrases that \
+you can directly observe right now. Do not copy phrases for skills the child \
+does not clearly demonstrate. If a domain is invisible write "none".
 
 Motor: crawling | first steps | walking | toddling | walks steadily | \
 running | jumping | grasping | picks up objects | uses spoon | \
@@ -1028,9 +1028,9 @@ def render_assessment_video(video_path: str, result: dict, output_path: str) -> 
         sections = chunk["sections"]
 
         # --- semi-transparent panel ---
-        # Lines: header + 5 domains + separator + overall age
-        n_lines  = 1 + len(DOMAINS) + 2
-        panel_h  = n_lines * line_h + pad * 2
+        # Layout: header + (domain-label + feature-scores) * 5 + sep + overall
+        n_lines  = 1 + len(DOMAINS) * 2 + 2
+        panel_h  = n_lines * line_h_s + pad * 2
         panel_w  = min(out_w, int(out_w * 0.72))
         overlay  = frame.copy()
         cv2.rectangle(overlay, (0, 0), (panel_w, panel_h), (0, 0, 0), -1)
@@ -1040,36 +1040,46 @@ def render_assessment_video(video_path: str, result: dict, output_path: str) -> 
         t_s    = int(chunk["t_start"])
         t_e    = int(chunk["t_end"]) if chunk["t_end"] is not None else "?"
         header = f"Chunk {chunk['index']}/{n_chunks}  [{t_s}s – {t_e}s]"
-        _puttext(frame, header, (pad, pad + line_h), fscale, _COL_HEADER)
+        _puttext(frame, header, (pad, pad + line_h_s), fscale, _COL_HEADER)
 
-        # --- per-domain lines: keywords  +  age estimate ---
-        for row, domain in enumerate(DOMAINS, start=1):
-            text  = sections.get(domain, "").strip()
-            label = _DOMAIN_ABBR[domain]
-            y     = pad + (row + 1) * line_h
+        # --- per-domain: label line + feature breakdown line ---
+        for row, domain in enumerate(DOMAINS):
+            feat_data = result.get("plm_features", {}).get(domain) or {}
+            kw_map    = feat_data.get("matched_keywords", {})
+            age       = domain_ages.get(domain)
+            age_str   = f"  [{age:.0f}mo]" if age is not None else ""
+            label     = _DOMAIN_ABBR[domain]
+            y_label   = pad + (row * 2 + 2) * line_h_s
+            y_feat    = y_label + line_h_s
 
-            has_match = any(f in matched_kw for f in _DOMAIN_FEATURES[domain])
+            has_match = bool(kw_map)
             col = _COL_MATCHED if has_match else _COL_TEXT
 
-            age = domain_ages.get(domain)
-            age_str = f" [{age:.0f}mo]" if age is not None else ""
+            # Domain label row
+            _puttext(frame, f"{label}{age_str}", (pad, y_label), fscale_s, col)
 
-            if not text or re.search(r"\bnot\s+observed\b", text, re.IGNORECASE):
-                _puttext(frame, f"{label}: —", (pad, y), fscale, _COL_NONE)
-            else:
-                max_chars = int((panel_w - int(fscale * 60)) / (fscale * 13))
-                display   = text if len(text) <= max_chars else text[:max_chars - 3] + "..."
-                _puttext(frame, f"{label}: {display}{age_str}", (pad, y), fscale, col)
+            # Feature breakdown row (smaller, indented)
+            feat_parts = []
+            for feat in _DOMAIN_FEATURES[domain]:
+                score = feat_data.get(feat)
+                if score is not None:
+                    kw = kw_map.get(feat, "")
+                    # Strip surrounding quotes and match tag for brevity
+                    kw_clean = re.sub(r'\s*\(.*?\)\s*$', '', kw).strip('"')
+                    feat_parts.append(f"{feat[:5]}:{score:.2f} {kw_clean}")
+            feat_line = "  " + "  |  ".join(feat_parts) if feat_parts else "  —"
+            max_chars = int((panel_w - pad * 2) / (fscale_s * 0.75 * 12))
+            if len(feat_line) > max_chars:
+                feat_line = feat_line[:max_chars - 3] + "..."
+            _puttext(frame, feat_line, (pad, y_feat), fscale_s * 0.75, _COL_TEXT)
 
-        # --- overall age (bottom of panel) ---
-        y_overall = pad + (len(DOMAINS) + 2) * line_h
-        if overall_age is not None:
-            overall_str = f"Overall: {overall_age:.1f} months"
-        else:
-            overall_str = "Overall: insufficient data"
-        cv2.line(frame, (pad, y_overall - line_h // 2),
-                 (panel_w - pad, y_overall - line_h // 2), (80, 80, 80), 1)
-        _puttext(frame, overall_str, (pad, y_overall), fscale, _COL_HEADER)
+        # --- overall age ---
+        y_overall = pad + (len(DOMAINS) * 2 + 2) * line_h_s
+        overall_str = (f"Overall: {overall_age:.1f} months"
+                       if overall_age is not None else "Overall: insufficient data")
+        cv2.line(frame, (pad, y_overall - line_h_s // 2),
+                 (panel_w - pad, y_overall - line_h_s // 2), (80, 80, 80), 1)
+        _puttext(frame, overall_str, (pad, y_overall), fscale_s, _COL_HEADER)
 
         # --- bottom panel: raw PLM text for this chunk ---
         raw_lines  = chunk_wrapped.get(chunk["index"], [])
