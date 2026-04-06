@@ -970,10 +970,9 @@ def render_assessment_video(video_path: str, result: dict, output_path: str) -> 
         if not ret:
             break
 
-        frame   = _apply_rotation(frame, rotation)
-        t       = frame_idx / fps
-        chunk   = _chunk_for_time(t)
-        sections = chunk["sections"]
+        frame = _apply_rotation(frame, rotation)
+        t     = frame_idx / fps
+        chunk = _chunk_for_time(t)
 
         # --- semi-transparent panel ---
         # Layout: header + (domain-label + feature-scores) * 5 + sep + overall
