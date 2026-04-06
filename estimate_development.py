@@ -56,29 +56,39 @@ _PROMPT_CHILD = (
 # Caregiver choices are listed inside Interaction so PLM sees them in context.
 
 _PROMPT_DESCRIBE = """\
-Watch this child carefully. Each domain below has its OWN list of choices. \
-Select the ONE phrase from THAT domain's list that best matches what you \
-directly observe. Only use phrases from each domain's own list — do NOT \
-copy a phrase into a domain whose list does not contain it. \
+Watch this child carefully. Each domain has its OWN vocabulary list. \
+Choose the ONE phrase from THAT domain's list that best matches what you \
+observe. Do NOT copy a phrase into a domain whose list does not contain it. \
 Write "none" if nothing in that domain's list is visible.
 
-Motor (how the child moves and uses hands): \
-crawling | first steps | walking | toddling | walks steadily | \
-running | jumping | grasping | picks up objects | uses spoon | \
-stacking blocks | sitting | seated | stands alone | balances
-Autonomy (self-care and independence): \
-reaches for toy | explores independently | self-feeds | \
-drinks from cup | removes shoes | washes hands | dresses self
-Attention (focus and engagement): \
-briefly looks | looks at toy | plays with toy | \
-sustained attention | extended play | prolonged focus
-Interaction (social behaviour with people): \
-responds to name | makes eye contact | waves at adult | \
-parallel play | shows toy to adult | cooperative play | takes turns | \
-returns to caregiver | seeks caregiver | plays independently
-Language (communication): \
-babbling | single word | several words | two-word phrases | \
-sentences | points at objects | waves | uses gestures\
+Motor (body movement and hand use):
+  crawling | first steps | walking | toddling | walks steadily | running | \
+jumping | grasping | picks up objects | uses spoon | stacking blocks | \
+sitting | seated | stands alone | balances
+
+Autonomy (self-care):
+  reaches for toy | explores independently | self-feeds | drinks from cup | \
+removes shoes | washes hands | dresses self
+
+Attention (focus):
+  briefly looks | looks at toy | plays with toy | sustained attention | \
+extended play | prolonged focus
+
+Interaction (social behaviour):
+  responds to name | makes eye contact | waves at adult | parallel play | \
+shows toy to adult | cooperative play | takes turns | returns to caregiver | \
+seeks caregiver | plays independently
+
+Language (communication):
+  babbling | single word | several words | two-word phrases | sentences | \
+points at objects | waves | uses gestures
+
+Reply in exactly this format — one selected phrase (or "none") per line:
+Motor: <phrase>
+Autonomy: <phrase>
+Attention: <phrase>
+Interaction: <phrase>
+Language: <phrase>\
 """
 
 
@@ -384,8 +394,9 @@ def _extract_domain_sections(description: str) -> dict:
     requests and splits the output into per-domain strings.
     Falls back to the full description for all domains if no headers found.
     """
+    # Match "Motor:", "Motor (anything):", "Motor - anything:", etc.
     header_pattern = re.compile(
-        r"(?:^|\n)\s*(motor|autonomy|attention|interaction|language)\s*:",
+        r"(?:^|\n)\s*(motor|autonomy|attention|interaction|language)\b[^:\n]*:",
         re.IGNORECASE,
     )
     parts = header_pattern.split(description)
