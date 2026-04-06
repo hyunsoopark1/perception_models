@@ -3,22 +3,20 @@
 Developmental stage estimator for children's videos.
 
 Pipeline:
-  1. PLM observes behavioral features in 5 domains (motor, autonomy,
-     attention, interaction, language) and outputs scores in [0, 1].
-  2. Python maps each domain's feature scores to an estimated age in months
-     using CDC milestone anchor points at 12 / 18 / 24 / 36 months.
-  3. A soft stage distribution (S0–S3) is computed from the age estimates.
-  4. A formatted report is printed.
+  1. PLM Call 1: Detect whether a child is visible (yes / no).
+  2. PLM Call 2: Free-text description of observed behaviour per domain.
+  3. Python keyword matching maps each domain description to CDC feature scores.
+  4. Inverse-interpolation of CDC milestone curves yields age estimates.
+  5. A soft S0-S3 stage distribution is computed and a formatted report is printed.
 
 CDC anchor reference:
-  S0 → < 12 months   (pre-walker, single words / gestures beginning)
-  S1 → 12–18 months  (independent walking, single words, caregiver-dependent)
-  S2 → 18–24 months  (running, 2-word phrases, parallel play)
-  S3 → 24–36 months  (complex motor, sentences, cooperative play)
+  S0 -> < 12 months   (pre-walker, gestures beginning)
+  S1 -> 12-18 months  (independent walking, single words)
+  S2 -> 18-24 months  (running, 2-word phrases, parallel play)
+  S3 -> 24-36 months  (complex motor, sentences, cooperative play)
 
 Usage:
     python estimate_development.py --video data/202503_a/zdgaa.MOV
-    python estimate_development.py --video clip.mp4 --ckpt facebook/Perception-LM-8B
     python estimate_development.py --video clip.mp4 --num_frames 16 --json_only
 """
 
@@ -38,80 +36,140 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PLM prompt
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
+# PLM prompts
+# ------------------------------------------------------------------------------
 
-# Kept short to avoid context-window echo issues.
-# PLM outputs feature scores; CDC mapping is done in Python.
-_PROMPT = """\
-Watch this child's video carefully and observe what they actually do.
+_PROMPT_CHILD = (
+    "Is there a child (infant or toddler under 4 years old) clearly visible "
+    "and active in this video? Answer only: yes or no."
+)
 
-For each domain, describe the specific action you see in *_evidence \
-(e.g. "walks steadily across room", "reaches for toy alone", "points at dog"). \
-Never write vague phrases like "child present" — describe the observed behavior. \
-If a domain is not visible, set *_observed=false and all its fields to null.
+# Ask for labelled free-text sections - PLM describes, Python scores.
+# Kept short to avoid context-window overflow on PLM-3B.
+_PROMPT_DESCRIBE = """\
+Watch this child carefully. For each domain below write 1-2 sentences \
+describing the specific actions you observe. Write "not observed" if \
+a domain is not visible.
 
-Score anchors (CDC milestones): 0.0=not yet present, 0.35=12mo, 0.6=18mo, 0.8=24mo, 1.0=36mo+.
-
-Motor — look for: walking, running, climbing, grasping, throwing.
-Autonomy — look for: reaching/acting without help, exploring independently.
-Attention — look for: sustained gaze, following objects, goal-directed play.
-Interaction — look for: eye contact, responding to others, seeking caregiver.
-Language — look for: babbling, words, pointing, waving, gestures.
-
-Output only this flat JSON with real values — no placeholders, no extra text:
-
-{"child_present":bool,\
-"motor_observed":bool,"locomotion":float|null,"coordination":float|null,"stability":float|null,"motor_evidence":string|null,\
-"autonomy_observed":bool,"independence":float|null,"initiative":float|null,"autonomy_evidence":string|null,\
-"attention_observed":bool,"duration":float|null,"goal_directed":float|null,"attention_evidence":string|null,\
-"interaction_observed":bool,"social_engagement":float|null,"caregiver_dependency":float|null,"interaction_evidence":string|null,\
-"language_observed":bool,"verbal":float|null,"gesture":float|null,"language_evidence":string|null}\
+Motor: walking, running, crawling, climbing, grasping objects?
+Autonomy: acts alone, self-feeds, explores independently, initiates?
+Attention: how long does the child focus, does the child pursue a goal?
+Interaction: eye contact, responds to others, plays near peers, seeks caregiver?
+Language: babbles, says words or phrases, points, waves, gestures?\
 """
 
-# Mapping from flat JSON keys back to (domain, feature) structure
-_DOMAIN_MAP = {
-    "motor":       {"observed_key": "motor_observed",       "evidence_key": "motor_evidence",       "features": ["locomotion", "coordination", "stability"]},
-    "autonomy":    {"observed_key": "autonomy_observed",    "evidence_key": "autonomy_evidence",    "features": ["independence", "initiative"]},
-    "attention":   {"observed_key": "attention_observed",   "evidence_key": "attention_evidence",   "features": ["duration", "goal_directed"]},
-    "interaction": {"observed_key": "interaction_observed", "evidence_key": "interaction_evidence", "features": ["social_engagement", "caregiver_dependency"]},
-    "language":    {"observed_key": "language_observed",    "evidence_key": "language_evidence",    "features": ["verbal", "gesture"]},
+
+# ------------------------------------------------------------------------------
+# Keyword tables  (feature -> [(score, [phrase, ...]), ...])
+#
+# Score anchors (CDC milestones): 0.35=12mo, 0.60=18mo, 0.80=24mo, 1.00=36mo.
+# _score_feature() returns the *highest* score whose phrases appear in the text.
+# Phrases use simple substring matching (case-insensitive).
+# caregiver_dependency is a DECREASING curve (more dependent = higher score).
+# ------------------------------------------------------------------------------
+
+_KEYWORDS: dict = {
+    "locomotion": [
+        (1.00, ["hopping", "galloping", "jumping", "jumps", "skipping", "runs confidently"]),
+        (0.80, ["running", "runs", "climbs stairs", "walks well", "walks steadily",
+                "walks independently", "walks without"]),
+        (0.60, ["walking", "walks", "toddling", "toddles", "walks around", "takes steps"]),
+        (0.35, ["cruising", "pulling to stand", "pulls to stand", "first steps",
+                "stands with support", "unsteady steps"]),
+        (0.10, ["crawling", "crawls", "creeping", "scooting"]),
+        (0.00, ["lying", "stationary", "does not walk", "seated only"]),
+    ],
+    "coordination": [
+        (1.00, ["scissors", "draws circle", "catches ball", "strings beads", "buttons"]),
+        (0.80, ["kicks ball", "turns pages", "builds tower", "stacks blocks", "uses fork"]),
+        (0.60, ["throws", "scribbles", "uses spoon", "picks up small", "stacks", "pours"]),
+        (0.35, ["grasps", "pincer", "reaches for", "picks up", "holds toy", "transfers"]),
+    ],
+    "stability": [
+        (1.00, ["stands on one foot", "hops on one foot", "balances on one", "excellent balance"]),
+        (0.80, ["tiptoe", "walks on tiptoe", "steady balance", "good balance", "balances briefly"]),
+        (0.60, ["stands alone", "stands independently", "steady on feet", "walks without falling"]),
+        (0.35, ["sits independently", "sits alone", "sitting up", "pulls to stand", "stands briefly"]),
+    ],
+    "independence": [
+        (1.00, ["dresses independently", "fully independent", "toilet", "brushes teeth"]),
+        (0.80, ["removes shoes", "washes hands", "partially dresses", "puts on clothing"]),
+        (0.60, ["feeds self", "drinks from cup", "uses spoon alone", "eats independently",
+                "self-feeds", "self feeds"]),
+        (0.35, ["reaches for toy", "picks up food", "explores nearby", "grabs object"]),
+    ],
+    "initiative": [
+        (1.00, ["complex pretend", "elaborate play", "self-directed", "plans activity",
+                "sequential", "organizes play"]),
+        (0.80, ["pretend play", "makes choices", "problem solv", "selects toy",
+                "leads play", "starts game"]),
+        (0.60, ["initiates play", "chooses toy", "opens container", "starts activity",
+                "initiates activity"]),
+        (0.35, ["initiates reaching", "explores independently", "moves toward", "approaches"]),
+    ],
+    "duration": [
+        (1.00, ["prolonged focus", "sustained engagement", "extended attention",
+                "maintains attention", "long period"]),
+        (0.80, ["extended play", "focused activity", "stays engaged", "continues playing",
+                "concentrates"]),
+        (0.60, ["sustained attention", "plays with toy", "attends for several",
+                "focused for", "watches attentively"]),
+        (0.35, ["briefly attends", "momentary attention", "looks at toy briefly",
+                "short attention", "glances"]),
+    ],
+    "goal_directed": [
+        (1.00, ["plans ahead", "sequential actions", "multi-step", "complex problem",
+                "organized play"]),
+        (0.80, ["completes task", "works to finish", "purposefully arranges", "solves problem"]),
+        (0.60, ["purposeful play", "works toward goal", "tries to achieve", "persists"]),
+        (0.35, ["reaches for specific", "follows object", "tracks toy", "pursues toy"]),
+    ],
+    "social_engagement": [
+        (1.00, ["cooperative play", "takes turns", "plays with other children",
+                "group play", "shares toys"]),
+        (0.80, ["plays alongside", "shows affection", "parallel play with interaction",
+                "brings toy to", "shows toy to"]),
+        (0.60, ["parallel play", "makes eye contact", "shows objects", "imitates",
+                "waves at", "responds to"]),
+        (0.35, ["responds to name", "smiles at", "turns to voice", "reacts to adult"]),
+    ],
+    # Decreasing curve: higher score = more caregiver-dependent = younger child
+    "caregiver_dependency": [
+        (0.80, ["clings to", "cries for caregiver", "separation anxiety",
+                "distressed without", "won't leave caregiver", "needs caregiver constantly"]),
+        (0.65, ["seeks caregiver", "returns to caregiver", "checks on caregiver",
+                "looks to caregiver", "stays near adult", "keeps close to"]),
+        (0.45, ["occasionally checks", "glances at caregiver", "aware of caregiver",
+                "looks back at"]),
+        (0.20, ["plays independently", "ignores caregiver", "fully independent from",
+                "comfortable away", "does not seek"]),
+    ],
+    "verbal": [
+        (1.00, ["sentences", "full sentence", "three-word", "conversation", "storytelling",
+                "talks in"]),
+        (0.80, ["two-word", "2-word", "combining words", "word combinations", "short phrases"]),
+        (0.60, ["several words", "multiple words", "vocabulary", "names objects",
+                "says words", "many words"]),
+        (0.35, ["babbling", "babbles", "single word", "mama", "dada", "first words",
+                "one word", "jargon", "vocalizes"]),
+        (0.00, ["no words", "no speech", "silent", "no verbal", "does not speak"]),
+    ],
+    "gesture": [
+        (1.00, ["rich gestures", "complex gestures", "gestures with speech", "mime",
+                "elaborate gesture"]),
+        (0.80, ["gestures to communicate", "uses gestures", "points to show",
+                "shows object", "symbolic gesture"]),
+        (0.60, ["points", "pointing", "uses pointing"]),
+        (0.35, ["waves", "waving", "arms up", "reaching gesture", "claps", "shakes head"]),
+        (0.00, ["no gesture", "no pointing", "no waving", "does not gesture"]),
+    ],
 }
 
 
-def _normalise_keys(flat: dict) -> dict:
-    """Normalise PLM dict keys: replace spaces with underscores."""
-    return {k.replace(" ", "_"): v for k, v in flat.items()}
-
-
-def _flat_to_domains(flat: dict) -> dict:
-    """Reconstruct nested domain dict from the flat PLM output."""
-    flat = _normalise_keys(flat)
-    domains = {}
-    for domain, cfg in _DOMAIN_MAP.items():
-        observed = flat.get(cfg["observed_key"], False)
-        if isinstance(observed, (int, float)):
-            observed = bool(observed)
-        entry = {"observed": observed}
-        for feat in cfg["features"]:
-            entry[feat] = flat.get(feat) if observed else None
-        entry["evidence"] = flat.get(cfg["evidence_key"]) if observed else None
-        domains[domain] = entry
-    return domains
-
-
-def _regex_child_present(text: str) -> bool:
-    """Regex fallback: extract child_present from raw text when JSON parse fails."""
-    m = re.search(r"['\"]child_present['\"]\s*:\s*(true|false)", text, re.IGNORECASE)
-    return m.group(1).lower() == "true" if m else False
-
-
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # CDC milestone anchor curves
-# Feature score expected at each milestone age (months).
-# Interpolating these gives a continuous age estimate from a feature score.
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 # fmt: off
 CDC_ANCHORS: dict = {
@@ -130,46 +188,122 @@ CDC_ANCHORS: dict = {
     },
     "interaction": {
         "social_engagement":    {0: 0.00, 12: 0.50, 18: 0.65, 24: 0.75, 36: 0.90},
-        # Decreasing: high dependency at birth, low at 36m
         "caregiver_dependency": {0: 1.00, 12: 0.80, 18: 0.65, 24: 0.45, 36: 0.20},
     },
     "language": {
-        "verbal":   {0: 0.00, 12: 0.20, 18: 0.40, 24: 0.70, 36: 0.95},
-        "gesture":  {0: 0.00, 12: 0.50, 18: 0.75, 24: 0.85, 36: 0.90},
+        "verbal":  {0: 0.00, 12: 0.20, 18: 0.40, 24: 0.70, 36: 0.95},
+        "gesture": {0: 0.00, 12: 0.50, 18: 0.75, 24: 0.85, 36: 0.90},
     },
 }
 # fmt: on
 
-# Stage boundaries in months
 STAGE_BOUNDS = {
     "S0": (0, 12),
     "S1": (12, 18),
     "S2": (18, 24),
-    "S3": (24, 42),   # 42 = open upper bound approximation
+    "S3": (24, 42),
+}
+
+DOMAINS = ["motor", "autonomy", "attention", "interaction", "language"]
+
+_DOMAIN_FEATURES = {
+    "motor":       ["locomotion", "coordination", "stability"],
+    "autonomy":    ["independence", "initiative"],
+    "attention":   ["duration", "goal_directed"],
+    "interaction": ["social_engagement", "caregiver_dependency"],
+    "language":    ["verbal", "gesture"],
 }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
+# Keyword scoring helpers
+# ------------------------------------------------------------------------------
+
+
+def _score_feature(text: str, feature: str) -> Optional[float]:
+    """Return the highest keyword-matched CDC score for a feature.
+
+    Scans all phrase lists for *feature* and returns the maximum score
+    whose phrases appear (case-insensitive substring match) in *text*.
+    Returns None if no phrase matches (feature not observable in text).
+    """
+    entries = _KEYWORDS.get(feature, [])
+    best: Optional[float] = None
+    text_lower = text.lower()
+    for score, phrases in entries:
+        for phrase in phrases:
+            if phrase.lower() in text_lower:
+                if best is None or score > best:
+                    best = score
+                break  # one phrase per score tier is enough
+    return best
+
+
+def _extract_domain_sections(description: str) -> dict:
+    """Split PLM free-text description into per-domain text sections.
+
+    Looks for labelled headers (Motor:, Autonomy:, ...) that the prompt
+    requests and splits the output into per-domain strings.
+    Falls back to the full description for all domains if no headers found.
+    """
+    header_pattern = re.compile(
+        r"(?:^|\n)\s*(motor|autonomy|attention|interaction|language)\s*:",
+        re.IGNORECASE,
+    )
+    parts = header_pattern.split(description)
+    # parts = [pre_text, label1, body1, label2, body2, ...]
+
+    if len(parts) < 3:
+        # No headers found; use the full text for every domain
+        full = description.strip()
+        return {d: full for d in DOMAINS}
+
+    sections = {}
+    i = 1
+    while i + 1 < len(parts):
+        label = parts[i].strip().lower()
+        body = parts[i + 1].strip()
+        sections[label] = body
+        i += 2
+    return sections
+
+
+def _score_domain(domain: str, text: str) -> Optional[dict]:
+    """Score all features of a domain from its description text.
+
+    Returns None if the text indicates the domain was not observed.
+    Returns a dict mapping feature_name -> score (float or None) plus
+    an 'evidence' key with the first 200 characters of the description.
+    """
+    if re.search(r"\bnot\s+observed\b", text, re.IGNORECASE):
+        return None
+
+    feature_names = _DOMAIN_FEATURES[domain]
+    result: dict = {}
+    any_scored = False
+
+    for feat in feature_names:
+        score = _score_feature(text, feat)
+        result[feat] = score
+        if score is not None:
+            any_scored = True
+
+    if not any_scored:
+        return None
+
+    result["evidence"] = text[:200].strip()
+    return result
+
+
+# ------------------------------------------------------------------------------
 # CDC mapping helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 
 def _score_to_age(score: float, curve: dict) -> float:
-    """Inverse-interpolate a feature score to an estimated age in months.
-
-    Handles both increasing (most features) and decreasing curves
-    (e.g. caregiver_dependency).
-
-    Args:
-        score: Observed feature value in [0, 1].
-        curve: Dict mapping age_months → expected_score.
-
-    Returns:
-        Estimated age in months (float).
-    """
+    """Inverse-interpolate a feature score to an estimated age in months."""
     ages = sorted(curve.keys())
     scores = [curve[a] for a in ages]
-
     increasing = scores[-1] >= scores[0]
 
     if increasing:
@@ -182,7 +316,7 @@ def _score_to_age(score: float, curve: dict) -> float:
             if lo <= score <= hi:
                 t = (score - lo) / (hi - lo) if hi != lo else 0.5
                 return ages[i] + t * (ages[i + 1] - ages[i])
-    else:  # decreasing
+    else:  # decreasing (e.g. caregiver_dependency)
         if score >= scores[0]:
             return float(ages[0])
         if score <= scores[-1]:
@@ -199,20 +333,13 @@ def _score_to_age(score: float, curve: dict) -> float:
 def domain_age(domain: str, features: dict) -> Optional[float]:
     """Estimate developmental age (months) for one domain.
 
-    Averages the inverse-interpolated ages across all observed features
+    Averages inverse-interpolated ages across all observed features
     that have a CDC anchor curve defined.
-
-    Args:
-        domain: One of motor / autonomy / attention / interaction / language.
-        features: Dict of feature_name → score (or None).
-
-    Returns:
-        Estimated age in months, or None if no scorable features.
     """
     curves = CDC_ANCHORS.get(domain, {})
     ages = []
     for feature, score in features.items():
-        if feature == "observed" or score is None:
+        if feature in ("observed", "evidence") or score is None:
             continue
         if feature not in curves:
             continue
@@ -221,64 +348,30 @@ def domain_age(domain: str, features: dict) -> Optional[float]:
         except (TypeError, ValueError):
             continue
         ages.append(_score_to_age(score, curves[feature]))
-
     return sum(ages) / len(ages) if ages else None
 
 
 def stage_distribution(age_months: float, sigma: float = 4.0) -> dict:
-    """Compute a soft S0–S3 stage distribution from a continuous age estimate.
+    """Soft S0-S3 stage distribution from a continuous age estimate."""
+    from math import erf, sqrt
 
-    Uses a Gaussian centred at age_months with std=sigma, integrated over
-    each stage's age range, then normalised.
-
-    Args:
-        age_months: Point estimate of developmental age.
-        sigma: Uncertainty spread in months (default: 4.0).
-
-    Returns:
-        Dict mapping stage label → probability (sums to 1.0).
-    """
-    def _gauss_integral(a, b, mu, sig):
-        """Integral of N(mu, sig) from a to b using erf."""
-        from math import erf, sqrt
+    def _integral(a, b, mu, sig):
         z = lambda x: (x - mu) / (sig * sqrt(2))
         return 0.5 * (erf(z(b)) - erf(z(a)))
 
-    raw = {}
-    for stage, (lo, hi) in STAGE_BOUNDS.items():
-        raw[stage] = _gauss_integral(lo, hi, age_months, sigma)
-
+    raw = {s: _integral(lo, hi, age_months, sigma) for s, (lo, hi) in STAGE_BOUNDS.items()}
     total = sum(raw.values()) or 1.0
     return {s: round(v / total, 4) for s, v in raw.items()}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PLM inference + JSON extraction
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
+# Video helpers
+# ------------------------------------------------------------------------------
 
 
 def _transcode_to_h264(video_path: str, tmp_path: str) -> str:
-    """Re-encode a video to H.264 MP4 using OpenCV so torchcodec can decode it.
-
-    iPhone MOV files use HEVC/H.265 with non-standard NAL unit structures that
-    torchcodec cannot decode. Reading with OpenCV (FFmpeg backend) and writing
-    as plain H.264 produces a file that torchcodec handles correctly.
-
-    Rotation metadata is baked into the frames during re-encoding (same logic
-    as split_videos.py) so the output clip is already upright.
-
-    Args:
-        video_path: Source video path (any format OpenCV can read).
-        tmp_path: Destination path for the re-encoded file.
-
-    Returns:
-        tmp_path on success.
-
-    Raises:
-        RuntimeError: If OpenCV cannot open the source video.
-    """
+    """Re-encode a video to H.264 MP4 using OpenCV (HEVC compatibility fix)."""
     import cv2
-    import numpy as np
     from split_videos import _apply_rotation, _get_rotation
 
     cap = cv2.VideoCapture(video_path)
@@ -302,204 +395,146 @@ def _transcode_to_h264(video_path: str, tmp_path: str) -> str:
 
     cap.release()
     writer.release()
-    logger.info(f"  Re-encoded {Path(video_path).name} → {Path(tmp_path).name} "
-                f"({out_w}×{out_h}, rotation={rotation}°)")
+    logger.info(f"  Re-encoded {Path(video_path).name} -> {Path(tmp_path).name} "
+                f"({out_w}x{out_h}, rotation={rotation} deg)")
     return tmp_path
 
 
-def _extract_json(text: str) -> Optional[dict]:
-    """Extract the first valid JSON/dict object from PLM output.
-
-    LLMs often produce Python-dict syntax (single quotes, True/False/None)
-    instead of strict JSON. This function tries multiple normalisation
-    strategies before giving up.
-    """
-    import ast
-
-    def _try_json(s):
-        try:
-            return json.loads(s)
-        except (json.JSONDecodeError, ValueError):
-            return None
-
-    def _try_ast(s):
-        # Normalise JSON literals → Python literals for ast.literal_eval
-        s = re.sub(r':\s*true\b',  ': True',  s)
-        s = re.sub(r':\s*false\b', ': False', s)
-        s = re.sub(r':\s*null\b',  ': None',  s)
-        try:
-            result = ast.literal_eval(s)
-            return result if isinstance(result, dict) else None
-        except (ValueError, SyntaxError):
-            return None
-
-    # 1. Direct JSON parse (model produced valid JSON)
-    result = _try_json(text.strip())
-    if result is not None:
-        return result
-
-    # 2. Extract first {...} block, then try JSON
-    match = re.search(r"\{[\s\S]*\}", text)
-    if not match:
-        return None
-    block = match.group()
-
-    result = _try_json(block)
-    if result is not None:
-        return result
-
-    # 3. ast.literal_eval on the block (handles single-quoted Python dicts)
-    result = _try_ast(block)
-    if result is not None:
-        return result
-
-    # 4. Replace single quotes → double quotes as last resort
-    try:
-        double_quoted = block.replace("'", '"')
-        result = _try_json(double_quoted)
-        if result is not None:
-            return result
-    except Exception:
-        pass
-
-    return None
+def _run_plm_text(video_path: str, prompt: str, model, tokenizer, config,
+                  num_frames: int = 8, temperature: float = 0.0,
+                  max_gen_len: int = 256) -> str:
+    """Run PLM with a prompt and return the raw text output."""
+    result = generate_description(
+        video_path=video_path,
+        model=model,
+        tokenizer=tokenizer,
+        config=config,
+        prompt=prompt,
+        num_frames=num_frames,
+        temperature=temperature,
+        max_gen_len=max_gen_len,
+    )
+    return result["description"]
 
 
-def run_plm(video_path: str, model, tokenizer, config,
-            num_frames: int = 8, temperature: float = 0.0,
-            max_gen_len: int = 512) -> Optional[dict]:
-    """Run PLM on a video and return the parsed domain feature dict.
-
-    Automatically re-encodes the video to H.264 if torchcodec fails to decode
-    the original (common with iPhone HEVC recordings).
-    """
-    import tempfile
-    import os
-
-    def _run(path):
-        result = generate_description(
-            video_path=path,
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            prompt=_PROMPT,
-            num_frames=num_frames,
-            temperature=temperature,
-            max_gen_len=max_gen_len,
-        )
-        return result["description"]
-
-    # First attempt with the original file
-    try:
-        raw_text = _run(video_path)
-        return _extract_json(raw_text), raw_text
-    except RuntimeError as e:
-        if "decoder" not in str(e).lower() and "NAL" not in str(e):
-            raise
-        logger.warning(
-            f"torchcodec could not decode {Path(video_path).name} "
-            f"({e}). Re-encoding to H.264 and retrying..."
-        )
-
-    # Fallback: transcode to a temp H.264 file and retry
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    try:
-        _transcode_to_h264(video_path, tmp_path)
-        raw_text = _run(tmp_path)
-        return _extract_json(raw_text), raw_text
-    finally:
-        os.unlink(tmp_path)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Full assessment
-# ──────────────────────────────────────────────────────────────────────────────
-
-DOMAINS = ["motor", "autonomy", "attention", "interaction", "language"]
+# ------------------------------------------------------------------------------
 
 
 def assess(video_path: str, model, tokenizer, config,
            num_frames: int = 8, temperature: float = 0.0,
            max_gen_len: int = 512) -> dict:
-    """Run the full developmental assessment pipeline on a video.
+    """Run the full two-call developmental assessment pipeline.
+
+    Call 1: child detection (yes/no, tiny budget).
+    Call 2: free-text behavioral description per domain (scored in Python).
 
     Returns:
-        Dict with keys: video_path, plm_features, domain_ages,
-        overall_age_months, stage_distribution, raw_plm_output.
+        Dict with keys: video_path, child_present, plm_features,
+        domain_ages, overall_age_months, stage_distribution,
+        raw_plm_output (the description text from Call 2).
     """
-    parsed, raw_text = run_plm(
-        video_path, model, tokenizer, config,
-        num_frames=num_frames, temperature=temperature, max_gen_len=max_gen_len,
-    )
+    import os
+    import tempfile
 
-    domain_ages = {}
-    plm_features = {}
+    tmp_path: Optional[str] = None
+    plm_path = video_path
 
-    if parsed:
-        # PLM now outputs a flat dict; reconstruct nested domain structure
-        nested = _flat_to_domains(parsed)
+    try:
+        # ---- Call 1: child detection ----------------------------------------
+        try:
+            child_text = _run_plm_text(
+                plm_path, _PROMPT_CHILD, model, tokenizer, config,
+                num_frames=num_frames, temperature=temperature, max_gen_len=10,
+            )
+        except RuntimeError as e:
+            if "decoder" not in str(e).lower() and "NAL" not in str(e):
+                raise
+            logger.warning(f"HEVC decode failed ({e}). Transcoding to H.264 ...")
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                tmp_path = f.name
+            _transcode_to_h264(video_path, tmp_path)
+            plm_path = tmp_path
+            child_text = _run_plm_text(
+                plm_path, _PROMPT_CHILD, model, tokenizer, config,
+                num_frames=num_frames, temperature=temperature, max_gen_len=10,
+            )
+
+        child_present = bool(re.search(r"\byes\b", child_text, re.IGNORECASE))
+        logger.info(f"Child present: {child_present!r}  (PLM raw: {child_text!r})")
+
+        if not child_present:
+            return {
+                "video_path": video_path,
+                "child_present": False,
+                "plm_features": {},
+                "domain_ages": {},
+                "overall_age_months": None,
+                "stage_distribution": None,
+                "raw_plm_output": child_text,
+            }
+
+        # ---- Call 2: behavioral description ----------------------------------
+        description = _run_plm_text(
+            plm_path, _PROMPT_DESCRIBE, model, tokenizer, config,
+            num_frames=num_frames, temperature=temperature, max_gen_len=max_gen_len,
+        )
+        logger.info(f"Description output:\n{description}")
+
+        # ---- Python keyword scoring ------------------------------------------
+        domain_sections = _extract_domain_sections(description)
+
+        plm_features: dict = {}
+        domain_ages: dict = {}
+
         for domain in DOMAINS:
-            domain_data = nested.get(domain, {})
-            observed = domain_data.get("observed", False)
-            if not observed:
+            text = domain_sections.get(domain, "")
+            scored = _score_domain(domain, text) if text else None
+            plm_features[domain] = scored
+            if scored:
+                features_for_age = {k: v for k, v in scored.items() if k != "evidence"}
+                domain_ages[domain] = domain_age(domain, features_for_age)
+            else:
                 domain_ages[domain] = None
-                plm_features[domain] = None
-                continue
-            features = {k: v for k, v in domain_data.items() if k != "observed"}
-            plm_features[domain] = features
-            domain_ages[domain] = domain_age(domain, features)
-    else:
-        for domain in DOMAINS:
-            domain_ages[domain] = None
-            plm_features[domain] = None
 
-    # Overall age: mean of observed domains
-    observed_ages = [a for a in domain_ages.values() if a is not None]
-    overall_age = sum(observed_ages) / len(observed_ages) if observed_ages else None
+        observed_ages = [a for a in domain_ages.values() if a is not None]
+        overall_age = sum(observed_ages) / len(observed_ages) if observed_ages else None
+        stage_dist = stage_distribution(overall_age) if overall_age is not None else None
 
-    stage_dist = stage_distribution(overall_age) if overall_age is not None else None
+        return {
+            "video_path": video_path,
+            "child_present": True,
+            "plm_features": plm_features,
+            "domain_ages": domain_ages,
+            "overall_age_months": round(overall_age, 1) if overall_age is not None else None,
+            "stage_distribution": stage_dist,
+            "raw_plm_output": description,
+        }
 
-    child_present = (
-        bool(parsed.get("child_present", False))
-        if parsed else _regex_child_present(raw_text)
-    )
-
-    return {
-        "video_path": video_path,
-        "child_present": child_present,
-        "plm_features": plm_features,
-        "domain_ages": domain_ages,
-        "overall_age_months": round(overall_age, 1) if overall_age else None,
-        "stage_distribution": stage_dist,
-        "raw_plm_output": raw_text,
-    }
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Formatted report
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 _STAGE_LABELS = {
     "S0": "< 12 months",
-    "S1": "12–18 months",
-    "S2": "18–24 months",
-    "S3": "24–36+ months",
-}
-
-_DOMAIN_FEATURES = {
-    "motor":       ["locomotion", "coordination", "stability"],
-    "autonomy":    ["independence", "initiative"],
-    "attention":   ["duration", "goal_directed"],
-    "interaction": ["social_engagement", "caregiver_dependency"],
-    "language":    ["verbal", "gesture"],
+    "S1": "12-18 months",
+    "S2": "18-24 months",
+    "S3": "24-36+ months",
 }
 
 
 def _bar(value: float, width: int = 20) -> str:
     filled = int(round(value * width))
-    return "█" * filled + "░" * (width - filled)
+    return chr(0x2588) * filled + chr(0x2591) * (width - filled)
 
 
 def print_report(result: dict) -> None:
@@ -520,8 +555,7 @@ def print_report(result: dict) -> None:
         print(f"{sep}\n")
         return
 
-    # Per-domain table
-    print(f"\n{'Domain':<14} {'Features (PLM scores)':<30} {'Age est.'}")
+    print(f"\n{'Domain':<14} {'Feature scores (keyword)':<30} {'Age est.'}")
     print(thin)
 
     for domain in DOMAINS:
@@ -531,38 +565,34 @@ def print_report(result: dict) -> None:
 
         if features is None:
             print(f"  {domain:<12} not observed{'':<22} {age_str}")
-        else:
-            feature_names = _DOMAIN_FEATURES.get(domain, [k for k in features if k != "evidence"])
-            lines = []
-            for fname in feature_names:
-                val = features.get(fname)
-                if val is not None:
-                    lines.append(f"{fname}: {val:.2f} {_bar(val, 10)}")
-                else:
-                    lines.append(f"{fname}: null")
+            continue
 
-            # First feature line on same row as domain name
-            print(f"  {domain:<12} {lines[0]:<32} {age_str}")
-            for line in lines[1:]:
-                print(f"  {'':<12} {line}")
+        feature_names = _DOMAIN_FEATURES[domain]
+        lines = []
+        for fname in feature_names:
+            val = features.get(fname)
+            if val is not None:
+                lines.append(f"{fname}: {val:.2f} {_bar(val, 10)}")
+            else:
+                lines.append(f"{fname}: --")
 
-            # Evidence
-            evidence = features.get("evidence")
-            if evidence:
-                # Wrap to 54 chars so it fits within the report width
-                import textwrap
-                wrapped = textwrap.wrap(str(evidence), width=54)
-                print(f"  {'':<12} \033[3mEvidence: {wrapped[0]}\033[0m")
-                for w in wrapped[1:]:
-                    print(f"  {'':<12}           {w}")
+        print(f"  {domain:<12} {lines[0]:<32} {age_str}")
+        for line in lines[1:]:
+            print(f"  {'':<12} {line}")
 
-    # Overall age
+        evidence = features.get("evidence")
+        if evidence:
+            import textwrap
+            wrapped = textwrap.wrap(str(evidence), width=54)
+            print(f"  {'':<12} \033[3mEvidence: {wrapped[0]}\033[0m")
+            for w in wrapped[1:]:
+                print(f"  {'':<12}           {w}")
+
     overall = result["overall_age_months"]
     print(f"\n{thin}")
     print(f"  Overall estimated age: "
-          f"{'%.1f months' % overall if overall else 'insufficient data'}")
+          f"{'%.1f months' % overall if overall is not None else 'insufficient data'}")
 
-    # Stage distribution
     dist = result["stage_distribution"]
     if dist:
         print(f"\n  Stage distribution:")
@@ -573,9 +603,9 @@ def print_report(result: dict) -> None:
     print(f"\n{sep}\n")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # CLI
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 
 def main():
@@ -585,7 +615,7 @@ def main():
         epilog="""
 Examples:
   %(prog)s --video data/202503_a/zdgaa.MOV
-  %(prog)s --video clip.mp4 --ckpt facebook/Perception-LM-8B --num_frames 16
+  %(prog)s --video clip.mp4 --num_frames 16
   %(prog)s --video clip.mp4 --json_only > result.json
         """,
     )
@@ -594,11 +624,11 @@ Examples:
     parser.add_argument("--ckpt", type=str, default="facebook/Perception-LM-3B",
                         help="PLM checkpoint or HuggingFace ID.")
     parser.add_argument("--num_frames", type=int, default=8,
-                        help="Frames to sample from the video (default: 8).")
-    parser.add_argument("--max_gen_len", type=int, default=1024,
-                        help="Max tokens to generate (default: 1024).")
+                        help="Frames to sample per PLM call (default: 8).")
+    parser.add_argument("--max_gen_len", type=int, default=512,
+                        help="Max tokens for description call (default: 512).")
     parser.add_argument("--temperature", type=float, default=0.0,
-                        help="Sampling temperature; 0.0 = greedy (default: 0.0).")
+                        help="Sampling temperature; 0.0 = greedy (default).")
     parser.add_argument("--json_only", action="store_true",
                         help="Print only the JSON result (no formatted report).")
     parser.add_argument("--save", type=str, default=None,
@@ -623,7 +653,7 @@ Examples:
         print(json.dumps(result, indent=2))
     else:
         print_report(result)
-        print("Raw PLM output:")
+        print("--- Raw PLM description ---")
         print(result["raw_plm_output"])
 
     if args.save:
