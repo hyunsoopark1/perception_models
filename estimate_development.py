@@ -55,101 +55,125 @@ _PROMPT_CHILD = (
 # Developmental level vocabulary
 #
 # Each feature has an ORDERED list of (cdc_score, phrase) pairs.
-# Scores are CDC-calibrated: 0 = birth-level, 1 = 36-month level.
-# Phrases are presented to PLM in developmental order (youngest → oldest).
-# PLM selects one phrase; we look it up directly — no matching needed.
+# Scores align EXACTLY with CDC_ANCHORS at the key milestone ages
+# (0, 12, 18, 24, 36 months) so that _score_to_age() returns the right age.
+# Intermediate scores are interpolated values for sub-milestone ages.
+#
+# Phrases are behavioral and visually observable — no abstract labels.
+# PLM selects one phrase; direct dict lookup replaces all keyword matching.
 #
 # caregiver_dependency is a DECREASING curve (more dependent = higher score
-# = younger child).  Its list is still sorted youngest→oldest for the prompt.
+# = younger).  Its list is ordered youngest→oldest for the prompt.
+#
+# CDC_ANCHORS reference (scores at key ages):
+#   locomotion:          {0: 0.00, 12: 0.35, 18: 0.60, 24: 0.80, 36: 1.00}
+#   coordination:        {0: 0.00, 12: 0.30, 18: 0.50, 24: 0.70, 36: 0.95}
+#   stability:           {0: 0.00, 12: 0.40, 18: 0.65, 24: 0.85, 36: 1.00}
+#   independence:        {0: 0.00, 12: 0.10, 18: 0.30, 24: 0.55, 36: 0.85}
+#   initiative:          {0: 0.00, 12: 0.15, 18: 0.35, 24: 0.60, 36: 0.90}
+#   duration:            {0: 0.00, 12: 0.20, 18: 0.40, 24: 0.65, 36: 0.90}
+#   goal_directed:       {0: 0.00, 12: 0.25, 18: 0.45, 24: 0.70, 36: 0.95}
+#   social_engagement:   {0: 0.00, 12: 0.50, 18: 0.65, 24: 0.75, 36: 0.90}
+#   caregiver_dependency:{0: 1.00, 12: 0.80, 18: 0.65, 24: 0.45, 36: 0.20}
+#   verbal:              {0: 0.00, 12: 0.20, 18: 0.40, 24: 0.70, 36: 0.95}
+#   gesture:             {0: 0.00, 12: 0.50, 18: 0.75, 24: 0.85, 36: 0.90}
 # ------------------------------------------------------------------------------
 
 _FEATURE_LEVELS: dict = {
+    # locomotion: 0.00=0mo  0.20=~8mo  0.35=12mo  0.60=18mo  0.80=24mo  1.00=36mo
     "locomotion": [
-        (0.00, "lying"),
-        (0.10, "crawling"),
-        (0.25, "cruising"),
-        (0.35, "first steps"),
-        (0.60, "toddling"),
-        (0.70, "walking"),
-        (0.80, "walks steadily"),
-        (0.85, "running"),
-        (1.00, "jumping"),
+        (0.00, "lying or rolling, no self-propelled movement"),
+        (0.20, "crawling on hands and knees"),
+        (0.35, "taking first steps, unsteady, arms out, frequent falls"),
+        (0.60, "walking well and beginning to run"),
+        (0.80, "running and going up and down stairs"),
+        (1.00, "jumping with both feet off the ground"),
     ],
+    # coordination: 0.00=0mo  0.15=~6mo  0.30=12mo  0.50=18mo  0.70=24mo  0.95=36mo
     "coordination": [
-        (0.15, "grasping"),
-        (0.35, "picks up objects"),
-        (0.60, "uses spoon"),
-        (0.80, "stacking blocks"),
-        (0.95, "draws circle"),
+        (0.00, "reflexive grasp only, no voluntary reaching"),
+        (0.15, "reaches for and holds toys with whole hand"),
+        (0.30, "picks up small objects with thumb and index finger"),
+        (0.50, "stacks 2 to 4 blocks or uses spoon messily"),
+        (0.70, "stacks 6 or more blocks and draws lines"),
+        (0.95, "draws a circle and uses a fork"),
     ],
+    # stability: 0.00=0mo  0.20=~6mo  0.40=12mo  0.65=18mo  0.85=24mo  1.00=36mo
     "stability": [
-        (0.15, "cannot sit"),
-        (0.35, "sitting"),
-        (0.60, "stands alone"),
-        (0.70, "walks without falling"),
-        (0.80, "tiptoe"),
-        (1.00, "balances on one foot"),
+        (0.00, "needs full body support, no head or trunk control"),
+        (0.20, "sits with support but cannot sit alone"),
+        (0.40, "pulls to stand and stands briefly without support"),
+        (0.65, "walks steadily without falling"),
+        (0.85, "runs without falling and climbs stairs"),
+        (1.00, "balances on one foot for 2 or more seconds"),
     ],
+    # independence: 0.00=0mo  0.10=12mo  0.30=18mo  0.55=24mo  0.85=36mo
     "independence": [
-        (0.10, "no self-care"),
-        (0.30, "reaches for toy"),
-        (0.55, "self-feeds"),
-        (0.55, "drinks from cup"),
-        (0.75, "removes shoes"),
-        (0.75, "washes hands"),
-        (0.85, "dresses self"),
+        (0.00, "fully dependent, caregiver handles all feeding and care"),
+        (0.10, "feeds self with finger foods"),
+        (0.30, "attempts spoon and open cup, spills often"),
+        (0.55, "removes simple clothing and washes hands with prompting"),
+        (0.85, "dresses self and uses toilet with minimal help"),
     ],
+    # initiative: 0.00=0mo  0.15=12mo  0.35=18mo  0.60=24mo  0.90=36mo
     "initiative": [
-        (0.15, "no initiative"),
-        (0.35, "approaches toy"),
-        (0.60, "initiates play"),
-        (0.80, "pretend play"),
-        (0.90, "complex pretend"),
+        (0.00, "passive, no self-directed activity"),
+        (0.15, "explores objects by mouthing, banging, or shaking"),
+        (0.35, "retrieves hidden toy and starts simple repetitive play"),
+        (0.60, "chooses a toy and begins play independently"),
+        (0.90, "creates elaborate pretend play with sequences"),
     ],
+    # duration: 0.00=0mo  0.20=12mo  0.40=18mo  0.65=24mo  0.90=36mo
     "duration": [
-        (0.20, "briefly looks"),
-        (0.40, "looks at toy"),
-        (0.65, "plays with toy"),
-        (0.80, "extended play"),
-        (0.90, "prolonged focus"),
+        (0.00, "disengages in under 10 seconds"),
+        (0.20, "attends for 30 to 60 seconds before moving on"),
+        (0.40, "plays with a single toy for 1 to 2 minutes"),
+        (0.65, "sustains one activity for 3 to 5 minutes"),
+        (0.90, "stays with one activity for 5 to 10 or more minutes"),
     ],
+    # goal_directed: 0.00=0mo  0.25=12mo  0.45=18mo  0.70=24mo  0.95=36mo
     "goal_directed": [
-        (0.25, "glances at objects"),
-        (0.45, "pursues toy"),
-        (0.70, "purposeful play"),
-        (0.80, "completes task"),
-        (0.95, "multi-step play"),
+        (0.00, "random exploration with no visible goal"),
+        (0.25, "persists toward a specific toy despite obstacles"),
+        (0.45, "completes simple cause and effect tasks"),
+        (0.70, "solves simple problems to obtain a toy"),
+        (0.95, "plans and carries out multi-step sequences"),
     ],
+    # social_engagement: 0.00=0mo  0.35=~10mo  0.50=12mo  0.65=18mo  0.75=24mo  0.90=36mo
     "social_engagement": [
-        (0.20, "no social response"),
-        (0.35, "responds to name"),
-        (0.60, "makes eye contact"),
-        (0.65, "waves at adult"),
-        (0.75, "parallel play"),
-        (0.80, "shows toy to adult"),
-        (0.90, "cooperative play"),
+        (0.00, "no visible response to people or voices"),
+        (0.35, "responds to own name and smiles at familiar faces"),
+        (0.50, "waves bye-bye and offers or shows toys to an adult"),
+        (0.65, "plays alongside other children without direct interaction"),
+        (0.75, "plays simple interactive games with others"),
+        (0.90, "takes turns and cooperates in group play with peers"),
     ],
-    # Ordered youngest→oldest: most dependent (high score) → least dependent (low score)
+    # caregiver_dependency: ordered most dependent (youngest) to least (oldest)
+    # 1.00=0mo  0.80=12mo  0.65=18mo  0.45=24mo  0.20=36mo
     "caregiver_dependency": [
-        (0.80, "clings to caregiver"),
-        (0.65, "seeks caregiver"),
-        (0.45, "occasionally checks"),
-        (0.20, "plays independently"),
+        (1.00, "distressed immediately when caregiver is out of sight"),
+        (0.80, "checks back frequently and returns to caregiver when unsure"),
+        (0.65, "seeks caregiver in new situations but accepts brief separation"),
+        (0.45, "plays near caregiver but ventures away independently"),
+        (0.20, "plays independently for long periods without checking back"),
     ],
+    # verbal: 0.00=0mo  0.10=~6mo  0.20=12mo  0.40=18mo  0.70=24mo  0.95=36mo
     "verbal": [
-        (0.00, "no speech"),
-        (0.20, "babbling"),
-        (0.40, "single word"),
-        (0.60, "several words"),
-        (0.70, "two-word phrases"),
-        (0.95, "sentences"),
+        (0.00, "crying or cooing only, no babbling"),
+        (0.10, "babbling with repeated syllables"),
+        (0.20, "says 1 to 3 real words such as mama, dada, or no"),
+        (0.40, "uses 10 to 50 single words"),
+        (0.70, "two-word combinations such as more milk or daddy go"),
+        (0.95, "speaks in sentences of 3 or more words and asks questions"),
     ],
+    # gesture: 0.00=0mo  0.35=~10mo  0.50=12mo  0.75=18mo  0.85=24mo  0.90=36mo
     "gesture": [
-        (0.10, "no gestures"),
-        (0.35, "waves"),
-        (0.60, "points at objects"),
-        (0.80, "uses gestures"),
-        (0.90, "gestures with speech"),
+        (0.00, "no intentional gestures"),
+        (0.35, "reaches toward objects or people and waves arms"),
+        (0.50, "waves bye-bye, claps, or shakes head for no"),
+        (0.75, "points to request or show something to an adult"),
+        (0.85, "combines pointing or gestures with spoken words"),
+        (0.90, "uses varied gestures fluently together with speech"),
     ],
 }
 
