@@ -47,16 +47,18 @@ _PROMPT_CHILD = (
 
 # Ask for labelled free-text sections - PLM describes, Python scores.
 # Kept short to avoid context-window overflow on PLM-3B.
+# Note: include passive behaviours (sitting, looking) so the model does not
+# default to "not observed" for a stationary child.
 _PROMPT_DESCRIBE = """\
-Watch this child carefully. For each domain below write 1-2 sentences \
-describing the specific actions you observe. Write "not observed" if \
-a domain is not visible.
+Watch this child carefully. For each domain write 1-2 sentences about \
+what you actually see — even small or quiet actions count. \
+Only write "not observed" if the domain is completely invisible.
 
-Motor: walking, running, crawling, climbing, grasping objects?
-Autonomy: acts alone, self-feeds, explores independently, initiates?
-Attention: how long does the child focus, does the child pursue a goal?
-Interaction: eye contact, responds to others, plays near peers, seeks caregiver?
-Language: babbles, says words or phrases, points, waves, gestures?\
+Motor: Is the child sitting, standing, walking, running, reaching, grasping?
+Autonomy: Does the child reach or explore without help? Feed itself?
+Attention: What does the child look at? How long does it stay focused?
+Interaction: Does the child make eye contact, look at adults, seek the caregiver?
+Language: Any babbling, words, pointing, waving, or other gestures?\
 """
 
 
@@ -90,7 +92,8 @@ _KEYWORDS: dict = {
         (1.00, ["stands on one foot", "hops on one foot", "balances on one", "excellent balance"]),
         (0.80, ["tiptoe", "walks on tiptoe", "steady balance", "good balance", "balances briefly"]),
         (0.60, ["stands alone", "stands independently", "steady on feet", "walks without falling"]),
-        (0.35, ["sits independently", "sits alone", "sitting up", "pulls to stand", "stands briefly"]),
+        (0.35, ["sits independently", "sits alone", "sitting", "sitting up", "pulls to stand",
+                "stands briefly", "standing"]),
     ],
     "independence": [
         (1.00, ["dresses independently", "fully independent", "toilet", "brushes teeth"]),
@@ -116,7 +119,7 @@ _KEYWORDS: dict = {
         (0.60, ["sustained attention", "plays with toy", "attends for several",
                 "focused for", "watches attentively"]),
         (0.35, ["briefly attends", "momentary attention", "looks at toy briefly",
-                "short attention", "glances"]),
+                "short attention", "glances", "looks at", "gazes", "watches", "observes"]),
     ],
     "goal_directed": [
         (1.00, ["plans ahead", "sequential actions", "multi-step", "complex problem",
@@ -424,7 +427,7 @@ def _run_plm_text(video_path: str, prompt: str, model, tokenizer, config,
 
 def assess(video_path: str, model, tokenizer, config,
            num_frames: int = 8, temperature: float = 0.0,
-           max_gen_len: int = 512) -> dict:
+           max_gen_len: int = 512, debug: bool = False) -> dict:
     """Run the full two-call developmental assessment pipeline.
 
     Call 1: child detection (yes/no, tiny budget).
@@ -485,12 +488,30 @@ def assess(video_path: str, model, tokenizer, config,
         # ---- Python keyword scoring ------------------------------------------
         domain_sections = _extract_domain_sections(description)
 
+        if debug:
+            print("\n--- Extracted domain sections ---")
+            for d in DOMAINS:
+                sec = domain_sections.get(d, "(missing)")
+                print(f"  [{d}] {sec!r}")
+
         plm_features: dict = {}
         domain_ages: dict = {}
 
         for domain in DOMAINS:
             text = domain_sections.get(domain, "")
             scored = _score_domain(domain, text) if text else None
+
+            if debug:
+                print(f"\n--- Keyword scores: {domain} ---")
+                if not text:
+                    print("  (no section text)")
+                elif re.search(r"\bnot\s+observed\b", text, re.IGNORECASE):
+                    print(f"  text='{text}' -> marked NOT OBSERVED")
+                else:
+                    for feat in _DOMAIN_FEATURES[domain]:
+                        s = _score_feature(text, feat)
+                        print(f"  {feat}: {s}")
+
             plm_features[domain] = scored
             if scored:
                 features_for_age = {k: v for k, v in scored.items() if k != "evidence"}
@@ -633,6 +654,8 @@ Examples:
                         help="Print only the JSON result (no formatted report).")
     parser.add_argument("--save", type=str, default=None,
                         help="Save full result as JSON to this path.")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print extracted domain sections and keyword scores.")
 
     args = parser.parse_args()
 
@@ -647,6 +670,7 @@ Examples:
         num_frames=args.num_frames,
         temperature=args.temperature,
         max_gen_len=args.max_gen_len,
+        debug=args.debug,
     )
 
     if args.json_only:
