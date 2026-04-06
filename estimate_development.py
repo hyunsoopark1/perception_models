@@ -548,31 +548,98 @@ def _run_plm_text(video_path: str, prompt: str, model, tokenizer, config,
 
 
 # ------------------------------------------------------------------------------
+# Video chunking helper
+# ------------------------------------------------------------------------------
+
+
+def _split_into_chunks(video_path: str, chunk_duration: float) -> list:
+    """Split a video into fixed-duration temp files using OpenCV.
+
+    Returns a list of temp file paths (caller must delete them).
+    Chunks are already rotation-corrected (same logic as split_videos.py).
+    """
+    import cv2
+    import tempfile
+    from split_videos import _apply_rotation, _get_rotation
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"OpenCV cannot open: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    rotation = _get_rotation(cap)
+    raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_w, out_h = (raw_h, raw_w) if rotation in (90, 270) else (raw_w, raw_h)
+
+    frames_per_chunk = int(fps * chunk_duration)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    chunk_paths = []
+    writer = None
+    tmp_file = None
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        chunk_idx = frame_idx // frames_per_chunk
+        local_idx = frame_idx % frames_per_chunk
+
+        if local_idx == 0:
+            # Close previous chunk
+            if writer is not None:
+                writer.release()
+            tmp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+            tmp_file.close()
+            chunk_paths.append(tmp_file.name)
+            writer = cv2.VideoWriter(tmp_file.name, fourcc, fps, (out_w, out_h))
+
+        writer.write(_apply_rotation(frame, rotation))
+        frame_idx += 1
+
+    if writer is not None:
+        writer.release()
+    cap.release()
+
+    logger.info(f"Split into {len(chunk_paths)} chunks "
+                f"({chunk_duration:.0f}s each, {frame_idx} frames total)")
+    return chunk_paths
+
+
+# ------------------------------------------------------------------------------
 # Full assessment
 # ------------------------------------------------------------------------------
 
 
 def assess(video_path: str, model, tokenizer, config,
            num_frames: int = 8, temperature: float = 0.0,
-           max_gen_len: int = 512, debug: bool = False) -> dict:
+           max_gen_len: int = 512, chunk_duration: Optional[float] = None,
+           debug: bool = False) -> dict:
     """Run the full two-call developmental assessment pipeline.
 
-    Call 1: child detection (yes/no, tiny budget).
-    Call 2: free-text behavioral description per domain (scored in Python).
+    Call 1: child detection on the full video (yes/no).
+    Call 2: keyword-choice description, once per chunk.
+             All chunk texts are aggregated per domain, then scored once.
 
-    Returns:
-        Dict with keys: video_path, child_present, plm_features,
-        domain_ages, overall_age_months, stage_distribution,
-        raw_plm_output (the description text from Call 2).
+    Args:
+        chunk_duration: If set, split the video into chunks of this many
+            seconds and run PLM on each.  All descriptions are joined per
+            domain before scoring, so behaviours observed in any chunk
+            contribute to the final score.  If None, the full video is
+            treated as one chunk (original behaviour).
     """
     import os
     import tempfile
 
-    tmp_path: Optional[str] = None
+    tmp_path: Optional[str] = None   # H.264 transcode of original (if needed)
+    chunk_paths: list = []           # temp chunk files (deleted in finally)
     plm_path = video_path
 
     try:
-        # ---- Call 1: child detection ----------------------------------------
+        # ---- HEVC → H.264 transcode if needed (detected on first PLM call) ---
         try:
             child_text = _run_plm_text(
                 plm_path, _PROMPT_CHILD, model, tokenizer, config,
@@ -605,27 +672,48 @@ def assess(video_path: str, model, tokenizer, config,
                 "raw_plm_output": child_text,
             }
 
-        # ---- Call 2: behavioral description ----------------------------------
-        description = _run_plm_text(
-            plm_path, _PROMPT_DESCRIBE, model, tokenizer, config,
-            num_frames=num_frames, temperature=temperature, max_gen_len=max_gen_len,
-        )
-        logger.info(f"Description output:\n{description}")
+        # ---- Determine which video segments to describe ----------------------
+        if chunk_duration:
+            chunk_paths = _split_into_chunks(plm_path, chunk_duration)
+            segments = chunk_paths
+        else:
+            segments = [plm_path]
 
-        # ---- Python keyword scoring ------------------------------------------
-        domain_sections = _extract_domain_sections(description)
+        # ---- PLM Call 2 on each segment, collect raw texts -------------------
+        raw_texts = []
+        for i, seg in enumerate(segments):
+            logger.info(f"Describing segment {i+1}/{len(segments)}: {seg}")
+            txt = _run_plm_text(
+                seg, _PROMPT_DESCRIBE, model, tokenizer, config,
+                num_frames=num_frames, temperature=temperature,
+                max_gen_len=max_gen_len,
+            )
+            logger.info(f"  -> {txt!r}")
+            raw_texts.append(txt)
+
+        # ---- Aggregate: join per-domain text across all chunks ---------------
+        # Extract domain sections from each chunk, then concatenate per domain.
+        # Scoring happens once on the combined text — behaviours seen in any
+        # chunk contribute to the final score.
+        all_sections = [_extract_domain_sections(t) for t in raw_texts]
+        aggregated: dict = {
+            domain: "  ".join(s.get(domain, "") for s in all_sections).strip()
+            for domain in DOMAINS
+        }
+
+        combined_description = "\n".join(raw_texts)
 
         if debug:
-            print("\n--- Extracted domain sections ---")
+            print(f"\n--- Aggregated domain text ({len(segments)} chunk(s)) ---")
             for d in DOMAINS:
-                sec = domain_sections.get(d, "(missing)")
-                print(f"  [{d}] {sec!r}")
+                print(f"  [{d}] {aggregated[d]!r}")
 
+        # ---- Score once on aggregated text -----------------------------------
         plm_features: dict = {}
         domain_ages: dict = {}
 
         for domain in DOMAINS:
-            text = domain_sections.get(domain, "")
+            text = aggregated[domain]
             scored = _score_domain(domain, text) if text else None
 
             if debug:
@@ -633,7 +721,7 @@ def assess(video_path: str, model, tokenizer, config,
                 if not text:
                     print("  (no section text)")
                 elif re.search(r"\bnot\s+observed\b", text, re.IGNORECASE):
-                    print(f"  text='{text}' -> marked NOT OBSERVED")
+                    print(f"  '{text}' -> all chunks said not observed")
                 else:
                     for feat in _DOMAIN_FEATURES[domain]:
                         s, phrase = _score_feature(text, feat)
@@ -642,7 +730,8 @@ def assess(video_path: str, model, tokenizer, config,
 
             plm_features[domain] = scored
             if scored:
-                features_for_age = {k: v for k, v in scored.items() if k != "evidence"}
+                features_for_age = {k: v for k, v in scored.items()
+                                    if k not in ("evidence", "matched_keywords")}
                 domain_ages[domain] = domain_age(domain, features_for_age)
             else:
                 domain_ages[domain] = None
@@ -658,10 +747,15 @@ def assess(video_path: str, model, tokenizer, config,
             "domain_ages": domain_ages,
             "overall_age_months": round(overall_age, 1) if overall_age is not None else None,
             "stage_distribution": stage_dist,
-            "raw_plm_output": description,
+            "raw_plm_output": combined_description,
         }
 
     finally:
+        for p in chunk_paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
         if tmp_path:
             try:
                 os.unlink(tmp_path)
@@ -786,6 +880,10 @@ Examples:
                         help="Max tokens for description call (default: 512).")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature; 0.0 = greedy (default).")
+    parser.add_argument("--chunk_duration", type=float, default=None,
+                        help="Split video into chunks of this many seconds and run PLM "
+                             "on each. All chunk texts are aggregated per domain before "
+                             "scoring. Omit to treat the full video as one chunk.")
     parser.add_argument("--json_only", action="store_true",
                         help="Print only the JSON result (no formatted report).")
     parser.add_argument("--save", type=str, default=None,
@@ -806,6 +904,7 @@ Examples:
         num_frames=args.num_frames,
         temperature=args.temperature,
         max_gen_len=args.max_gen_len,
+        chunk_duration=args.chunk_duration,
         debug=args.debug,
     )
 
