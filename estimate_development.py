@@ -346,7 +346,10 @@ def _score_feature(text: str, feature: str) -> tuple:
                 break  # one phrase per tier is enough
 
     # --- Phase 2: semantic fallback (only when nothing exact-matched) ---------
-    if best_score is None and model is not None:
+    # Require at least 4 words before using semantic similarity; single words
+    # (e.g. PLM lazily copying "walking" for every domain) have very generic
+    # embeddings that produce cross-domain false positives.
+    if best_score is None and model is not None and len(text.split()) >= 4:
         from sentence_transformers import util
         text_emb = model.encode(text, convert_to_tensor=True)
 
@@ -981,10 +984,10 @@ def render_assessment_video(video_path: str, result: dict, output_path: str) -> 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
 
-    fscale   = max(0.40, min(0.65, out_w / 1440 * 0.65))
+    fscale   = max(0.65, min(1.10, out_w / 1440 * 1.10))   # larger for readability
     fscale_s = fscale * 0.80          # smaller font for raw-text panel
-    line_h   = int(fscale * 38)
-    line_h_s = int(fscale_s * 36)
+    line_h   = int(fscale * 42)
+    line_h_s = int(fscale_s * 40)
     pad      = 10
     n_chunks = len(chunk_details)
 
@@ -1028,7 +1031,7 @@ def render_assessment_video(video_path: str, result: dict, output_path: str) -> 
         # Lines: header + 5 domains + separator + overall age
         n_lines  = 1 + len(DOMAINS) + 2
         panel_h  = n_lines * line_h + pad * 2
-        panel_w  = min(out_w, int(out_w * 0.60))
+        panel_w  = min(out_w, int(out_w * 0.72))
         overlay  = frame.copy()
         cv2.rectangle(overlay, (0, 0), (panel_w, panel_h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
