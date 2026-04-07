@@ -511,16 +511,17 @@ def load_consolidated_model_and_tokenizer(ckpt):
         patch_size=config.model.vision_model.patch_size,
     )
 
-    # Build model and load the consolidated checkpoints
+    # Build model directly on CUDA so weights are never staged in CPU RAM.
+    # Combined with mmap=True in load_consolidated_checkpoint this keeps
+    # peak CPU memory at ~1x model size instead of ~2x.
     model_args = dataclass_from_dict(LMTransformerArgs, config.model, strict=False)
-    model = LMTransformer(model_args)
-    load_consolidated_checkpoint(model, ckpt_path)
     param_dtype = dict(fp32=torch.float32, fp16=torch.float16, bf16=torch.bfloat16)[
         config.distributed.model_dtype
     ]
-    model = model.cuda().eval()
-    for param in model.parameters():
-        param.data = param.data.to(dtype=param_dtype)
+    with torch.device("cuda"):
+        model = LMTransformer(model_args)
+    load_consolidated_checkpoint(model, ckpt_path)
+    model = model.to(dtype=param_dtype).eval()
 
     return model, tokenizer, config
 

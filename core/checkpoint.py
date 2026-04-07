@@ -342,12 +342,13 @@ def load_consolidated_checkpoint(
     ckpt_path = Path(consolidated_path)
     cp_file = get_consolidated_ckpt_path(ckpt_path, mp_rank=0, mp_size=1)
     if cp_file.exists():
-        # Use the single file
-        st_dict = torch.load(cp_file, weights_only=True)
+        # Use the single file. mmap=True memory-maps the file so the state dict
+        # is not fully copied into CPU RAM, halving peak memory usage.
+        st_dict = torch.load(cp_file, weights_only=True, mmap=True)
         if "model" in st_dict:
             st_dict = st_dict["model"]
     else:
-        # Fall back to multi-part consolidated files (e.g. consolidated.00.pth, consolidated.01.pth, …)
+        # Fall back to multi-part consolidated files
         checkpoint_files = sorted(ckpt_path.glob("consolidated.*.pth"))
         if not checkpoint_files:
             raise FileNotFoundError(
@@ -355,7 +356,7 @@ def load_consolidated_checkpoint(
             )
         st_dict = {}
         for ckpt_file in checkpoint_files:
-            part = torch.load(ckpt_file, weights_only=True)
+            part = torch.load(ckpt_file, weights_only=True, mmap=True)
             # If the checkpoint part is wrapped with "model", unwrap it
             if "model" in part:
                 part = part["model"]
