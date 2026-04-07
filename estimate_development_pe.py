@@ -346,11 +346,13 @@ def _encode_all_levels(model, tokenizer, device: str) -> dict:
     return cache
 
 
-def _extract_frames(video_path: str, num_frames: int, preprocess) -> torch.Tensor:
+def _extract_frames(video_path: str, num_frames: int, preprocess) -> tuple:
     """Extract num_frames evenly-spaced frames from a video.
 
     Returns:
-        Tensor of shape (1, N, C, H, W) ready for model.encode_video().
+        (pil_images, video_tensor) where:
+          pil_images   — list of num_frames PIL.Image (RGB)
+          video_tensor — torch.Tensor (1, N, C, H, W) for encode_video()
     """
     import cv2
     from split_videos import _apply_rotation, _get_rotation
@@ -363,35 +365,44 @@ def _extract_frames(video_path: str, num_frames: int, preprocess) -> torch.Tenso
     rotation = _get_rotation(cap)
     indices = [int(i * total / num_frames) for i in range(num_frames)]
 
-    frames = []
+    pil_images: list = []
+    tensors: list    = []
     last_valid = None
+
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
         if not ret:
-            frames.append(last_valid if last_valid is not None else torch.zeros(3, 224, 224))
+            if last_valid is not None:
+                pil_images.append(pil_images[-1])
+                tensors.append(last_valid)
+            else:
+                pil_images.append(PIL.Image.new("RGB", (224, 224)))
+                tensors.append(torch.zeros(3, 224, 224))
             continue
         frame = _apply_rotation(frame, rotation)
         img = PIL.Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        t = preprocess(img)   # (C, H, W) tensor
+        t = preprocess(img)   # (C, H, W)
         last_valid = t
-        frames.append(t)
+        pil_images.append(img)
+        tensors.append(t)
 
     cap.release()
-    return torch.stack(frames, dim=0).unsqueeze(0)  # (1, N, C, H, W)
+    video_tensor = torch.stack(tensors, dim=0).unsqueeze(0)  # (1, N, C, H, W)
+    return pil_images, video_tensor
 
 
 def _encode_chunk_pe(video_path: str, model, preprocess, num_frames: int,
-                     device: str) -> torch.Tensor:
-    """Encode a video clip into a normalized embedding vector.
+                     device: str) -> tuple:
+    """Encode a video clip as a single joint embedding over all N frames.
 
     Returns:
-        Tensor (1, D).
+        (pil_images, video_emb) where video_emb is (1, D).
     """
-    video = _extract_frames(video_path, num_frames, preprocess).to(device)
+    pil_images, video = _extract_frames(video_path, num_frames, preprocess)
     with torch.no_grad():
-        emb = model.encode_video(video, normalize=True)  # (1, D)
-    return emb
+        emb = model.encode_video(video.to(device), normalize=True)  # (1, D)
+    return pil_images, emb
 
 
 def _detect_child_pe(video_emb: torch.Tensor, model, tokenizer, device: str) -> bool:
@@ -501,6 +512,122 @@ def _aggregate_domain_scores(per_chunk: list, domain: str) -> dict:
 # ------------------------------------------------------------------------------
 
 
+def save_frame_visualization(
+    pil_frames: list,
+    chunk_info: dict,
+    output_path: str,
+    thumb_size: int = 160,
+) -> None:
+    """Save a matplotlib figure showing the N sampled frames for a chunk.
+
+    Layout:
+      Row 0   — N frame thumbnails with frame index labels
+      Rows 1+ — one row per domain: domain label | per-frame best phrase + sim score
+                cells are colour-coded by similarity (white→green scale)
+
+    Args:
+        pil_frames:  List of N PIL.Image objects (RGB).
+        chunk_info:  Chunk dict from assess_pe() (has domain_scores, t_start, t_end).
+        output_path: Where to write the .png file.
+        thumb_size:  Height in pixels for the frame thumbnails.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import numpy as np
+
+    n = len(pil_frames)
+    n_domains = len(DOMAINS)
+
+    # Figure: n columns, (1 + n_domains) rows
+    fig_w = max(12, n * 2.2)
+    fig_h = 2.0 + n_domains * 0.9
+    fig, axes = plt.subplots(
+        1 + n_domains, n,
+        figsize=(fig_w, fig_h),
+        gridspec_kw={"height_ratios": [thumb_size / 72] + [0.85] * n_domains},
+    )
+    if n == 1:
+        axes = axes.reshape(-1, 1)
+
+    t_s = int(chunk_info["t_start"])
+    t_e = chunk_info["t_end"]
+    time_str = f"{t_s}s\u2013{int(t_e)}s" if t_e is not None else "full video"
+    chunk_age_vals = [v for v in chunk_info["domain_ages"].values() if v is not None]
+    chunk_age_str  = f"{sum(chunk_age_vals)/len(chunk_age_vals):.0f}mo" if chunk_age_vals else "?"
+    fig.suptitle(
+        f"Chunk {chunk_info['index']}  [{time_str}]  est. age \u2248 {chunk_age_str}",
+        fontsize=11, fontweight="bold", y=1.01,
+    )
+
+    # Row 0: frame thumbnails
+    total_frames_in_chunk = 1  # placeholder for time offset labelling
+    for fi, img in enumerate(pil_frames):
+        ax = axes[0, fi]
+        ax.imshow(img)
+        ax.set_title(f"frame {fi + 1}", fontsize=7, pad=2)
+        ax.axis("off")
+
+    # Rows 1+: per-domain similarity table
+    domain_scores = chunk_info.get("domain_scores", {})
+    for di, domain in enumerate(DOMAINS):
+        ds      = domain_scores.get(domain, {})
+        phrases = ds.get("phrases", {})
+        sims    = ds.get("similarities", {})
+        age_d   = chunk_info["domain_ages"].get(domain)
+        age_tag = f"{age_d:.0f}mo" if age_d is not None else "n/a"
+
+        for fi in range(n):
+            ax = axes[di + 1, fi]
+            ax.axis("off")
+
+            # Build text from features in this domain
+            lines = []
+            bg_sim = 0.0
+            for feat in _DOMAIN_FEATURES[domain]:
+                phrase = phrases.get(feat, "")
+                sim    = sims.get(feat, 0.0)
+                if phrase:
+                    short = phrase[:28] + "\u2026" if len(phrase) > 28 else phrase
+                    lines.append(f"{short}\n({sim:.3f})")
+                    bg_sim = max(bg_sim, sim)
+                else:
+                    lines.append("\u2014")
+
+            # Background colour: white (0) to green (0.4+)
+            intensity = min(1.0, bg_sim / 0.4)
+            bg_color  = (1 - intensity * 0.55, 1.0, 1 - intensity * 0.55)  # RGB
+
+            ax.set_facecolor(bg_color)
+            ax.patch.set_visible(True)
+
+            cell_text = "\n".join(lines)
+            ax.text(
+                0.5, 0.5, cell_text,
+                ha="center", va="center",
+                fontsize=6.5, wrap=True,
+                transform=ax.transAxes,
+            )
+
+            # Domain label only in first column
+            if fi == 0:
+                ax.set_ylabel(
+                    f"{domain}\n[{age_tag}]",
+                    fontsize=7, rotation=0, labelpad=50,
+                    va="center", ha="right",
+                )
+
+    plt.tight_layout(rect=[0.08, 0, 1, 1])
+    plt.savefig(output_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ------------------------------------------------------------------------------
+# Full assessment
+# ------------------------------------------------------------------------------
+
+
 def assess_pe(
     video_path: str,
     model,
@@ -510,6 +637,7 @@ def assess_pe(
     num_frames: int = 8,
     chunk_duration: Optional[float] = None,
     sim_threshold: float = 0.15,
+    visualize_dir: Optional[str] = None,
     debug: bool = False,
 ) -> dict:
     """Run the full PE-based developmental assessment pipeline.
@@ -531,7 +659,7 @@ def assess_pe(
         level_cache = _encode_all_levels(model, tokenizer, device)
 
         # Child detection on the full video
-        full_emb = _encode_chunk_pe(video_path, model, preprocess, num_frames, device)
+        _, full_emb = _encode_chunk_pe(video_path, model, preprocess, num_frames, device)
         child_present = _detect_child_pe(full_emb, model, tokenizer, device)
         logger.info(f"Child present: {child_present}")
 
@@ -562,7 +690,7 @@ def assess_pe(
             t_end   = (i + 1) * chunk_duration if chunk_duration else None
             logger.info(f"Segment {i + 1}/{n_chunks}: {seg}")
 
-            video_emb = _encode_chunk_pe(seg, model, preprocess, num_frames, device)
+            pil_frames, video_emb = _encode_chunk_pe(seg, model, preprocess, num_frames, device)
 
             domain_scores: dict = {}
             for domain in DOMAINS:
@@ -582,14 +710,25 @@ def assess_pe(
                 for d in DOMAINS
             )
 
-            chunk_details.append({
+            chunk_info = {
                 "index":         i + 1,
                 "t_start":       t_start,
                 "t_end":         t_end,
                 "domain_scores": domain_scores,
                 "domain_ages":   {d: domain_scores[d]["age"] for d in DOMAINS},
                 "raw_text":      raw_text,
-            })
+            }
+            chunk_details.append(chunk_info)
+
+            if visualize_dir:
+                import os
+                os.makedirs(visualize_dir, exist_ok=True)
+                vis_path = os.path.join(
+                    visualize_dir,
+                    f"chunk_{i + 1:03d}.png",
+                )
+                save_frame_visualization(pil_frames, chunk_info, vis_path)
+                logger.info(f"Frame visualization saved: {vis_path}")
 
         # Aggregate across chunks
         pe_features:  dict = {}
@@ -993,6 +1132,10 @@ Examples:
                         help="Save full result as JSON to this path.")
     parser.add_argument("--output_video", type=str, default=None,
                         help="Render PE similarity overlays onto the video and save here.")
+    parser.add_argument("--visualize_dir", type=str, default=None,
+                        help="Save per-chunk frame visualization PNGs to this directory. "
+                             "Creates one image per chunk showing the N sampled frames "
+                             "alongside per-domain similarity scores.")
     parser.add_argument("--debug", action="store_true",
                         help="Print per-chunk domain scores and similarities.")
 
@@ -1012,6 +1155,7 @@ Examples:
         num_frames=args.num_frames,
         chunk_duration=args.chunk_duration,
         sim_threshold=args.sim_threshold,
+        visualize_dir=args.visualize_dir,
         debug=args.debug,
     )
 
