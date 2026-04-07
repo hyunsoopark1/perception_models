@@ -665,22 +665,6 @@ def assess_pe(
         # Pre-encode all level descriptions once
         level_cache = _encode_all_levels(model, tokenizer, device)
 
-        # Child detection on the full video
-        _, full_emb = _encode_chunk_pe(video_path, model, preprocess, num_frames, device)
-        child_present = _detect_child_pe(full_emb, model, tokenizer, device)
-        logger.info(f"Child present: {child_present}")
-
-        if not child_present:
-            return {
-                "video_path":         video_path,
-                "child_present":      False,
-                "pe_features":        {},
-                "plm_features":       {},
-                "domain_ages":        {},
-                "overall_age_months": None,
-                "stage_distribution": None,
-            }
-
         # Determine segments
         if chunk_duration:
             chunk_paths = _split_into_chunks(video_path, chunk_duration)
@@ -844,19 +828,10 @@ def print_report(result: dict) -> None:
     sep  = "=" * 62
     thin = "-" * 62
 
-    child_present = result.get("child_present", False)
-    child_str = "YES" if child_present else "NO"
-
     print(f"\n{sep}")
     print(f"  PE-based Developmental Assessment")
     print(f"  {Path(result['video_path']).name}")
-    print(f"  Child present: {child_str}")
     print(sep)
-
-    if not child_present:
-        print("\n  No child detected in this video.\n")
-        print(f"{sep}\n")
-        return
 
     chunks = result.get("chunk_details", [])
     if len(chunks) > 1:
