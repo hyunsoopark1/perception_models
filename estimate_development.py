@@ -124,12 +124,13 @@ _FEATURE_LEVELS: dict = {
         (0.90, "creates elaborate pretend play with sequences"),
     ],
     # duration: 0.00=0mo  0.20=12mo  0.40=18mo  0.65=24mo  0.90=36mo
+    # Descriptions are snapshot-observable (no absolute time durations).
     "duration": [
-        (0.00, "disengages in under 10 seconds"),
-        (0.20, "attends for 30 to 60 seconds before moving on"),
-        (0.40, "plays with a single toy for 1 to 2 minutes"),
-        (0.65, "sustains one activity for 3 to 5 minutes"),
-        (0.90, "stays with one activity for 5 to 10 or more minutes"),
+        (0.00, "no focused attention, immediately looks away from objects"),
+        (0.20, "briefly attends to an object then quickly shifts attention"),
+        (0.40, "engaged with a single object or activity"),
+        (0.65, "deeply absorbed in play, not distracted by surroundings"),
+        (0.90, "fully immersed in complex activity with intense concentration"),
     ],
     # goal_directed: 0.00=0mo  0.25=12mo  0.45=18mo  0.70=24mo  0.95=36mo
     "goal_directed": [
@@ -137,7 +138,7 @@ _FEATURE_LEVELS: dict = {
         (0.25, "persists toward a specific toy despite obstacles"),
         (0.45, "completes a simple cause and effect task"),
         (0.70, "solves a simple problem to obtain a toy"),
-        (0.95, "plans and carries out multi-step sequences"),
+        (0.95, "executes a visible multi-step plan toward a goal"),
     ],
     # social_engagement: 0.00=0mo  0.35=~10mo  0.50=12mo  0.65=18mo  0.75=24mo  0.90=36mo
     "social_engagement": [
@@ -155,7 +156,7 @@ _FEATURE_LEVELS: dict = {
         (0.80, "checks back frequently and returns to caregiver when unsure"),
         (0.65, "seeks caregiver in new situations but accepts brief separation"),
         (0.45, "plays near caregiver but ventures away independently"),
-        (0.20, "plays independently for long periods without checking back"),
+        (0.20, "plays without checking back on the caregiver"),
     ],
     # verbal: 0.00=0mo  0.10=~6mo  0.20=12mo  0.40=18mo  0.70=24mo  0.95=36mo
     "verbal": [
