@@ -532,7 +532,10 @@ def load_consolidated_model_and_tokenizer(ckpt):
     # instead of holding the full model in CPU RAM while .cuda() copies it.
     model = model.cuda()
     load_consolidated_checkpoint(model, ckpt_path)
-    model = model.eval()
+    # init_tensors() inside load_consolidated_checkpoint creates new nn.Parameter
+    # objects (positional embeddings, LayerScale gammas, etc.) with no device
+    # specified, so they land on CPU.  A second .cuda() sweeps them to GPU.
+    model = model.cuda().eval()
 
     return model, tokenizer, config
 
