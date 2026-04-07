@@ -525,6 +525,16 @@ def load_consolidated_model_and_tokenizer(ckpt):
     finally:
         torch.set_default_dtype(prev_dtype)
 
+    # set_default_dtype causes buffers (RoPE embeddings, masks, etc.) to also
+    # be created in param_dtype, but the model's compute expects them in float32.
+    # Convert all non-parameter buffers back to float32; parameters stay in
+    # param_dtype (bf16/fp16) which is what we want for memory efficiency.
+    if param_dtype != torch.float32:
+        for module in model.modules():
+            for buf_name, buf in list(module._buffers.items()):
+                if buf is not None and buf.dtype == param_dtype:
+                    module._buffers[buf_name] = buf.float()
+
     # Move to CUDA *before* loading weights.  With mmap=True in
     # load_consolidated_checkpoint the state dict is memory-mapped, so only
     # one parameter's pages are in CPU RAM at a time as they are copied into
