@@ -543,9 +543,12 @@ def load_consolidated_model_and_tokenizer(ckpt):
     model = model.cuda()
     load_consolidated_checkpoint(model, ckpt_path)
     # init_tensors() inside load_consolidated_checkpoint creates new nn.Parameter
-    # objects (positional embeddings, LayerScale gammas, etc.) with no device
-    # specified, so they land on CPU.  A second .cuda() sweeps them to GPU.
+    # objects after the default dtype is restored to float32, leaving mixed dtypes.
+    # A second .cuda() sweeps any CPU tensors to GPU, then we normalize all
+    # parameter dtypes to param_dtype so the model is uniformly bf16/fp16.
     model = model.cuda().eval()
+    for param in model.parameters():
+        param.data = param.data.to(dtype=param_dtype)
 
     return model, tokenizer, config
 
