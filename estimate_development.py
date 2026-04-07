@@ -49,6 +49,8 @@ _PROMPT_CHILD = (
     "and active in this video? Answer only: yes or no."
 )
 
+_PROMPT_DESCRIBE = "Describe what is happening in this video in 2-3 sentences."
+
 # Per-domain prompts are built at runtime from _FEATURE_LEVELS (see below).
 
 # ------------------------------------------------------------------------------
@@ -678,6 +680,12 @@ def assess(video_path: str, model, tokenizer, config,
             t_end   = (i + 1) * chunk_duration if chunk_duration else None
             logger.info(f"Segment {i + 1}/{n_chunks}: {seg}")
 
+            description = _run_plm_text(
+                seg, _PROMPT_DESCRIBE, model, tokenizer, config,
+                num_frames=num_frames, temperature=temperature,
+                max_gen_len=max_gen_len,
+            )
+
             domain_scores: dict = {}
             for domain in DOMAINS:
                 ds = _assess_domain(
@@ -702,6 +710,7 @@ def assess(video_path: str, model, tokenizer, config,
                 "index":         i + 1,
                 "t_start":       t_start,
                 "t_end":         t_end,
+                "description":   description,
                 "domain_scores": domain_scores,
                 "domain_ages":   {d: domain_scores[d]["age"] for d in DOMAINS},
                 "raw_text":      raw_text,
@@ -795,6 +804,12 @@ def _print_chunk_timeline(chunk_details: list) -> None:
         print(f"\n  {sep}")
         print(f"  Chunk {c['index']}  [{time_str}]")
         print(f"  {sep}")
+
+        description = c.get("description", "")
+        if description:
+            print(f"\n  Description:")
+            for line in description.strip().splitlines():
+                print(f"    {line}")
 
         domain_scores = c.get("domain_scores", {})
         domain_ages   = c.get("domain_ages",   {})
