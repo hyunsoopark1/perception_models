@@ -431,11 +431,13 @@ def _score_domain_pe(
     domain: str,
     level_cache: dict,
     device: str,
+    sim_threshold: float = 0.15,
 ) -> dict:
     """Score one domain for one chunk using cosine similarity.
 
     For each feature the level with the highest cosine similarity to the video
-    embedding is always selected (no threshold — argmax is always reported).
+    is selected.  If the maximum similarity falls below sim_threshold the
+    feature is treated as not confidently visible and omitted.
 
     Returns:
         {
@@ -453,10 +455,13 @@ def _score_domain_pe(
     with torch.no_grad():
         for feat in feats:
             levels    = _FEATURE_LEVELS[feat]
-            text_embs = level_cache[feat]              # (M, D) on device
-            sims      = (video_emb @ text_embs.T).squeeze(0)  # (M,)
+            text_embs = level_cache[feat]              # (N, D) on device
+            sims      = (video_emb @ text_embs.T).squeeze(0)  # (N,)
             best_idx  = int(sims.argmax().item())
             best_sim  = float(sims[best_idx].item())
+
+            if best_sim < sim_threshold:
+                continue
 
             score, phrase = levels[best_idx]
             features_out[feat] = score
@@ -637,6 +642,7 @@ def assess_pe(
     device: str,
     num_frames: int = 8,
     chunk_duration: Optional[float] = None,
+    sim_threshold: float = 0.15,
     frames_video: Optional[str] = None,
     debug: bool = False,
 ) -> dict:
@@ -695,7 +701,7 @@ def assess_pe(
 
             domain_scores: dict = {}
             for domain in DOMAINS:
-                ds = _score_domain_pe(video_emb, domain, level_cache, device)
+                ds = _score_domain_pe(video_emb, domain, level_cache, device, sim_threshold)
                 domain_scores[domain] = ds
                 if debug:
                     age_d = ds["age"]
@@ -1119,6 +1125,8 @@ Examples:
     parser.add_argument("--chunk_duration", type=float, default=None,
                         help="Split video into chunks of this many seconds. "
                              "Omit to use the full video as one chunk.")
+    parser.add_argument("--sim_threshold", type=float, default=0.15,
+                        help="Min cosine similarity to accept a feature match (default: 0.15).")
     parser.add_argument("--json_only", action="store_true",
                         help="Print only the JSON result (no formatted report).")
     parser.add_argument("--save", type=str, default=None,
@@ -1146,6 +1154,7 @@ Examples:
         device=device,
         num_frames=args.num_frames,
         chunk_duration=args.chunk_duration,
+        sim_threshold=args.sim_threshold,
         frames_video=args.frames_video,
         debug=args.debug,
     )
