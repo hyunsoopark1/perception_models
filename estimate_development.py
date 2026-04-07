@@ -94,9 +94,9 @@ _FEATURE_LEVELS: dict = {
         (0.00, "reflexive grasp only, no voluntary reaching"),
         (0.15, "reaches for and holds toys with whole hand"),
         (0.30, "picks up small objects with thumb and index finger"),
-        (0.50, "stacks 2 to 4 blocks or uses spoon messily"),
-        (0.70, "stacks 6 or more blocks and draws lines"),
-        (0.95, "draws a circle and uses a fork"),
+        (0.50, "stacks 2 to 4 blocks"),
+        (0.70, "stacks 6 or more blocks"),
+        (0.95, "draws a circle or cuts with scissors"),
     ],
     # stability: 0.00=0mo  0.20=~6mo  0.40=12mo  0.65=18mo  0.85=24mo  1.00=36mo
     "stability": [
@@ -104,22 +104,22 @@ _FEATURE_LEVELS: dict = {
         (0.20, "sits with support but cannot sit alone"),
         (0.40, "pulls to stand and stands briefly without support"),
         (0.65, "walks steadily without falling"),
-        (0.85, "runs without falling and climbs stairs"),
+        (0.85, "runs without falling"),
         (1.00, "balances on one foot for 2 or more seconds"),
     ],
     # independence: 0.00=0mo  0.10=12mo  0.30=18mo  0.55=24mo  0.85=36mo
     "independence": [
         (0.00, "fully dependent, caregiver handles all feeding and care"),
         (0.10, "feeds self with finger foods"),
-        (0.30, "attempts spoon and open cup, spills often"),
-        (0.55, "removes simple clothing and washes hands with prompting"),
+        (0.30, "attempts to use spoon, spills often"),
+        (0.55, "removes simple clothing independently"),
         (0.85, "dresses self and uses toilet with minimal help"),
     ],
     # initiative: 0.00=0mo  0.15=12mo  0.35=18mo  0.60=24mo  0.90=36mo
     "initiative": [
         (0.00, "passive, no self-directed activity"),
         (0.15, "explores objects by mouthing, banging, or shaking"),
-        (0.35, "retrieves hidden toy and starts simple repetitive play"),
+        (0.35, "retrieves a hidden toy and starts simple repetitive play"),
         (0.60, "chooses a toy and begins play independently"),
         (0.90, "creates elaborate pretend play with sequences"),
     ],
@@ -135,15 +135,15 @@ _FEATURE_LEVELS: dict = {
     "goal_directed": [
         (0.00, "random exploration with no visible goal"),
         (0.25, "persists toward a specific toy despite obstacles"),
-        (0.45, "completes simple cause and effect tasks"),
-        (0.70, "solves simple problems to obtain a toy"),
+        (0.45, "completes a simple cause and effect task"),
+        (0.70, "solves a simple problem to obtain a toy"),
         (0.95, "plans and carries out multi-step sequences"),
     ],
     # social_engagement: 0.00=0mo  0.35=~10mo  0.50=12mo  0.65=18mo  0.75=24mo  0.90=36mo
     "social_engagement": [
         (0.00, "no visible response to people or voices"),
         (0.35, "responds to own name and smiles at familiar faces"),
-        (0.50, "waves bye-bye and offers or shows toys to an adult"),
+        (0.50, "waves bye-bye or shows toys to an adult"),
         (0.65, "plays alongside other children without direct interaction"),
         (0.75, "plays simple interactive games with others"),
         (0.90, "takes turns and cooperates in group play with peers"),
@@ -161,16 +161,16 @@ _FEATURE_LEVELS: dict = {
     "verbal": [
         (0.00, "crying or cooing only, no babbling"),
         (0.10, "babbling with repeated syllables"),
-        (0.20, "says 1 to 3 real words such as mama, dada, or no"),
-        (0.40, "uses 10 to 50 single words"),
-        (0.70, "two-word combinations such as more milk or daddy go"),
-        (0.95, "speaks in sentences of 3 or more words and asks questions"),
+        (0.20, "says 1 to 3 real words"),
+        (0.40, "uses 10 to 50 different single words"),
+        (0.70, "combines two words together"),
+        (0.95, "speaks in sentences of 3 or more words"),
     ],
     # gesture: 0.00=0mo  0.35=~10mo  0.50=12mo  0.75=18mo  0.85=24mo  0.90=36mo
     "gesture": [
         (0.00, "no intentional gestures"),
-        (0.35, "reaches toward objects or people and waves arms"),
-        (0.50, "waves bye-bye, claps, or shakes head for no"),
+        (0.35, "reaches toward objects or people"),
+        (0.50, "waves bye-bye or claps hands"),
         (0.75, "points to request or show something to an adult"),
         (0.85, "combines pointing or gestures with spoken words"),
         (0.90, "uses varied gestures fluently together with speech"),
@@ -217,12 +217,15 @@ def _build_domain_prompt(domain: str) -> str:
     answer_block = "\n".join(f"{_feat_label(feat)}: <option>" for feat in features)
 
     return (
-        f"Watch this child. For each {desc} skill, select the ONE option that "
-        f"best matches what you observe. Options run from youngest (left, ◄) to "
-        f"most developed (right, ►). Pick the rightmost option the child "
-        f"clearly demonstrates.\n\n"
+        f"Watch this child carefully. For each {desc} skill below, select the "
+        f"ONE option that is DIRECTLY VISIBLE in the video right now.\n"
+        f"Rules:\n"
+        f"- Only choose a level if you can SEE that exact behavior happening.\n"
+        f"- Do NOT infer or assume based on the child's age or other skills.\n"
+        f"- If the behavior is not visible in this clip, write: not visible\n"
+        f"Options run from youngest (left, ◄) to most developed (right, ►).\n\n"
         + "\n".join(level_lines)
-        + f"\n\nReply in this exact format:\n{answer_block}"
+        + f"\n\nReply in this exact format (one line per skill):\n{answer_block}"
     )
 
 
@@ -301,6 +304,9 @@ def _parse_domain_output(domain: str, text: str) -> dict:
         if not m:
             continue
         answer = m.group(1).strip().rstrip(".").lower()
+        # Explicit "not visible" means the feature is unobservable in this clip
+        if answer in ("not visible", "not observed", "none", "n/a"):
+            continue
         for score, phrase in _FEATURE_LEVELS[feat]:
             if answer == phrase.lower():
                 result[feat] = (score, phrase)
