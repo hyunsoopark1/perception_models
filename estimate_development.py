@@ -49,7 +49,11 @@ _PROMPT_CHILD = (
     "and active in this video? Answer only: yes or no."
 )
 
-_PROMPT_DESCRIBE = "Describe what is happening in this video in 2-3 sentences."
+_PROMPT_DESCRIBE = (
+    "Describe the state of the child in this video in exactly three sentences. "
+    "Focus on what the child is doing, how they are moving, and how they are interacting "
+    "with objects or people around them."
+)
 
 # Per-domain prompts are built at runtime from _FEATURE_LEVELS (see below).
 
