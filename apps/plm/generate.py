@@ -511,18 +511,23 @@ def load_consolidated_model_and_tokenizer(ckpt):
         patch_size=config.model.vision_model.patch_size,
     )
 
-    # Build model and load the consolidated checkpoints.
-    # mmap=True in load_consolidated_checkpoint keeps peak CPU RAM at ~1x
-    # model size (state dict is memory-mapped, not fully copied into RAM).
-    model_args = dataclass_from_dict(LMTransformerArgs, config.model, strict=False)
-    model = LMTransformer(model_args)
-    load_consolidated_checkpoint(model, ckpt_path)
+    # Determine target dtype before model init so we can allocate in the
+    # right dtype from the start.  An 8B model in float32 = 32 GB CPU RAM;
+    # in bf16 = 16 GB — the difference between fitting on g6e.xlarge or OOM.
     param_dtype = dict(fp32=torch.float32, fp16=torch.float16, bf16=torch.bfloat16)[
         config.distributed.model_dtype
     ]
+
+    model_args = dataclass_from_dict(LMTransformerArgs, config.model, strict=False)
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(param_dtype)
+    try:
+        model = LMTransformer(model_args)
+    finally:
+        torch.set_default_dtype(prev_dtype)
+
+    load_consolidated_checkpoint(model, ckpt_path)
     model = model.cuda().eval()
-    for param in model.parameters():
-        param.data = param.data.to(dtype=param_dtype)
 
     return model, tokenizer, config
 
