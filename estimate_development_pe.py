@@ -512,115 +512,121 @@ def _aggregate_domain_scores(per_chunk: list, domain: str) -> dict:
 # ------------------------------------------------------------------------------
 
 
-def save_frame_visualization(
-    pil_frames: list,
-    chunk_info: dict,
+def render_frames_video(
+    sampled: list,
     output_path: str,
-    thumb_size: int = 160,
+    frame_duration: float = 2.0,
+    fps: int = 10,
 ) -> None:
-    """Save a matplotlib figure showing the N sampled frames for a chunk.
+    """Write a video showing every sampled frame for every chunk with PE score overlay.
 
-    Layout:
-      Row 0   — N frame thumbnails with frame index labels
-      Rows 1+ — one row per domain: domain label | per-frame best phrase + sim score
-                cells are colour-coded by similarity (white→green scale)
+    Each sampled frame is held for `frame_duration` seconds. The left panel shows
+    the raw frame; a semi-transparent right panel lists per-domain best phrase +
+    similarity score for the chunk that frame belongs to.
 
     Args:
-        pil_frames:  List of N PIL.Image objects (RGB).
-        chunk_info:  Chunk dict from assess_pe() (has domain_scores, t_start, t_end).
-        output_path: Where to write the .png file.
-        thumb_size:  Height in pixels for the frame thumbnails.
+        sampled:        List of (pil_frames, chunk_info) tuples, one per chunk.
+        output_path:    Output MP4 path.
+        frame_duration: Seconds each sampled frame is held (default 2 s).
+        fps:            Output video frame rate (default 10 fps).
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
+    import cv2
     import numpy as np
 
-    n = len(pil_frames)
-    n_domains = len(DOMAINS)
+    if not sampled:
+        logger.warning("render_frames_video: no frames to render.")
+        return
 
-    # Figure: n columns, (1 + n_domains) rows
-    fig_w = max(12, n * 2.2)
-    fig_h = 2.0 + n_domains * 0.9
-    fig, axes = plt.subplots(
-        1 + n_domains, n,
-        figsize=(fig_w, fig_h),
-        gridspec_kw={"height_ratios": [thumb_size / 72] + [0.85] * n_domains},
-    )
-    if n == 1:
-        axes = axes.reshape(-1, 1)
+    # Determine output canvas size from the first available PIL image
+    first_img = sampled[0][0][0]  # pil_frames[0] of first chunk
+    W, H = first_img.size
+    # Keep aspect ratio; cap height at 720 for readability
+    scale = min(1.0, 720 / H)
+    out_w = int(W * scale)
+    out_h = int(H * scale)
 
-    t_s = int(chunk_info["t_start"])
-    t_e = chunk_info["t_end"]
-    time_str = f"{t_s}s\u2013{int(t_e)}s" if t_e is not None else "full video"
-    chunk_age_vals = [v for v in chunk_info["domain_ages"].values() if v is not None]
-    chunk_age_str  = f"{sum(chunk_age_vals)/len(chunk_age_vals):.0f}mo" if chunk_age_vals else "?"
-    fig.suptitle(
-        f"Chunk {chunk_info['index']}  [{time_str}]  est. age \u2248 {chunk_age_str}",
-        fontsize=11, fontweight="bold", y=1.01,
-    )
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
 
-    # Row 0: frame thumbnails
-    total_frames_in_chunk = 1  # placeholder for time offset labelling
-    for fi, img in enumerate(pil_frames):
-        ax = axes[0, fi]
-        ax.imshow(img)
-        ax.set_title(f"frame {fi + 1}", fontsize=7, pad=2)
-        ax.axis("off")
+    n_repeats   = max(1, int(fps * frame_duration))
+    n_chunks    = len(sampled)
+    fscale      = max(0.45, min(0.75, out_w / 1280 * 0.75))
+    line_h      = int(fscale * 38)
+    pad         = 8
 
-    # Rows 1+: per-domain similarity table
-    domain_scores = chunk_info.get("domain_scores", {})
-    for di, domain in enumerate(DOMAINS):
-        ds      = domain_scores.get(domain, {})
-        phrases = ds.get("phrases", {})
-        sims    = ds.get("similarities", {})
-        age_d   = chunk_info["domain_ages"].get(domain)
-        age_tag = f"{age_d:.0f}mo" if age_d is not None else "n/a"
+    # BGR colour helpers
+    COL_HDR  = (0, 220, 255)   # chunk / frame header
+    COL_TXT  = (255, 255, 255) # domain text
+    COL_NONE = (120, 120, 120) # "none"
 
-        for fi in range(n):
-            ax = axes[di + 1, fi]
-            ax.axis("off")
+    def _put(img, text, pos, scale, color, thickness=1):
+        x, y = pos
+        cv2.putText(img, text, (x + 1, y + 1), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
+        cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, color, thickness, cv2.LINE_AA)
 
-            # Build text from features in this domain
-            lines = []
-            bg_sim = 0.0
-            for feat in _DOMAIN_FEATURES[domain]:
-                phrase = phrases.get(feat, "")
-                sim    = sims.get(feat, 0.0)
-                if phrase:
-                    short = phrase[:28] + "\u2026" if len(phrase) > 28 else phrase
-                    lines.append(f"{short}\n({sim:.3f})")
-                    bg_sim = max(bg_sim, sim)
-                else:
-                    lines.append("\u2014")
+    for pil_frames, chunk_info in sampled:
+        n_frames      = len(pil_frames)
+        chunk_idx     = chunk_info["index"]
+        t_s           = int(chunk_info["t_start"])
+        t_e           = chunk_info["t_end"]
+        time_str      = f"{t_s}s-{int(t_e)}s" if t_e is not None else "full"
+        domain_scores = chunk_info.get("domain_scores", {})
+        domain_ages   = chunk_info.get("domain_ages",   {})
 
-            # Background colour: white (0) to green (0.4+)
-            intensity = min(1.0, bg_sim / 0.4)
-            bg_color  = (1 - intensity * 0.55, 1.0, 1 - intensity * 0.55)  # RGB
+        for fi, pil_img in enumerate(pil_frames):
+            # Convert PIL → BGR numpy, resize to canvas
+            bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            bgr = cv2.resize(bgr, (out_w, out_h))
 
-            ax.set_facecolor(bg_color)
-            ax.patch.set_visible(True)
+            # --- right-side semi-transparent score panel ---
+            panel_lines = 1 + sum(
+                len(_DOMAIN_FEATURES[d]) for d in DOMAINS
+            ) + len(DOMAINS)                              # header + features + domain labels
+            panel_h = panel_lines * line_h + pad * 2
+            panel_w = int(out_w * 0.52)
+            px0     = out_w - panel_w
+            overlay = bgr.copy()
+            cv2.rectangle(overlay, (px0, 0), (out_w, panel_h), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.60, bgr, 0.40, 0, bgr)
 
-            cell_text = "\n".join(lines)
-            ax.text(
-                0.5, 0.5, cell_text,
-                ha="center", va="center",
-                fontsize=6.5, wrap=True,
-                transform=ax.transAxes,
-            )
+            # Header line
+            header = (f"Chunk {chunk_idx}/{n_chunks}  [{time_str}]"
+                      f"  frame {fi + 1}/{n_frames}")
+            _put(bgr, header, (px0 + pad, pad + line_h), fscale, COL_HDR)
 
-            # Domain label only in first column
-            if fi == 0:
-                ax.set_ylabel(
-                    f"{domain}\n[{age_tag}]",
-                    fontsize=7, rotation=0, labelpad=50,
-                    va="center", ha="right",
-                )
+            # Per-domain rows
+            y = pad + line_h * 2
+            for domain in DOMAINS:
+                ds      = domain_scores.get(domain, {})
+                phrases = ds.get("phrases",     {})
+                sims    = ds.get("similarities", {})
+                age_d   = domain_ages.get(domain)
+                age_str = f"{age_d:.0f}mo" if age_d is not None else "n/a"
 
-    plt.tight_layout(rect=[0.08, 0, 1, 1])
-    plt.savefig(output_path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
+                dom_label = f"{_DOMAIN_ABBR[domain]} [{age_str}]"
+                _put(bgr, dom_label, (px0 + pad, y), fscale * 0.9, COL_HDR)
+                y += line_h
+
+                for feat in _DOMAIN_FEATURES[domain]:
+                    phrase = phrases.get(feat, "")
+                    sim    = sims.get(feat)
+                    if phrase and sim is not None:
+                        txt = f"  {feat[:5]}: {phrase[:26]}  ({sim:.3f})"
+                        col = COL_TXT
+                    else:
+                        txt = f"  {feat[:5]}: —"
+                        col = COL_NONE
+                    _put(bgr, txt, (px0 + pad, y), fscale * 0.75, col)
+                    y += line_h
+
+            # Write the same canvas n_repeats times
+            for _ in range(n_repeats):
+                writer.write(bgr)
+
+    writer.release()
+    logger.info(f"Sampled-frames video saved: {output_path}")
 
 
 # ------------------------------------------------------------------------------
@@ -637,7 +643,7 @@ def assess_pe(
     num_frames: int = 8,
     chunk_duration: Optional[float] = None,
     sim_threshold: float = 0.15,
-    visualize_dir: Optional[str] = None,
+    frames_video: Optional[str] = None,
     debug: bool = False,
 ) -> dict:
     """Run the full PE-based developmental assessment pipeline.
@@ -653,6 +659,7 @@ def assess_pe(
     import os
 
     chunk_paths: list = []
+    sampled: list    = []   # (pil_frames, chunk_info) for frames_video
 
     try:
         # Pre-encode all level descriptions once
@@ -719,16 +726,7 @@ def assess_pe(
                 "raw_text":      raw_text,
             }
             chunk_details.append(chunk_info)
-
-            if visualize_dir:
-                import os
-                os.makedirs(visualize_dir, exist_ok=True)
-                vis_path = os.path.join(
-                    visualize_dir,
-                    f"chunk_{i + 1:03d}.png",
-                )
-                save_frame_visualization(pil_frames, chunk_info, vis_path)
-                logger.info(f"Frame visualization saved: {vis_path}")
+            sampled.append((pil_frames, chunk_info))
 
         # Aggregate across chunks
         pe_features:  dict = {}
@@ -759,6 +757,9 @@ def assess_pe(
         observed_ages = [a for a in domain_ages.values() if a is not None]
         overall_age   = sum(observed_ages) / len(observed_ages) if observed_ages else None
         stage_dist    = stage_distribution(overall_age) if overall_age is not None else None
+
+        if frames_video and sampled:
+            render_frames_video(sampled, frames_video)
 
         return {
             "video_path":         video_path,
@@ -1132,10 +1133,9 @@ Examples:
                         help="Save full result as JSON to this path.")
     parser.add_argument("--output_video", type=str, default=None,
                         help="Render PE similarity overlays onto the video and save here.")
-    parser.add_argument("--visualize_dir", type=str, default=None,
-                        help="Save per-chunk frame visualization PNGs to this directory. "
-                             "Creates one image per chunk showing the N sampled frames "
-                             "alongside per-domain similarity scores.")
+    parser.add_argument("--frames_video", type=str, default=None,
+                        help="Save a video of the N sampled frames per chunk with "
+                             "per-domain PE similarity scores overlaid (MP4).")
     parser.add_argument("--debug", action="store_true",
                         help="Print per-chunk domain scores and similarities.")
 
@@ -1155,7 +1155,7 @@ Examples:
         num_frames=args.num_frames,
         chunk_duration=args.chunk_duration,
         sim_threshold=args.sim_threshold,
-        visualize_dir=args.visualize_dir,
+        frames_video=args.frames_video,
         debug=args.debug,
     )
 
