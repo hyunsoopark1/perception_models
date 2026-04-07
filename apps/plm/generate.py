@@ -511,9 +511,8 @@ def load_consolidated_model_and_tokenizer(ckpt):
         patch_size=config.model.vision_model.patch_size,
     )
 
-    # Determine target dtype before model init so we can allocate in the
-    # right dtype from the start.  An 8B model in float32 = 32 GB CPU RAM;
-    # in bf16 = 16 GB — the difference between fitting on g6e.xlarge or OOM.
+    # Determine target dtype first so model is allocated in the right dtype.
+    # 8B params in float32 = 32 GB CPU RAM; in bf16 = 16 GB.
     param_dtype = dict(fp32=torch.float32, fp16=torch.float16, bf16=torch.bfloat16)[
         config.distributed.model_dtype
     ]
@@ -526,8 +525,14 @@ def load_consolidated_model_and_tokenizer(ckpt):
     finally:
         torch.set_default_dtype(prev_dtype)
 
+    # Move to CUDA *before* loading weights.  With mmap=True in
+    # load_consolidated_checkpoint the state dict is memory-mapped, so only
+    # one parameter's pages are in CPU RAM at a time as they are copied into
+    # the already-resident GPU model.  This keeps peak CPU RAM near zero
+    # instead of holding the full model in CPU RAM while .cuda() copies it.
+    model = model.cuda()
     load_consolidated_checkpoint(model, ckpt_path)
-    model = model.cuda().eval()
+    model = model.eval()
 
     return model, tokenizer, config
 
