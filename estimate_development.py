@@ -770,37 +770,59 @@ def _bar(value: float, width: int = 20) -> str:
 
 
 def _print_chunk_timeline(chunk_details: list) -> None:
-    """Print a compact table showing what PLM observed in each chunk."""
+    """Print raw PLM output and parsed description for every domain in each chunk."""
     if not chunk_details:
         return
 
-    n = len(chunk_details)
-    thin = "-" * 62
-    domain_abbr = {"motor": "Motor", "autonomy": "Auto",
-                   "attention": "Attn", "interaction": "Inter", "language": "Lang"}
+    n    = len(chunk_details)
+    sep  = "=" * 66
+    thin = "-" * 66
 
-    print(f"\n  Per-chunk descriptions ({n} chunk{'s' if n > 1 else ''})")
-    print(f"  {thin}")
+    print(f"\n  Per-chunk PLM output ({n} chunk{'s' if n > 1 else ''})")
 
     for c in chunk_details:
         t_s = int(c["t_start"])
         t_e = int(c["t_end"]) if c["t_end"] is not None else "?"
-        time_str = f"{t_s:3d}s – {t_e:3d}s" if c["t_end"] is not None else "full video"
-        print(f"  Chunk {c['index']:>2}  [{time_str}]")
+        time_str = f"{t_s}s – {t_e}s" if c["t_end"] is not None else "full video"
+
+        print(f"\n  {sep}")
+        print(f"  Chunk {c['index']}  [{time_str}]")
+        print(f"  {sep}")
 
         domain_scores = c.get("domain_scores", {})
-        domain_ages   = c.get("domain_ages", {})
+        domain_ages   = c.get("domain_ages",   {})
+
         for domain in DOMAINS:
-            label   = f"  {'':<11}{domain_abbr[domain]:<6}: "
+            ds      = domain_scores.get(domain, {})
+            phrases = ds.get("phrases",  {})
             age_d   = domain_ages.get(domain)
-            age_tag = f"  [{age_d:.0f}mo]" if age_d is not None else ""
-            phrases = domain_scores.get(domain, {}).get("phrases", {})
-            if phrases:
-                summary = ", ".join(f"{f}={p}" for f, p in phrases.items())
-                summary = summary if len(summary) <= 44 else summary[:41] + "..."
-                print(f"{label}{summary}{age_tag}")
+            age_tag = f"  [{age_d:.0f}mo]" if age_d is not None else "  [n/a]"
+
+            print(f"\n  [{domain.upper()}]{age_tag}")
+            print(f"  {thin}")
+
+            # Raw PLM text (all runs when num_runs > 1)
+            raw_list = ds.get("raw_outputs", [])
+            if raw_list:
+                for run_i, raw in enumerate(raw_list):
+                    if len(raw_list) > 1:
+                        print(f"  PLM output (run {run_i + 1}):")
+                    else:
+                        print("  PLM output:")
+                    for line in raw.strip().splitlines():
+                        print(f"    {line}")
             else:
-                print(f"{label}—{age_tag}")
+                print("  PLM output:  (none)")
+
+            # Parsed level per feature
+            print("  Parsed description:")
+            if phrases:
+                for feat, phrase in phrases.items():
+                    score = ds.get("features", {}).get(feat)
+                    score_str = f"  (score {score:.2f})" if score is not None else ""
+                    print(f"    {_feat_label(feat)}: {phrase}{score_str}")
+            else:
+                print("    (no levels matched)")
 
         print()
 
