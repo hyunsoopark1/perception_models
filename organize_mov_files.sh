@@ -2,10 +2,10 @@
 #
 # organize_mov_files.sh
 #
-# Find all .MOV files under a source directory whose duration exceeds 5
-# seconds and move them into a destination directory, renaming each file as
-# YYYY-MM-DD-NUM.MOV. NUM is an incremental counter (starting at 1) used to
-# disambiguate multiple videos that share the same creation date.
+# Find all .MOV files under a source directory (recursively) whose duration
+# exceeds 5 seconds and copy them into a destination directory, renaming each
+# file as YYYY-MM-DD-NUM.MOV. NUM is an incremental counter (starting at 1)
+# used to disambiguate multiple videos that share the same creation date.
 #
 # Usage:
 #   ./organize_mov_files.sh <source_dir> <destination_dir>
@@ -72,7 +72,7 @@ get_creation_date() {
     fi
 }
 
-moved=0
+copied=0
 skipped=0
 
 # Use -print0 / read -d '' to safely handle filenames with spaces or newlines.
@@ -105,9 +105,9 @@ while IFS= read -r -d '' file; do
     done
 
     new_path="$DEST_DIR/${date_str}-${num}.MOV"
-    echo "Move: $file -> $new_path"
-    mv -- "$file" "$new_path"
-    moved=$((moved + 1))
-done < <(find "$SRC_DIR" -type f -iname "*.mov" -print0)
+    echo "Copy: $file -> $new_path"
+    cp -p -- "$file" "$new_path"
+    copied=$((copied + 1))
+done < <(find "$SRC_DIR" -type f -name "*.MOV" -print0)
 
-echo "Done. Moved: $moved, Skipped: $skipped."
+echo "Done. Copied: $copied, Skipped: $skipped."
