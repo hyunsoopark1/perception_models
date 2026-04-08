@@ -5,15 +5,18 @@ Developmental stage estimator — description-first pipeline.
 Pipeline (per chunk):
   1. PLM Call 1 : Detect whether a child is visible (yes / no).
   2. PLM Call 2 : Generate a free-form behavioral description of the child.
-  3. Semantic match: for each developmental feature, find the vocabulary phrase
-                     most semantically similar to the description.
-                     No additional PLM calls — pure text similarity.
-  4. Inverse-interpolation of CDC milestone curves yields age estimates.
-  5. A soft S0-S3 stage distribution is computed and a formatted report printed.
+  3. PLM Calls 3+: For each domain, feed the description back into the prompt
+                   alongside the video and ask PLM to select ONE vocabulary
+                   level.  The description grounds the matching (less ambiguity,
+                   no majority voting needed).
+  4. Parse, aggregate across chunks, inverse-interpolate ages, print report.
 
 Compared with estimate_development.py:
-  PLM calls per chunk:  N_domains × N_runs  →  1 (description only)
-  Domain scoring:       model-selected exact phrase → semantic similarity match
+  - The description (step 2) is generated first and embedded in every
+    subsequent domain prompt as explicit context.
+  - num_runs is dropped: the grounded description makes a single call
+    reliable enough that majority voting adds little value.
+  - PLM calls per chunk: N_domains × N_runs  →  1 + N_domains
 
 Usage:
     python estimate_development_desc.py --video clip.mp4
@@ -46,7 +49,8 @@ from estimate_development import (
     _score_to_age,
     domain_age,
     stage_distribution,
-    # aggregation across chunks
+    # PLM output parsing & aggregation
+    _parse_domain_output,
     _aggregate_domain_scores,
     # video utilities
     _split_into_chunks,
@@ -84,106 +88,85 @@ _PROMPT_DESCRIBE_BEHAVIOR = (
 
 
 # ------------------------------------------------------------------------------
-# Semantic matching — description → vocabulary phrase
+# Description-grounded domain prompt builder
 # ------------------------------------------------------------------------------
 
-_STOPWORDS = frozenset({
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
-    "of", "with", "without", "by", "from", "is", "are", "was", "were",
-    "be", "been", "being", "has", "have", "had", "do", "does", "did",
-    "not", "no", "only", "just", "more", "most", "some", "any", "all",
-    "their", "they", "them", "this", "that", "these", "those", "it",
-    "its", "he", "she", "his", "her", "him", "who", "what", "which",
-    "while", "when", "as", "if", "then", "than", "also", "very",
-    "can", "cannot", "could", "would", "will", "shall", "may", "might",
-    "own", "other", "each", "both", "few", "such", "one", "two",
-})
 
+def _build_domain_match_prompt(domain: str, description: str) -> str:
+    """Build a domain-matching prompt that embeds the pre-generated description.
 
-def _tokenize(text: str) -> set:
-    """Lower-case, split on word boundaries, remove stopwords and short tokens."""
-    words = re.findall(r'\b[a-z]+\b', text.lower())
-    return {w for w in words if w not in _STOPWORDS and len(w) > 2}
-
-
-def _jaccard(set_a: set, set_b: set) -> float:
-    """Jaccard similarity between two token sets."""
-    if not set_a or not set_b:
-        return 0.0
-    return len(set_a & set_b) / len(set_a | set_b)
-
-
-def _semantic_match_feature(description: str, feat: str,
-                             threshold: float = 0.10) -> Optional[tuple]:
-    """Find the vocabulary phrase most semantically similar to the description.
-
-    Computes Jaccard similarity between the (stopword-filtered) description tokens
-    and each vocabulary phrase's tokens.  Returns (score, phrase) or None if the
-    best match is below `threshold` (feature not observed / not mentioned).
-
-    Args:
-        description: Free-form behavioral description from PLM.
-        feat:        Feature key in _FEATURE_LEVELS (e.g. "locomotion").
-        threshold:   Minimum Jaccard similarity to accept a match (default 0.10).
-
-    Returns:
-        (cdc_score, phrase) of the best-matching level, or None.
+    The model receives the behavioral description as explicit context, then
+    selects the ONE vocabulary level per feature that best matches.
+    Including the description reduces ambiguity so a single call is reliable.
     """
-    desc_tokens = _tokenize(description)
+    features   = _DOMAIN_FEATURES[domain]
+    desc_label = _DOMAIN_DESCRIPTIONS[domain]
 
-    best_sim   = -1.0
-    best_level: Optional[tuple] = None
+    level_lines = []
+    for feat in features:
+        levels  = _FEATURE_LEVELS[feat]
+        ordered = levels if feat in _DECREASING_FEATURES else sorted(levels, key=lambda x: x[0])
+        option_str = " < ".join(phrase for _, phrase in ordered)
+        level_lines.append(f"  {_feat_label(feat)}: {option_str}")
 
-    for score, phrase in _FEATURE_LEVELS[feat]:
-        phrase_tokens = _tokenize(phrase)
-        sim = _jaccard(desc_tokens, phrase_tokens)
-        if sim > best_sim:
-            best_sim   = sim
-            best_level = (score, phrase)
+    answer_block = "\n".join(f"{_feat_label(feat)}: <option>" for feat in features)
 
-    if best_level is not None and best_sim >= threshold:
-        return best_level
-    return None
+    return (
+        f"A child in this video has been described as:\n"
+        f"\"{description}\"\n\n"
+        f"Based on this description and what you observe, for each {desc_label} skill "
+        f"below select the ONE option that BEST MATCHES the child's behavior.\n"
+        f"Rules:\n"
+        f"- Match what is described or directly visible.\n"
+        f"- If the skill is not mentioned and not observable, write: not visible\n"
+        f"Options run from youngest (left, ◄) to most developed (right, ►).\n\n"
+        + "\n".join(level_lines)
+        + f"\n\nReply in this exact format (one line per skill):\n{answer_block}"
+    )
 
 
-def _match_description_to_domain(description: str, domain: str,
-                                  threshold: float = 0.10,
-                                  debug: bool = False) -> dict:
-    """Match a behavioral description against every feature in a domain.
+# ------------------------------------------------------------------------------
+# Domain assessment using pre-generated description as context
+# ------------------------------------------------------------------------------
 
-    Returns same shape as estimate_development._assess_domain():
-        {
-            "features":    {feat: score},
-            "phrases":     {feat: phrase},
-            "age":         float | None,
-            "raw_outputs": [],          # no PLM output for this step
-        }
+
+def _assess_domain_from_description(
+    seg: str,
+    domain: str,
+    description: str,
+    model,
+    tokenizer,
+    config,
+    num_frames: int,
+    temperature: float,
+    max_gen_len: int,
+    debug: bool = False,
+) -> dict:
+    """Run one PLM call per domain, grounded by the behavioral description.
+
+    Returns same shape as estimate_development._assess_domain() with one run.
     """
-    features_scores: dict = {}
-    features_phrases: dict = {}
+    prompt = _build_domain_match_prompt(domain, description)
+    txt = _run_plm_text(
+        seg, prompt, model, tokenizer, config,
+        num_frames=num_frames, temperature=temperature, max_gen_len=max_gen_len,
+    )
+    parsed = _parse_domain_output(domain, txt)
 
-    for feat in _DOMAIN_FEATURES[domain]:
-        match = _semantic_match_feature(description, feat, threshold=threshold)
-        if match is not None:
-            score, phrase = match
-            features_scores[feat]  = score
-            features_phrases[feat] = phrase
-            if debug:
-                desc_tok = _tokenize(description)
-                phrase_tok = _tokenize(phrase)
-                sim = _jaccard(desc_tok, phrase_tok)
-                logger.info(
-                    f"    [{domain}] {feat}: sim={sim:.3f} → '{phrase}' (score={score:.2f})"
-                )
-        else:
-            if debug:
-                logger.info(f"    [{domain}] {feat}: below threshold — not matched")
+    if debug:
+        logger.info(f"    [{domain}] raw: {txt!r}")
+        logger.info(f"    parsed: {parsed}")
 
+    if not parsed:
+        return {"features": {}, "phrases": {}, "age": None, "raw_outputs": [txt]}
+
+    features = {feat: score for feat, (score, _) in parsed.items()}
+    phrases  = {feat: phrase for feat, (_, phrase) in parsed.items()}
     return {
-        "features":    features_scores,
-        "phrases":     features_phrases,
-        "age":         domain_age(domain, features_scores),
-        "raw_outputs": [],
+        "features":    features,
+        "phrases":     phrases,
+        "age":         domain_age(domain, features),
+        "raw_outputs": [txt],
     }
 
 
@@ -199,23 +182,25 @@ def assess_desc(
     config,
     num_frames: int = 8,
     temperature: float = 0.0,
+    max_gen_len: int = 128,
     desc_max_gen_len: int = 256,
-    sim_threshold: float = 0.10,
     chunk_duration: Optional[float] = None,
     debug: bool = False,
 ) -> dict:
     """Run the description-first developmental assessment pipeline.
 
     Per chunk:
-      Call 1 (video) : child detection (yes/no).
-      Call 2 (video) : free-form behavioral description.
-      Step 3 (text)  : semantic match description → vocabulary per feature.
+      Call 1 (video)             : child detection (yes/no).
+      Call 2 (video)             : free-form behavioral description.
+      Calls 3 to 2+N_domains     : one domain-matching call each, with the
+                                   description embedded in the prompt.
 
-    Total PLM calls: 2 per chunk (+ 1 for initial child detection).
+    Total PLM calls per chunk: 1 (description) + N_domains (matching).
+    No majority voting — the description grounds the answer sufficiently.
 
     Args:
         desc_max_gen_len: Max tokens for the behavioral description (default 256).
-        sim_threshold:    Min Jaccard similarity to accept a vocabulary match (default 0.10).
+        max_gen_len:      Max tokens for each domain matching call (default 128).
         chunk_duration:   Split into N-second chunks; None = full video as one chunk.
     """
     import os
@@ -266,10 +251,11 @@ def assess_desc(
         else:
             segments = [plm_path]
 
-        n_chunks = len(segments)
+        n_chunks  = len(segments)
+        total_plm = n_chunks * (1 + len(DOMAINS))
         logger.info(
-            f"Assessment: {n_chunks} chunk(s) × 1 description call "
-            f"= {n_chunks} PLM calls (semantic matching, no per-domain calls)"
+            f"Assessment: {n_chunks} chunk(s) × (1 description + {len(DOMAINS)} domain calls)"
+            f" = {total_plm} PLM calls"
         )
 
         # ---- Assess each segment --------------------------------------------
@@ -291,12 +277,14 @@ def assess_desc(
                 f"{'...' if len(description) > 120 else ''}"
             )
 
-            # Step 2: semantic match description → all domains (no PLM calls)
-            logger.info("  Semantic matching to domain vocabulary ...")
+            # Step 2: for each domain, match description → vocabulary (1 PLM call each)
             domain_scores: dict = {}
             for domain in DOMAINS:
-                ds = _match_description_to_domain(
-                    description, domain, threshold=sim_threshold, debug=debug
+                logger.info(f"  Matching [{domain}] ...")
+                ds = _assess_domain_from_description(
+                    seg, domain, description, model, tokenizer, config,
+                    num_frames=num_frames, temperature=temperature,
+                    max_gen_len=max_gen_len, debug=debug,
                 )
                 domain_scores[domain] = ds
                 if debug:
@@ -354,7 +342,7 @@ def assess_desc(
             "domain_ages":        domain_ages,
             "overall_age_months": round(overall_age, 1) if overall_age is not None else None,
             "stage_distribution": stage_dist,
-            "raw_plm_output":     "\n\n".join(c["description"] for c in chunk_details),
+            "raw_plm_output":     "\n\n".join(c["raw_text"] for c in chunk_details),
             "chunk_details":      chunk_details,
         }
 
@@ -378,13 +366,13 @@ def assess_desc(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Developmental assessment via description + semantic matching.",
+        description="Developmental assessment via description-grounded PLM matching.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s --video clip.mp4
   %(prog)s --video clip.mp4 --num_frames 16 --chunk_duration 10
-  %(prog)s --video clip.mp4 --debug       # show per-feature similarity scores
+  %(prog)s --video clip.mp4 --debug       # show raw PLM output per domain
   %(prog)s --video clip.mp4 --json_only > result.json
         """,
     )
@@ -394,12 +382,12 @@ Examples:
                         help="PLM checkpoint or HuggingFace ID.")
     parser.add_argument("--num_frames", type=int, default=8,
                         help="Frames to sample per PLM call (default: 8).")
+    parser.add_argument("--max_gen_len", type=int, default=128,
+                        help="Max tokens for domain matching calls (default: 128).")
     parser.add_argument("--desc_max_gen_len", type=int, default=256,
                         help="Max tokens for the behavioral description (default: 256).")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature; 0.0 = greedy (default).")
-    parser.add_argument("--sim_threshold", type=float, default=0.10,
-                        help="Min Jaccard similarity to accept a vocabulary match (default: 0.10).")
     parser.add_argument("--chunk_duration", type=float, default=None,
                         help="Split video into chunks of this many seconds.")
     parser.add_argument("--json_only", action="store_true",
@@ -409,7 +397,7 @@ Examples:
     parser.add_argument("--output_video", type=str, default=None,
                         help="Render keyword overlays onto the video and save here.")
     parser.add_argument("--debug", action="store_true",
-                        help="Print per-feature similarity scores and matched phrases.")
+                        help="Print raw PLM outputs and parsed domain scores.")
 
     args = parser.parse_args()
 
@@ -423,8 +411,8 @@ Examples:
         config=config,
         num_frames=args.num_frames,
         temperature=args.temperature,
+        max_gen_len=args.max_gen_len,
         desc_max_gen_len=args.desc_max_gen_len,
-        sim_threshold=args.sim_threshold,
         chunk_duration=args.chunk_duration,
         debug=args.debug,
     )
