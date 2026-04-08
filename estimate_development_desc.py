@@ -5,22 +5,19 @@ Developmental stage estimator — description-first pipeline.
 Pipeline (per chunk):
   1. PLM Call 1 : Detect whether a child is visible (yes / no).
   2. PLM Call 2 : Generate a free-form behavioral description of the child.
-  3. PLM Calls 3+: For each domain, feed the description back into the prompt
-                   alongside the video and ask PLM to select ONE vocabulary
-                   level.  The description grounds the matching (less ambiguity,
-                   no majority voting needed).
-  4. Parse, aggregate across chunks, inverse-interpolate ages, print report.
+  3. Semantic match (no PLM): for each developmental feature, embed the
+     description and all vocabulary phrases with a sentence transformer and
+     pick the phrase with the highest cosine similarity.
+  4. Aggregate across chunks, inverse-interpolate ages, print report.
 
-Compared with estimate_development.py:
-  - The description (step 2) is generated first and embedded in every
-    subsequent domain prompt as explicit context.
-  - num_runs is dropped: the grounded description makes a single call
-    reliable enough that majority voting adds little value.
-  - PLM calls per chunk: N_domains × N_runs  →  1 + N_domains
+There are only 2 PLM calls per chunk regardless of the number of domains.
+Domain scoring comes entirely from the description text — if the description
+does not mention a feature the score for that feature is left unset.
 
 Usage:
     python estimate_development_desc.py --video clip.mp4
     python estimate_development_desc.py --video clip.mp4 --num_frames 16 --chunk_duration 10
+    python estimate_development_desc.py --video clip.mp4 --sim_threshold 0.25
     python estimate_development_desc.py --video clip.mp4 --json_only > result.json
 """
 
@@ -32,6 +29,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+
 from apps.plm.generate import load_consolidated_model_and_tokenizer
 
 # Shared constants, CDC helpers, report rendering — all live in estimate_development.
@@ -42,24 +41,19 @@ from estimate_development import (
     _DOMAIN_DESCRIPTIONS,
     _DOMAIN_FEATURES,
     DOMAINS,
-    CDC_ANCHORS,
-    STAGE_BOUNDS,
     # small helpers
     _feat_label,
-    _score_to_age,
     domain_age,
     stage_distribution,
-    # PLM output parsing & aggregation
-    _parse_domain_output,
+    # aggregation across chunks
     _aggregate_domain_scores,
     # video utilities
     _split_into_chunks,
     _transcode_to_h264,
     _run_plm_text,
-    # report / overlay
+    # report helpers
     _STAGE_LABELS,
     _bar,
-    print_report,
     render_assessment_video,
 )
 
@@ -76,7 +70,7 @@ _PROMPT_CHILD = (
     "and active in this video? Answer only: yes or no."
 )
 
-# Asks for a rich behavioral description covering all developmental domains.
+# Focused description prompt: elicits observable developmental behaviors.
 _PROMPT_DESCRIBE_BEHAVIOR = (
     "Describe this child's behavior in detail. "
     "Focus on: how they move (crawling, walking, running, climbing), "
@@ -90,96 +84,101 @@ _PROMPT_DESCRIBE_BEHAVIOR = (
 
 
 # ------------------------------------------------------------------------------
-# Description-grounded domain prompt builder
+# NLI cross-encoder semantic matcher
+# ------------------------------------------------------------------------------
+# Strategy: run each (description, hypothesis) pair through an NLI model.
+# The hypothesis is "The child is: <vocab phrase>".
+# The phrase with the LOWEST contradiction score is the best match.
+# If even the best phrase has contradiction > threshold, the feature is
+# considered unobserved in this description.
+#
+# This outperforms cosine-similarity approaches because the cross-encoder
+# sees both texts simultaneously and understands that "climbing on the slide"
+# does NOT contradict "walking well and beginning to run" while it DOES
+# contradict "crawling on hands and knees".
 # ------------------------------------------------------------------------------
 
-
-def _build_domain_match_prompt(domain: str, description: str) -> str:
-    """Build a domain-matching prompt that embeds the pre-generated description.
-
-    Options are presented as a numbered list (not " < " separated) to prevent
-    the 8B model from echoing the full option list instead of selecting one.
-    """
-    features   = _DOMAIN_FEATURES[domain]
-    desc_label = _DOMAIN_DESCRIPTIONS[domain]
-
-    # Build numbered option blocks per feature.
-    # Also build a reverse lookup: number → phrase (used by the parser below).
-    level_blocks = []
-    for feat in features:
-        levels  = _FEATURE_LEVELS[feat]
-        ordered = levels if feat in _DECREASING_FEATURES else sorted(levels, key=lambda x: x[0])
-        lines = [f"  {_feat_label(feat)} (youngest → most developed):"]
-        for idx, (_, phrase) in enumerate(ordered, start=1):
-            lines.append(f"    {idx}. {phrase}")
-        level_blocks.append("\n".join(lines))
-
-    answer_block = "\n".join(
-        f"{_feat_label(feat)}: <copy the exact phrase>" for feat in features
-    )
-
-    return (
-        f"A child in this video has been described as:\n"
-        f"\"{description}\"\n\n"
-        f"Based on this description and what you observe, for each {desc_label} skill "
-        f"below, copy the ONE phrase that BEST MATCHES the child's behavior.\n"
-        f"Rules:\n"
-        f"- Copy the phrase verbatim from the numbered list.\n"
-        f"- If the skill is not mentioned and not observable, write: not visible\n\n"
-        + "\n\n".join(level_blocks)
-        + f"\n\nReply in this exact format (one line per skill, phrase copied verbatim):\n"
-        + answer_block
-    )
+_nli_model = None   # loaded once on first use
 
 
-# ------------------------------------------------------------------------------
-# Domain assessment using pre-generated description as context
-# ------------------------------------------------------------------------------
+def _load_nli_model():
+    global _nli_model
+    if _nli_model is None:
+        from sentence_transformers import CrossEncoder
+        logger.info("Loading NLI cross-encoder (nli-MiniLM2-L6-H768) ...")
+        _nli_model = CrossEncoder("cross-encoder/nli-MiniLM2-L6-H768")
+        logger.info("NLI cross-encoder loaded.")
+    return _nli_model
 
 
-def _assess_domain_from_description(
-    seg: str,
-    domain: str,
+def _nli_match_feature(
     description: str,
-    model,
-    tokenizer,
-    config,
-    num_frames: int,
-    temperature: float,
-    max_gen_len: int,
+    feat: str,
+    threshold: float = 0.50,
     debug: bool = False,
-) -> dict:
-    """Run one PLM call per domain, grounded by the behavioral description.
+) -> Optional[tuple]:
+    """Match a description to the vocabulary phrase least contradicted by it.
 
-    Returns same shape as estimate_development._assess_domain() with one run.
+    Args:
+        description: Free-form behavioral description from PLM.
+        feat:        Feature key (e.g. "locomotion").
+        threshold:   Max allowed contradiction score (default 0.50).
+                     If the best phrase exceeds this, the feature is unobserved.
+
+    Returns:
+        (cdc_score, phrase) of the best-matching level, or None if unobserved.
     """
-    prompt = _build_domain_match_prompt(domain, description)
-    txt = _run_plm_text(
-        seg, prompt, model, tokenizer, config,
-        num_frames=num_frames, temperature=temperature, max_gen_len=max_gen_len,
-    )
+    model = _load_nli_model()
+    levels = _FEATURE_LEVELS[feat]   # [(score, phrase), ...]
 
-    # Strip any leading number prefix the model may add from the numbered list
-    # e.g. "Locomotion: 4. walking well..." → "Locomotion: walking well..."
-    txt_clean = re.sub(r'(:\s*)\d+\.\s*', r'\1', txt)
+    # Each hypothesis is "The child is: <phrase>"
+    pairs = [(description, f"The child is: {phrase}") for _, phrase in levels]
+    scores = model.predict(pairs, apply_softmax=True)  # shape (n_phrases, 3)
+    # Label order: [contradiction=0, entailment=1, neutral=2]
+    contradiction = scores[:, 0]
 
-    parsed = _parse_domain_output(domain, txt_clean)
+    best_idx         = int(np.argmin(contradiction))
+    best_contra      = float(contradiction[best_idx])
+    best_score, best_phrase = levels[best_idx]
 
     if debug:
-        logger.info(f"    [{domain}] raw:   {txt!r}")
-        logger.info(f"    [{domain}] clean: {txt_clean!r}")
-        logger.info(f"    [{domain}] parsed: {parsed}")
+        for (_, ph), c in zip(levels, contradiction):
+            mark = " <<<" if ph == best_phrase else ""
+            logger.info(f"    [{feat}] contra={c:.3f}  {ph}{mark}")
 
-    if not parsed:
-        return {"features": {}, "phrases": {}, "age": None, "raw_outputs": [txt]}
+    if best_contra < threshold:
+        return (best_score, best_phrase)
+    return None
 
-    features = {feat: score for feat, (score, _) in parsed.items()}
-    phrases  = {feat: phrase for feat, (_, phrase) in parsed.items()}
+
+def _match_description_to_domain(
+    description: str,
+    domain: str,
+    threshold: float = 0.50,
+    debug: bool = False,
+) -> dict:
+    """NLI-match a description against every feature in one domain.
+
+    Returns same shape as estimate_development._assess_domain():
+        {"features": {feat: score}, "phrases": {feat: phrase},
+         "age": float|None, "raw_outputs": []}
+    """
+    features_scores: dict = {}
+    features_phrases: dict = {}
+
+    for feat in _DOMAIN_FEATURES[domain]:
+        match = _nli_match_feature(description, feat,
+                                   threshold=threshold, debug=debug)
+        if match is not None:
+            score, phrase = match
+            features_scores[feat]  = score
+            features_phrases[feat] = phrase
+
     return {
-        "features":    features,
-        "phrases":     phrases,
-        "age":         domain_age(domain, features),
-        "raw_outputs": [txt],
+        "features":    features_scores,
+        "phrases":     features_phrases,
+        "age":         domain_age(domain, features_scores),
+        "raw_outputs": [],
     }
 
 
@@ -195,25 +194,23 @@ def assess_desc(
     config,
     num_frames: int = 8,
     temperature: float = 0.0,
-    max_gen_len: int = 128,
     desc_max_gen_len: int = 256,
+    sim_threshold: float = 0.50,
     chunk_duration: Optional[float] = None,
     debug: bool = False,
 ) -> dict:
     """Run the description-first developmental assessment pipeline.
 
     Per chunk:
-      Call 1 (video)             : child detection (yes/no).
-      Call 2 (video)             : free-form behavioral description.
-      Calls 3 to 2+N_domains     : one domain-matching call each, with the
-                                   description embedded in the prompt.
-
-    Total PLM calls per chunk: 1 (description) + N_domains (matching).
-    No majority voting — the description grounds the answer sufficiently.
+      PLM Call 1 (video) : child detection (yes / no).
+      PLM Call 2 (video) : free-form behavioral description.
+      Semantic matching  : sentence-embedding cosine similarity maps the
+                           description to vocabulary phrases per feature.
+                           No further PLM calls.
 
     Args:
         desc_max_gen_len: Max tokens for the behavioral description (default 256).
-        max_gen_len:      Max tokens for each domain matching call (default 128).
+        sim_threshold:    Min cosine similarity to accept a vocabulary match (default 0.20).
         chunk_duration:   Split into N-second chunks; None = full video as one chunk.
     """
     import os
@@ -264,12 +261,14 @@ def assess_desc(
         else:
             segments = [plm_path]
 
-        n_chunks  = len(segments)
-        total_plm = n_chunks * (1 + len(DOMAINS))
+        n_chunks = len(segments)
         logger.info(
-            f"Assessment: {n_chunks} chunk(s) × (1 description + {len(DOMAINS)} domain calls)"
-            f" = {total_plm} PLM calls"
+            f"Assessment: {n_chunks} chunk(s) × 1 PLM description call "
+            f"+ sentence-embedding matching (no per-domain PLM calls)"
         )
+
+        # Pre-load NLI model before the chunk loop (avoids first-call overhead)
+        _load_nli_model()
 
         # ---- Assess each segment --------------------------------------------
         chunk_details: list = []
@@ -278,7 +277,7 @@ def assess_desc(
             t_end   = (i + 1) * chunk_duration if chunk_duration else None
             logger.info(f"Segment {i + 1}/{n_chunks}: {seg}")
 
-            # Step 1: generate behavioral description (one PLM call with video)
+            # Step 1: generate behavioral description (the only PLM call)
             logger.info("  Generating behavioral description ...")
             description = _run_plm_text(
                 seg, _PROMPT_DESCRIBE_BEHAVIOR, model, tokenizer, config,
@@ -286,18 +285,16 @@ def assess_desc(
                 max_gen_len=desc_max_gen_len,
             )
             logger.info(
-                f"  Description: {description[:120]!r}"
-                f"{'...' if len(description) > 120 else ''}"
+                f"  Description ({len(description)} chars): "
+                f"{description[:100]!r}{'...' if len(description) > 100 else ''}"
             )
 
-            # Step 2: for each domain, match description → vocabulary (1 PLM call each)
+            # Step 2: semantic match description → domain vocabulary (no PLM)
             domain_scores: dict = {}
             for domain in DOMAINS:
-                logger.info(f"  Matching [{domain}] ...")
-                ds = _assess_domain_from_description(
-                    seg, domain, description, model, tokenizer, config,
-                    num_frames=num_frames, temperature=temperature,
-                    max_gen_len=max_gen_len, debug=debug,
+                ds = _match_description_to_domain(
+                    description, domain,
+                    threshold=sim_threshold, debug=debug,
                 )
                 domain_scores[domain] = ds
                 if debug:
@@ -373,12 +370,12 @@ def assess_desc(
 
 
 # ------------------------------------------------------------------------------
-# Custom report — shows description as PLM output, hides domain matching output
+# Custom report — shows description as PLM output, matched phrases per domain
 # ------------------------------------------------------------------------------
 
 
 def _print_chunk_timeline_desc(chunk_details: list) -> None:
-    """Print per-chunk description (PLM output) and matched domain phrases."""
+    """Print per-chunk description (PLM output) and semantic-matched phrases."""
     if not chunk_details:
         return
 
@@ -397,7 +394,7 @@ def _print_chunk_timeline_desc(chunk_details: list) -> None:
         print(f"  Chunk {c['index']}  [{time_str}]")
         print(f"  {sep}")
 
-        # Show the behavioral description as "PLM output"
+        # The description IS the PLM output
         description = c.get("description", "")
         print(f"\n  PLM output:")
         if description:
@@ -424,7 +421,7 @@ def _print_chunk_timeline_desc(chunk_details: list) -> None:
                     score_str = f"  (score {score:.2f})" if score is not None else ""
                     print(f"    {_feat_label(feat)}: {phrase}{score_str}")
             else:
-                print("    (no levels matched)")
+                print("    (no levels matched — below similarity threshold)")
 
         print()
 
@@ -524,13 +521,14 @@ def print_report_desc(result: dict) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Developmental assessment via description-grounded PLM matching.",
+        description="Developmental assessment: PLM description + sentence-embedding matching.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s --video clip.mp4
   %(prog)s --video clip.mp4 --num_frames 16 --chunk_duration 10
-  %(prog)s --video clip.mp4 --debug       # show raw PLM output per domain
+  %(prog)s --video clip.mp4 --sim_threshold 0.35   # stricter matching
+  %(prog)s --video clip.mp4 --debug                # show per-feature NLI contradiction scores
   %(prog)s --video clip.mp4 --json_only > result.json
         """,
     )
@@ -540,12 +538,13 @@ Examples:
                         help="PLM checkpoint or HuggingFace ID.")
     parser.add_argument("--num_frames", type=int, default=8,
                         help="Frames to sample per PLM call (default: 8).")
-    parser.add_argument("--max_gen_len", type=int, default=128,
-                        help="Max tokens for domain matching calls (default: 128).")
     parser.add_argument("--desc_max_gen_len", type=int, default=256,
                         help="Max tokens for the behavioral description (default: 256).")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature; 0.0 = greedy (default).")
+    parser.add_argument("--sim_threshold", type=float, default=0.50,
+                        help="Max NLI contradiction score to accept a match (default: 0.50). "
+                             "Lower = stricter; raise if too few features matched.")
     parser.add_argument("--chunk_duration", type=float, default=None,
                         help="Split video into chunks of this many seconds.")
     parser.add_argument("--json_only", action="store_true",
@@ -555,11 +554,11 @@ Examples:
     parser.add_argument("--output_video", type=str, default=None,
                         help="Render keyword overlays onto the video and save here.")
     parser.add_argument("--debug", action="store_true",
-                        help="Print raw PLM outputs and parsed domain scores.")
+                        help="Print per-feature NLI contradiction scores.")
 
     args = parser.parse_args()
 
-    logger.info(f"Loading model: {args.ckpt}")
+    logger.info(f"Loading PLM model: {args.ckpt}")
     model, tokenizer, config = load_consolidated_model_and_tokenizer(args.ckpt)
 
     result = assess_desc(
@@ -569,8 +568,8 @@ Examples:
         config=config,
         num_frames=args.num_frames,
         temperature=args.temperature,
-        max_gen_len=args.max_gen_len,
         desc_max_gen_len=args.desc_max_gen_len,
+        sim_threshold=args.sim_threshold,
         chunk_duration=args.chunk_duration,
         debug=args.debug,
     )
