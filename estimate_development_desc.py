@@ -158,11 +158,17 @@ def _assess_domain_from_description(
         seg, prompt, model, tokenizer, config,
         num_frames=num_frames, temperature=temperature, max_gen_len=max_gen_len,
     )
-    parsed = _parse_domain_output(domain, txt)
+
+    # Strip any leading number prefix the model may add from the numbered list
+    # e.g. "Locomotion: 4. walking well..." → "Locomotion: walking well..."
+    txt_clean = re.sub(r'(:\s*)\d+\.\s*', r'\1', txt)
+
+    parsed = _parse_domain_output(domain, txt_clean)
 
     if debug:
-        logger.info(f"    [{domain}] raw: {txt!r}")
-        logger.info(f"    parsed: {parsed}")
+        logger.info(f"    [{domain}] raw:   {txt!r}")
+        logger.info(f"    [{domain}] clean: {txt_clean!r}")
+        logger.info(f"    [{domain}] parsed: {parsed}")
 
     if not parsed:
         return {"features": {}, "phrases": {}, "age": None, "raw_outputs": [txt]}
@@ -349,7 +355,7 @@ def assess_desc(
             "domain_ages":        domain_ages,
             "overall_age_months": round(overall_age, 1) if overall_age is not None else None,
             "stage_distribution": stage_dist,
-            "raw_plm_output":     "\n\n".join(c["raw_text"] for c in chunk_details),
+            "raw_plm_output":     "\n\n".join(c["description"] for c in chunk_details),
             "chunk_details":      chunk_details,
         }
 
@@ -393,10 +399,12 @@ def _print_chunk_timeline_desc(chunk_details: list) -> None:
 
         # Show the behavioral description as "PLM output"
         description = c.get("description", "")
+        print(f"\n  PLM output:")
         if description:
-            print(f"\n  PLM output:")
             for line in description.strip().splitlines():
                 print(f"    {line}")
+        else:
+            print("    (description not generated)")
 
         domain_scores = c.get("domain_scores", {})
         domain_ages   = c.get("domain_ages",   {})
@@ -443,11 +451,13 @@ def print_report_desc(result: dict) -> None:
     chunks = result.get("chunk_details", [])
     if len(chunks) == 1:
         desc = chunks[0].get("description", "")
+        print(f"\n  PLM output:")
         if desc:
-            print(f"\n  PLM output:")
             for line in desc.strip().splitlines():
                 print(f"    {line}")
-            print(f"  {thin}")
+        else:
+            print("    (description not generated)")
+        print(f"  {thin}")
     elif len(chunks) > 1:
         _print_chunk_timeline_desc(chunks)
 
