@@ -15,10 +15,12 @@ import argparse
 import json
 import logging
 import os
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from split_videos import _apply_rotation, _get_rotation
 
@@ -26,6 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {".mov", ".mp4", ".avi", ".mkv", ".webm", ".flv", ".m4v"}
+MAX_CLIPS = 10  # hard cap per source video
 
 
 def split_video(
@@ -34,7 +37,10 @@ def split_video(
     clip_duration: float = 5.0,
     overwrite: bool = False,
 ) -> list:
-    """Split one video into fixed-duration clips.
+    """Split one video into up to MAX_CLIPS fixed-duration clips.
+
+    If the video is longer than MAX_CLIPS * clip_duration, clips are sampled
+    uniformly across the full duration instead of taken consecutively.
 
     Returns a list of dicts:
         {"clip_path": str, "source_file": str, "year_month": str,
@@ -57,79 +63,76 @@ def split_video(
     out_w, out_h = (raw_h, raw_w) if rotation in (90, 270) else (raw_w, raw_h)
 
     frames_per_clip = max(1, int(fps * clip_duration))
-    n_clips = max(1, (total_frames + frames_per_clip - 1) // frames_per_clip)
-    fourcc  = cv2.VideoWriter_fourcc(*"mp4v")
+    video_duration  = total_frames / fps
+
+    # Number of consecutive clips the video could fill
+    consecutive_clips = max(1, total_frames // frames_per_clip)
+
+    if consecutive_clips <= MAX_CLIPS:
+        # Short video: take all consecutive clips
+        n_clips = consecutive_clips
+        t_starts = [i * clip_duration for i in range(n_clips)]
+    else:
+        # Long video: sample MAX_CLIPS clips uniformly
+        n_clips = MAX_CLIPS
+        t_starts = list(np.linspace(0.0, video_duration - clip_duration, MAX_CLIPS))
+        logger.info(
+            f"  {src.name}: video ({video_duration:.0f}s) > {MAX_CLIPS}×{clip_duration}s — "
+            f"sampling {MAX_CLIPS} clips uniformly."
+        )
 
     # Derive year_month from filename (e.g. "2025-06-15.MOV" → "2025-06")
     year_month = ""
-    import re
-    m = re.match(r"(\d{4}-\d{2})", src.stem)
-    if m:
-        year_month = m.group(1)
+    ym = re.match(r"(\d{4}-\d{2})", src.stem)
+    if ym:
+        year_month = ym.group(1)
 
-    clips = []
-    writer = None
-    clip_idx = 0
-    clip_frame = 0
-    clip_path = None
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    clips  = []
 
-    def _open_writer(idx):
-        p = out_dir / f"{src.stem}_clip{idx:03d}.mp4"
-        return cv2.VideoWriter(str(p), fourcc, fps, (out_w, out_h)), str(p)
+    for clip_idx, t_start in enumerate(t_starts):
+        clip_path = out_dir / f"{src.stem}_clip{clip_idx:03d}.mp4"
 
-    frame_total = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if clip_frame == 0:
-            if writer is not None:
-                writer.release()
-                clips[-1]["t_end"] = round(frame_total / fps, 2)
-
-            if clip_idx >= n_clips and total_frames > 0:
-                # safety: shouldn't happen, but avoid infinite open
-                break
-
-            clip_path_str_candidate = str(out_dir / f"{src.stem}_clip{clip_idx:03d}.mp4")
-            if not overwrite and Path(clip_path_str_candidate).exists():
-                logger.info(f"  Skip existing: {clip_path_str_candidate}")
-                # fast-forward frames
-                for _ in range(frames_per_clip - 1):
-                    cap.read()
-                    frame_total += 1
-                clip_idx += 1
-                frame_total += 1
-                continue
-
-            writer, clip_path = _open_writer(clip_idx)
+        if not overwrite and clip_path.exists():
+            logger.info(f"  Skip existing: {clip_path.name}")
+            # Reconstruct metadata for existing clip
             clips.append({
-                "clip_path":   clip_path,
+                "clip_path":   str(clip_path),
                 "source_file": src.name,
                 "year_month":  year_month,
                 "clip_index":  clip_idx,
-                "t_start":     round(frame_total / fps, 2),
-                "t_end":       None,
+                "t_start":     round(t_start, 2),
+                "t_end":       round(min(t_start + clip_duration, video_duration), 2),
             })
-            clip_idx += 1
+            continue
 
-        writer.write(_apply_rotation(frame, rotation))
-        clip_frame += 1
-        frame_total += 1
+        start_frame = int(t_start * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-        if clip_frame >= frames_per_clip:
-            clip_frame = 0
-
-    if writer is not None:
+        writer = cv2.VideoWriter(str(clip_path), fourcc, fps, (out_w, out_h))
+        frames_written = 0
+        for _ in range(frames_per_clip):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            writer.write(_apply_rotation(frame, rotation))
+            frames_written += 1
         writer.release()
-        if clips and clips[-1]["t_end"] is None:
-            clips[-1]["t_end"] = round(frame_total / fps, 2)
+
+        t_end = round(t_start + frames_written / fps, 2)
+        clips.append({
+            "clip_path":   str(clip_path),
+            "source_file": src.name,
+            "year_month":  year_month,
+            "clip_index":  clip_idx,
+            "t_start":     round(t_start, 2),
+            "t_end":       t_end,
+        })
 
     cap.release()
     logger.info(
-        f"  {src.name}: {clip_idx} clip(s), "
-        f"{total_frames} frames @ {fps:.1f} fps, rotation={rotation}°"
+        f"  {src.name}: {len(clips)} clip(s), "
+        f"{video_duration:.1f}s @ {fps:.1f} fps, rotation={rotation}°"
     )
     return clips
 
