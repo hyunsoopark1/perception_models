@@ -229,7 +229,8 @@ def process_clips(
             entry["description"] = get_description(
                 clip_path, model, tokenizer, config, num_frames, temperature
             )
-            logger.info(f"     {entry['description'][:80]!r}")
+            desc_preview = entry['description']
+            logger.info(f"     {desc_preview!r}")
 
         if need_stage:
             logger.info("  → stage ...")
