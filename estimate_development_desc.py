@@ -4,20 +4,17 @@ Developmental stage estimator — description-first pipeline.
 
 Pipeline (per chunk):
   1. PLM Call 1 : Detect whether a child is visible (yes / no).
-  2. PLM Call 2 : Generate a free-form behavioral description of the child.
-  3. Semantic match (no PLM): for each developmental feature, embed the
-     description and all vocabulary phrases with a sentence transformer and
-     pick the phrase with the highest cosine similarity.
-  4. Aggregate across chunks, inverse-interpolate ages, print report.
+  2. PLM Call 2 : Generate a free-form description of the child (the PLM output).
+  3. PLM Calls 3+: For each domain, give PLM the description as context and an
+                   ordered vocabulary list; PLM selects ONE phrase per feature.
+  4. Aggregate across chunks, inverse-interpolate CDC ages, print report.
 
-There are only 2 PLM calls per chunk regardless of the number of domains.
-Domain scoring comes entirely from the description text — if the description
-does not mention a feature the score for that feature is left unset.
+PLM calls per chunk: 1 (description) + N_domains (matching) = 6 total.
+No majority voting — the description grounds the selection reliably.
 
 Usage:
     python estimate_development_desc.py --video clip.mp4
     python estimate_development_desc.py --video clip.mp4 --num_frames 16 --chunk_duration 10
-    python estimate_development_desc.py --video clip.mp4 --sim_threshold 0.25
     python estimate_development_desc.py --video clip.mp4 --json_only > result.json
 """
 
@@ -29,32 +26,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-
 from apps.plm.generate import load_consolidated_model_and_tokenizer
-
-# Shared constants, CDC helpers, report rendering — all live in estimate_development.
 from estimate_development import (
-    # vocabulary / CDC data
-    _FEATURE_LEVELS,
-    _DECREASING_FEATURES,
-    _DOMAIN_DESCRIPTIONS,
-    _DOMAIN_FEATURES,
-    DOMAINS,
-    # small helpers
-    _feat_label,
-    domain_age,
-    stage_distribution,
-    # aggregation across chunks
-    _aggregate_domain_scores,
-    # video utilities
-    _split_into_chunks,
-    _transcode_to_h264,
-    _run_plm_text,
-    # report helpers
-    _STAGE_LABELS,
-    _bar,
-    render_assessment_video,
+    _FEATURE_LEVELS, _DECREASING_FEATURES, _DOMAIN_DESCRIPTIONS, _DOMAIN_FEATURES,
+    DOMAINS, _feat_label, domain_age, stage_distribution,
+    _parse_domain_output, _aggregate_domain_scores,
+    _split_into_chunks, _transcode_to_h264, _run_plm_text,
+    _STAGE_LABELS, _bar, render_assessment_video,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -62,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------------------
-# PLM prompts
+# Prompts
 # ------------------------------------------------------------------------------
 
 _PROMPT_CHILD = (
@@ -70,150 +48,106 @@ _PROMPT_CHILD = (
     "and active in this video? Answer only: yes or no."
 )
 
-# Focused description prompt — kept short to avoid triggering early EOS.
-# The model generates better responses to simple, direct prompts.
-_PROMPT_DESCRIBE_BEHAVIOR = "Describe what the child is doing in this video in detail."
+_PROMPT_DESCRIBE = "Describe what the child is doing in this video in detail."
 
 
 # ------------------------------------------------------------------------------
-# NLI cross-encoder semantic matcher
-# ------------------------------------------------------------------------------
-# Strategy: run each (description, hypothesis) pair through an NLI model.
-# The hypothesis is "The child is: <vocab phrase>".
-# The phrase with the LOWEST contradiction score is the best match.
-# If even the best phrase has contradiction > threshold, the feature is
-# considered unobserved in this description.
-#
-# This outperforms cosine-similarity approaches because the cross-encoder
-# sees both texts simultaneously and understands that "climbing on the slide"
-# does NOT contradict "walking well and beginning to run" while it DOES
-# contradict "crawling on hands and knees".
+# Domain prompt (description-grounded, numbered options to prevent echo)
 # ------------------------------------------------------------------------------
 
-_nli_model = None   # loaded once on first use
 
+def _build_domain_prompt(domain: str, description: str) -> str:
+    """Ordered vocabulary prompt with the pre-generated description as context.
 
-def _load_nli_model():
-    global _nli_model
-    if _nli_model is None:
-        from sentence_transformers import CrossEncoder
-        logger.info("Loading NLI cross-encoder (nli-MiniLM2-L6-H768) ...")
-        _nli_model = CrossEncoder("cross-encoder/nli-MiniLM2-L6-H768")
-        logger.info("NLI cross-encoder loaded.")
-    return _nli_model
-
-
-def _nli_match_feature(
-    description: str,
-    feat: str,
-    threshold: float = 0.50,
-    debug: bool = False,
-) -> Optional[tuple]:
-    """Match a description to the vocabulary phrase least contradicted by it.
-
-    Args:
-        description: Free-form behavioral description from PLM.
-        feat:        Feature key (e.g. "locomotion").
-        threshold:   Max allowed contradiction score (default 0.50).
-                     If the best phrase exceeds this, the feature is unobserved.
-
-    Returns:
-        (cdc_score, phrase) of the best-matching level, or None if unobserved.
+    Options are presented as a numbered list so the model copies the exact
+    phrase rather than echoing the full option string.
     """
-    model = _load_nli_model()
-    levels = _FEATURE_LEVELS[feat]   # [(score, phrase), ...]
+    features   = _DOMAIN_FEATURES[domain]
+    desc_label = _DOMAIN_DESCRIPTIONS[domain]
 
-    # Each hypothesis is "The child is: <phrase>"
-    pairs = [(description, f"The child is: {phrase}") for _, phrase in levels]
-    scores = model.predict(pairs, apply_softmax=True)  # shape (n_phrases, 3)
-    # Label order: [contradiction=0, entailment=1, neutral=2]
-    contradiction = scores[:, 0]
+    option_blocks = []
+    for feat in features:
+        levels  = _FEATURE_LEVELS[feat]
+        ordered = levels if feat in _DECREASING_FEATURES else sorted(levels, key=lambda x: x[0])
+        lines = [f"  {_feat_label(feat)} (youngest → most developed):"]
+        for idx, (_, phrase) in enumerate(ordered, start=1):
+            lines.append(f"    {idx}. {phrase}")
+        option_blocks.append("\n".join(lines))
 
-    best_idx         = int(np.argmin(contradiction))
-    best_contra      = float(contradiction[best_idx])
-    best_score, best_phrase = levels[best_idx]
+    answer_block = "\n".join(
+        f"{_feat_label(feat)}: <copy exact phrase>" for feat in features
+    )
 
-    if debug:
-        for (_, ph), c in zip(levels, contradiction):
-            mark = " <<<" if ph == best_phrase else ""
-            logger.info(f"    [{feat}] contra={c:.3f}  {ph}{mark}")
+    return (
+        f"The child in this video has been described as:\n"
+        f"\"{description}\"\n\n"
+        f"Based on this description and what you observe, for each {desc_label} skill "
+        f"copy the ONE phrase that BEST MATCHES the child's behavior.\n"
+        f"- Copy the phrase verbatim from the numbered list.\n"
+        f"- If the skill is not visible, write: not visible\n\n"
+        + "\n\n".join(option_blocks)
+        + f"\n\nReply (one line per skill, phrase copied verbatim):\n"
+        + answer_block
+    )
 
-    if best_contra < threshold:
-        return (best_score, best_phrase)
-    return None
+
+# ------------------------------------------------------------------------------
+# Single domain assessment
+# ------------------------------------------------------------------------------
 
 
-def _match_description_to_domain(
-    description: str,
-    domain: str,
-    threshold: float = 0.50,
+def _assess_domain(
+    seg: str, domain: str, description: str,
+    model, tokenizer, config,
+    num_frames: int, temperature: float, max_gen_len: int,
     debug: bool = False,
 ) -> dict:
-    """NLI-match a description against every feature in one domain.
+    prompt = _build_domain_prompt(domain, description)
+    txt = _run_plm_text(
+        seg, prompt, model, tokenizer, config,
+        num_frames=num_frames, temperature=temperature, max_gen_len=max_gen_len,
+    )
+    # Strip number prefix the model may add (e.g. "4. phrase" → "phrase")
+    txt_clean = re.sub(r'(:\s*)\d+\.\s*', r'\1', txt)
+    parsed = _parse_domain_output(domain, txt_clean)
 
-    Returns same shape as estimate_development._assess_domain():
-        {"features": {feat: score}, "phrases": {feat: phrase},
-         "age": float|None, "raw_outputs": []}
-    """
-    features_scores: dict = {}
-    features_phrases: dict = {}
+    if debug:
+        logger.info(f"    [{domain}] raw:    {txt!r}")
+        logger.info(f"    [{domain}] parsed: {parsed}")
 
-    for feat in _DOMAIN_FEATURES[domain]:
-        match = _nli_match_feature(description, feat,
-                                   threshold=threshold, debug=debug)
-        if match is not None:
-            score, phrase = match
-            features_scores[feat]  = score
-            features_phrases[feat] = phrase
+    if not parsed:
+        return {"features": {}, "phrases": {}, "age": None, "raw_outputs": [txt]}
 
+    features = {feat: score for feat, (score, _) in parsed.items()}
+    phrases  = {feat: phrase for feat, (_, phrase) in parsed.items()}
     return {
-        "features":    features_scores,
-        "phrases":     features_phrases,
-        "age":         domain_age(domain, features_scores),
-        "raw_outputs": [],
+        "features":    features,
+        "phrases":     phrases,
+        "age":         domain_age(domain, features),
+        "raw_outputs": [txt],
     }
 
 
 # ------------------------------------------------------------------------------
-# Full assessment — description-first pipeline
+# Full assessment
 # ------------------------------------------------------------------------------
 
 
 def assess_desc(
-    video_path: str,
-    model,
-    tokenizer,
-    config,
-    num_frames: int = 8,
-    temperature: float = 0.0,
-    desc_max_gen_len: int = 256,
-    sim_threshold: float = 0.50,
+    video_path: str, model, tokenizer, config,
+    num_frames: int = 8, temperature: float = 0.0,
+    max_gen_len: int = 128, desc_max_gen_len: int = 256,
     chunk_duration: Optional[float] = None,
     debug: bool = False,
 ) -> dict:
-    """Run the description-first developmental assessment pipeline.
-
-    Per chunk:
-      PLM Call 1 (video) : child detection (yes / no).
-      PLM Call 2 (video) : free-form behavioral description.
-      Semantic matching  : sentence-embedding cosine similarity maps the
-                           description to vocabulary phrases per feature.
-                           No further PLM calls.
-
-    Args:
-        desc_max_gen_len: Max tokens for the behavioral description (default 256).
-        sim_threshold:    Min cosine similarity to accept a vocabulary match (default 0.20).
-        chunk_duration:   Split into N-second chunks; None = full video as one chunk.
-    """
-    import os
-    import tempfile
+    import os, tempfile
 
     tmp_path: Optional[str] = None
     chunk_paths: list = []
     plm_path = video_path
 
     try:
-        # ---- Child detection (HEVC transcode fallback) -----------------------
+        # ---- Child detection ------------------------------------------------
         try:
             child_text = _run_plm_text(
                 plm_path, _PROMPT_CHILD, model, tokenizer, config,
@@ -233,20 +167,17 @@ def assess_desc(
             )
 
         child_present = bool(re.search(r"\byes\b", child_text, re.IGNORECASE))
-        logger.info(f"Child present: {child_present!r}  (PLM raw: {child_text!r})")
+        logger.info(f"Child present: {child_present!r}  (PLM: {child_text!r})")
 
         if not child_present:
             return {
-                "video_path":         video_path,
-                "child_present":      False,
-                "plm_features":       {},
-                "domain_ages":        {},
-                "overall_age_months": None,
-                "stage_distribution": None,
-                "raw_plm_output":     child_text,
+                "video_path": video_path, "child_present": False,
+                "plm_features": {}, "domain_ages": {},
+                "overall_age_months": None, "stage_distribution": None,
+                "raw_plm_output": child_text,
             }
 
-        # ---- Determine segments ----------------------------------------------
+        # ---- Segments -------------------------------------------------------
         if chunk_duration:
             chunk_paths = _split_into_chunks(plm_path, chunk_duration)
             segments = chunk_paths
@@ -255,59 +186,43 @@ def assess_desc(
 
         n_chunks = len(segments)
         logger.info(
-            f"Assessment: {n_chunks} chunk(s) × 1 PLM description call "
-            f"+ sentence-embedding matching (no per-domain PLM calls)"
+            f"Assessment: {n_chunks} chunk(s) × "
+            f"(1 description + {len(DOMAINS)} domain calls) = "
+            f"{n_chunks * (1 + len(DOMAINS))} PLM calls"
         )
 
-        # Pre-load NLI model before the chunk loop (avoids first-call overhead)
-        _load_nli_model()
-
-        # ---- Assess each segment --------------------------------------------
+        # ---- Per-segment assessment -----------------------------------------
         chunk_details: list = []
         for i, seg in enumerate(segments):
             t_start = i * chunk_duration if chunk_duration else 0
             t_end   = (i + 1) * chunk_duration if chunk_duration else None
-            logger.info(f"Segment {i + 1}/{n_chunks}: {seg}")
+            logger.info(f"Segment {i + 1}/{n_chunks}")
 
-            # Step 1: generate behavioral description (the only PLM call)
-            logger.info("  Generating behavioral description ...")
+            # Step 1: description (the PLM output shown to the user)
             description = _run_plm_text(
-                seg, _PROMPT_DESCRIBE_BEHAVIOR, model, tokenizer, config,
+                seg, _PROMPT_DESCRIBE, model, tokenizer, config,
                 num_frames=num_frames, temperature=temperature,
                 max_gen_len=desc_max_gen_len,
             )
-            if not description:
-                logger.warning(
-                    f"  Description empty for segment {i + 1} — "
-                    "PLM generated no text. Skipping domain matching for this chunk."
-                )
-            else:
-                logger.info(
-                    f"  Description ({len(description)} chars): "
-                    f"{description[:100]!r}{'...' if len(description) > 100 else ''}"
-                )
+            logger.info(f"  Description ({len(description)} chars): {description[:80]!r}")
 
-            # Step 2: NLI-match description → domain vocabulary (only if non-empty)
+            if not description:
+                logger.warning("  Description empty — skipping domain assessment for this chunk.")
+
+            # Step 2: domain selection using description as context
             domain_scores: dict = {}
             for domain in DOMAINS:
                 if not description:
-                    ds = {"features": {}, "phrases": {}, "age": None, "raw_outputs": []}
+                    domain_scores[domain] = {
+                        "features": {}, "phrases": {}, "age": None, "raw_outputs": []
+                    }
                 else:
-                    ds = _match_description_to_domain(
-                        description, domain,
-                        threshold=sim_threshold, debug=debug,
+                    domain_scores[domain] = _assess_domain(
+                        seg, domain, description, model, tokenizer, config,
+                        num_frames=num_frames, temperature=temperature,
+                        max_gen_len=max_gen_len, debug=debug,
                     )
-                domain_scores[domain] = ds
-                if debug:
-                    age_d = ds["age"]
-                    print(f"  [{domain}] age={'%.1f' % age_d if age_d is not None else 'n/a'}"
-                          f"  phrases={ds['phrases']}")
 
-            raw_text = "\n".join(
-                (f"{d}: " + ", ".join(f"{f}={p}" for f, p in domain_scores[d]["phrases"].items()))
-                if domain_scores[d]["phrases"] else f"{d}: none"
-                for d in DOMAINS
-            )
             chunk_details.append({
                 "index":         i + 1,
                 "t_start":       t_start,
@@ -315,43 +230,39 @@ def assess_desc(
                 "description":   description,
                 "domain_scores": domain_scores,
                 "domain_ages":   {d: domain_scores[d]["age"] for d in DOMAINS},
-                "raw_text":      raw_text,
+                "raw_text":      "\n".join(
+                    (f"{d}: " + ", ".join(f"{f}={p}" for f, p in domain_scores[d]["phrases"].items()))
+                    if domain_scores[d]["phrases"] else f"{d}: none"
+                    for d in DOMAINS
+                ),
             })
 
-        # ---- Aggregate across chunks -----------------------------------------
+        # ---- Aggregate ------------------------------------------------------
         plm_features: dict = {}
         domain_ages:  dict = {}
 
         for domain in DOMAINS:
             per_chunk = [c["domain_scores"][domain] for c in chunk_details]
             agg = _aggregate_domain_scores(per_chunk, domain)
-
             if agg["features"]:
                 entry = dict(agg["features"])
-                entry["evidence"] = ", ".join(
-                    f"{f}={p}" for f, p in agg["phrases"].items()
-                )
+                entry["evidence"]         = ", ".join(f"{f}={p}" for f, p in agg["phrases"].items())
                 entry["matched_keywords"] = dict(agg["phrases"])
                 plm_features[domain] = entry
             else:
                 plm_features[domain] = None
             domain_ages[domain] = agg["age"]
 
-            if debug:
-                print(f"\n--- Aggregated [{domain}] age={agg['age']} ---")
-                for feat, score in agg["features"].items():
-                    print(f"  {feat}: {score:.2f}  ({agg['phrases'].get(feat, '')})")
-
-        observed_ages = [a for a in domain_ages.values() if a is not None]
-        overall_age = sum(observed_ages) / len(observed_ages) if observed_ages else None
-        stage_dist = stage_distribution(overall_age) if overall_age is not None else None
+        observed = [a for a in domain_ages.values() if a is not None]
+        overall  = sum(observed) / len(observed) if observed else None
+        stage_dist = stage_distribution(overall) if overall is not None else None
 
         return {
             "video_path":         video_path,
             "child_present":      True,
             "plm_features":       plm_features,
             "domain_ages":        domain_ages,
-            "overall_age_months": round(overall_age, 1) if overall_age is not None else None,
+            "overall_age_months": round(overall, 1) if overall is not None else None,
             "stage_distribution": stage_dist,
             "raw_plm_output":     "\n\n".join(c["description"] for c in chunk_details),
             "chunk_details":      chunk_details,
@@ -359,31 +270,22 @@ def assess_desc(
 
     finally:
         for p in chunk_paths:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+            try: os.unlink(p)
+            except OSError: pass
         if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            try: os.unlink(tmp_path)
+            except OSError: pass
 
 
 # ------------------------------------------------------------------------------
-# Custom report — shows description as PLM output, matched phrases per domain
+# Report — description is "PLM output", domain matching is internal
 # ------------------------------------------------------------------------------
 
 
-def _print_chunk_timeline_desc(chunk_details: list) -> None:
-    """Print per-chunk description (PLM output) and semantic-matched phrases."""
-    if not chunk_details:
-        return
-
-    n    = len(chunk_details)
-    sep  = "=" * 66
-    thin = "-" * 66
-
+def _print_chunk_timeline(chunk_details: list) -> None:
+    n   = len(chunk_details)
+    sep = "=" * 66
+    thin= "-" * 66
     print(f"\n  Per-chunk output ({n} chunk{'s' if n > 1 else ''})")
 
     for c in chunk_details:
@@ -395,11 +297,10 @@ def _print_chunk_timeline_desc(chunk_details: list) -> None:
         print(f"  Chunk {c['index']}  [{time_str}]")
         print(f"  {sep}")
 
-        # The description IS the PLM output
-        description = c.get("description", "")
+        desc = c.get("description", "")
         print(f"\n  PLM output:")
-        if description:
-            for line in description.strip().splitlines():
+        if desc:
+            for line in desc.strip().splitlines():
                 print(f"    {line}")
         else:
             print("    (description not generated)")
@@ -409,40 +310,34 @@ def _print_chunk_timeline_desc(chunk_details: list) -> None:
 
         for domain in DOMAINS:
             ds      = domain_scores.get(domain, {})
-            phrases = ds.get("phrases",  {})
+            phrases = ds.get("phrases", {})
             age_d   = domain_ages.get(domain)
             age_tag = f"  [{age_d:.0f}mo]" if age_d is not None else "  [n/a]"
-
             print(f"\n  [{domain.upper()}]{age_tag}")
             print(f"  {thin}")
-
             if phrases:
                 for feat, phrase in phrases.items():
                     score = ds.get("features", {}).get(feat)
                     score_str = f"  (score {score:.2f})" if score is not None else ""
                     print(f"    {_feat_label(feat)}: {phrase}{score_str}")
             else:
-                print("    (no levels matched — below similarity threshold)")
-
+                print("    (no levels matched)")
         print()
 
 
-def print_report_desc(result: dict) -> None:
-    """Formatted report for the description-first pipeline."""
+def print_report(result: dict) -> None:
     sep  = "=" * 62
     thin = "-" * 62
 
     child_present = result.get("child_present", False)
-    child_str = "YES" if child_present else "NO"
-
     print(f"\n{sep}")
     print(f"  Developmental Assessment  [description mode]")
     print(f"  {Path(result['video_path']).name}")
-    print(f"  Child present: {child_str}")
+    print(f"  Child present: {'YES' if child_present else 'NO'}")
     print(sep)
 
     if not child_present:
-        print("\n  No child detected in this video.\n")
+        print("\n  No child detected.\n")
         print(f"{sep}\n")
         return
 
@@ -457,7 +352,7 @@ def print_report_desc(result: dict) -> None:
             print("    (description not generated)")
         print(f"  {thin}")
     elif len(chunks) > 1:
-        _print_chunk_timeline_desc(chunks)
+        _print_chunk_timeline(chunks)
 
     print(f"\n{'Domain':<14} {'Feature scores':<30} {'Age est.'}")
     print(thin)
@@ -471,11 +366,9 @@ def print_report_desc(result: dict) -> None:
             print(f"  {domain:<12} not observed{'':<22} {age_str}")
             continue
 
-        feature_names = _DOMAIN_FEATURES[domain]
-        matched_kw    = features.get("matched_keywords", {})
-        lines    = []
-        kw_lines = []
-        for fname in feature_names:
+        matched_kw = features.get("matched_keywords", {})
+        lines, kw_lines = [], []
+        for fname in _DOMAIN_FEATURES[domain]:
             val = features.get(fname)
             if val is not None:
                 lines.append(f"{fname}: {val:.2f} {_bar(val, 10)}")
@@ -485,20 +378,17 @@ def print_report_desc(result: dict) -> None:
                 kw_lines.append("")
 
         print(f"  {domain:<12} {lines[0]:<32} {age_str}")
-        if kw_lines[0]:
-            print(f"  {'':<12} {kw_lines[0]}")
+        if kw_lines[0]: print(f"  {'':<12} {kw_lines[0]}")
         for line, kw_line in zip(lines[1:], kw_lines[1:]):
             print(f"  {'':<12} {line}")
-            if kw_line:
-                print(f"  {'':<12} {kw_line}")
+            if kw_line: print(f"  {'':<12} {kw_line}")
 
         evidence = features.get("evidence")
         if evidence:
             import textwrap
-            wrapped = textwrap.wrap(str(evidence), width=54)
-            print(f"  {'':<12} \033[3mEvidence: {wrapped[0]}\033[0m")
-            for w in wrapped[1:]:
-                print(f"  {'':<12}           {w}")
+            for i, w in enumerate(textwrap.wrap(str(evidence), 54)):
+                prefix = "Evidence: " if i == 0 else "          "
+                print(f"  {'':<12} \033[3m{prefix}{w}\033[0m")
 
     overall = result["overall_age_months"]
     print(f"\n{thin}")
@@ -522,63 +412,45 @@ def print_report_desc(result: dict) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Developmental assessment: PLM description + sentence-embedding matching.",
+        description="Developmental assessment: PLM description then PLM domain matching.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s --video clip.mp4
   %(prog)s --video clip.mp4 --num_frames 16 --chunk_duration 10
-  %(prog)s --video clip.mp4 --sim_threshold 0.35   # stricter matching
-  %(prog)s --video clip.mp4 --debug                # show per-feature NLI contradiction scores
-  %(prog)s --video clip.mp4 --json_only > result.json
+  %(prog)s --video clip.mp4 --debug
         """,
     )
-    parser.add_argument("--video", type=str, required=True,
-                        help="Path to the child's video.")
-    parser.add_argument("--ckpt", type=str, default="facebook/Perception-LM-3B",
-                        help="PLM checkpoint or HuggingFace ID.")
-    parser.add_argument("--num_frames", type=int, default=8,
-                        help="Frames to sample per PLM call (default: 8).")
-    parser.add_argument("--desc_max_gen_len", type=int, default=256,
-                        help="Max tokens for the behavioral description (default: 256).")
-    parser.add_argument("--temperature", type=float, default=0.0,
-                        help="Sampling temperature; 0.0 = greedy (default).")
-    parser.add_argument("--sim_threshold", type=float, default=0.50,
-                        help="Max NLI contradiction score to accept a match (default: 0.50). "
-                             "Lower = stricter; raise if too few features matched.")
-    parser.add_argument("--chunk_duration", type=float, default=None,
-                        help="Split video into chunks of this many seconds.")
-    parser.add_argument("--json_only", action="store_true",
-                        help="Print only the JSON result (no formatted report).")
-    parser.add_argument("--save", type=str, default=None,
-                        help="Save full result as JSON to this path.")
-    parser.add_argument("--output_video", type=str, default=None,
-                        help="Render keyword overlays onto the video and save here.")
-    parser.add_argument("--debug", action="store_true",
-                        help="Print per-feature NLI contradiction scores.")
+    parser.add_argument("--video",            type=str,   required=True)
+    parser.add_argument("--ckpt",             type=str,   default="facebook/Perception-LM-3B")
+    parser.add_argument("--num_frames",       type=int,   default=8)
+    parser.add_argument("--max_gen_len",      type=int,   default=128,
+                        help="Max tokens for domain selection calls (default: 128).")
+    parser.add_argument("--desc_max_gen_len", type=int,   default=256,
+                        help="Max tokens for description call (default: 256).")
+    parser.add_argument("--temperature",      type=float, default=0.0)
+    parser.add_argument("--chunk_duration",   type=float, default=None)
+    parser.add_argument("--json_only",        action="store_true")
+    parser.add_argument("--save",             type=str,   default=None)
+    parser.add_argument("--output_video",     type=str,   default=None)
+    parser.add_argument("--debug",            action="store_true")
 
     args = parser.parse_args()
 
-    logger.info(f"Loading PLM model: {args.ckpt}")
+    logger.info(f"Loading model: {args.ckpt}")
     model, tokenizer, config = load_consolidated_model_and_tokenizer(args.ckpt)
 
     result = assess_desc(
-        video_path=args.video,
-        model=model,
-        tokenizer=tokenizer,
-        config=config,
-        num_frames=args.num_frames,
-        temperature=args.temperature,
-        desc_max_gen_len=args.desc_max_gen_len,
-        sim_threshold=args.sim_threshold,
-        chunk_duration=args.chunk_duration,
-        debug=args.debug,
+        video_path=args.video, model=model, tokenizer=tokenizer, config=config,
+        num_frames=args.num_frames, temperature=args.temperature,
+        max_gen_len=args.max_gen_len, desc_max_gen_len=args.desc_max_gen_len,
+        chunk_duration=args.chunk_duration, debug=args.debug,
     )
 
     if args.json_only:
         print(json.dumps(result, indent=2))
     else:
-        print_report_desc(result)
+        print_report(result)
 
     if args.save:
         with open(args.save, "w") as f:
