@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -156,6 +157,8 @@ Examples:
                         help="Re-generate clips that already exist.")
     parser.add_argument("--save",          type=str, default=None,
                         help="Save clip metadata list as JSON to this path.")
+    parser.add_argument("--workers",       type=int, default=1,
+                        help="Number of videos to process in parallel (default: 1).")
     args = parser.parse_args()
 
     input_dir  = Path(args.input_dir)
@@ -172,13 +175,27 @@ Examples:
         return
 
     logger.info(f"Found {len(sources)} video(s) in {input_dir}")
-    logger.info(f"Output dir: {output_dir}  |  clip_duration: {args.clip_duration}s")
+    logger.info(f"Output dir: {output_dir}  |  clip_duration: {args.clip_duration}s  |  workers: {args.workers}")
 
     all_clips = []
-    for src in sources:
-        logger.info(f"Processing: {src.name}")
-        clips = split_video(str(src), str(output_dir), args.clip_duration, args.overwrite)
-        all_clips.extend(clips)
+    if args.workers > 1 and len(sources) > 1:
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = {
+                pool.submit(split_video, str(src), str(output_dir), args.clip_duration, args.overwrite): src
+                for src in sources
+            }
+            for fut in as_completed(futures):
+                src = futures[fut]
+                try:
+                    clips = fut.result()
+                    all_clips.extend(clips)
+                except Exception as exc:
+                    logger.error(f"Failed to process {src.name}: {exc}")
+    else:
+        for src in sources:
+            logger.info(f"Processing: {src.name}")
+            clips = split_video(str(src), str(output_dir), args.clip_duration, args.overwrite)
+            all_clips.extend(clips)
 
     logger.info(f"Total clips generated: {len(all_clips)}")
 
