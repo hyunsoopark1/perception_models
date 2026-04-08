@@ -57,6 +57,8 @@ from estimate_development import (
     _transcode_to_h264,
     _run_plm_text,
     # report / overlay
+    _STAGE_LABELS,
+    _bar,
     print_report,
     render_assessment_video,
 )
@@ -95,33 +97,38 @@ _PROMPT_DESCRIBE_BEHAVIOR = (
 def _build_domain_match_prompt(domain: str, description: str) -> str:
     """Build a domain-matching prompt that embeds the pre-generated description.
 
-    The model receives the behavioral description as explicit context, then
-    selects the ONE vocabulary level per feature that best matches.
-    Including the description reduces ambiguity so a single call is reliable.
+    Options are presented as a numbered list (not " < " separated) to prevent
+    the 8B model from echoing the full option list instead of selecting one.
     """
     features   = _DOMAIN_FEATURES[domain]
     desc_label = _DOMAIN_DESCRIPTIONS[domain]
 
-    level_lines = []
+    # Build numbered option blocks per feature.
+    # Also build a reverse lookup: number → phrase (used by the parser below).
+    level_blocks = []
     for feat in features:
         levels  = _FEATURE_LEVELS[feat]
         ordered = levels if feat in _DECREASING_FEATURES else sorted(levels, key=lambda x: x[0])
-        option_str = " < ".join(phrase for _, phrase in ordered)
-        level_lines.append(f"  {_feat_label(feat)}: {option_str}")
+        lines = [f"  {_feat_label(feat)} (youngest → most developed):"]
+        for idx, (_, phrase) in enumerate(ordered, start=1):
+            lines.append(f"    {idx}. {phrase}")
+        level_blocks.append("\n".join(lines))
 
-    answer_block = "\n".join(f"{_feat_label(feat)}: <option>" for feat in features)
+    answer_block = "\n".join(
+        f"{_feat_label(feat)}: <copy the exact phrase>" for feat in features
+    )
 
     return (
         f"A child in this video has been described as:\n"
         f"\"{description}\"\n\n"
         f"Based on this description and what you observe, for each {desc_label} skill "
-        f"below select the ONE option that BEST MATCHES the child's behavior.\n"
+        f"below, copy the ONE phrase that BEST MATCHES the child's behavior.\n"
         f"Rules:\n"
-        f"- Match what is described or directly visible.\n"
-        f"- If the skill is not mentioned and not observable, write: not visible\n"
-        f"Options run from youngest (left, ◄) to most developed (right, ►).\n\n"
-        + "\n".join(level_lines)
-        + f"\n\nReply in this exact format (one line per skill):\n{answer_block}"
+        f"- Copy the phrase verbatim from the numbered list.\n"
+        f"- If the skill is not mentioned and not observable, write: not visible\n\n"
+        + "\n\n".join(level_blocks)
+        + f"\n\nReply in this exact format (one line per skill, phrase copied verbatim):\n"
+        + answer_block
     )
 
 
@@ -360,6 +367,147 @@ def assess_desc(
 
 
 # ------------------------------------------------------------------------------
+# Custom report — shows description as PLM output, hides domain matching output
+# ------------------------------------------------------------------------------
+
+
+def _print_chunk_timeline_desc(chunk_details: list) -> None:
+    """Print per-chunk description (PLM output) and matched domain phrases."""
+    if not chunk_details:
+        return
+
+    n    = len(chunk_details)
+    sep  = "=" * 66
+    thin = "-" * 66
+
+    print(f"\n  Per-chunk output ({n} chunk{'s' if n > 1 else ''})")
+
+    for c in chunk_details:
+        t_s = int(c["t_start"])
+        t_e = int(c["t_end"]) if c["t_end"] is not None else "?"
+        time_str = f"{t_s}s – {t_e}s" if c["t_end"] is not None else "full video"
+
+        print(f"\n  {sep}")
+        print(f"  Chunk {c['index']}  [{time_str}]")
+        print(f"  {sep}")
+
+        # Show the behavioral description as "PLM output"
+        description = c.get("description", "")
+        if description:
+            print(f"\n  PLM output:")
+            for line in description.strip().splitlines():
+                print(f"    {line}")
+
+        domain_scores = c.get("domain_scores", {})
+        domain_ages   = c.get("domain_ages",   {})
+
+        for domain in DOMAINS:
+            ds      = domain_scores.get(domain, {})
+            phrases = ds.get("phrases",  {})
+            age_d   = domain_ages.get(domain)
+            age_tag = f"  [{age_d:.0f}mo]" if age_d is not None else "  [n/a]"
+
+            print(f"\n  [{domain.upper()}]{age_tag}")
+            print(f"  {thin}")
+
+            if phrases:
+                for feat, phrase in phrases.items():
+                    score = ds.get("features", {}).get(feat)
+                    score_str = f"  (score {score:.2f})" if score is not None else ""
+                    print(f"    {_feat_label(feat)}: {phrase}{score_str}")
+            else:
+                print("    (no levels matched)")
+
+        print()
+
+
+def print_report_desc(result: dict) -> None:
+    """Formatted report for the description-first pipeline."""
+    sep  = "=" * 62
+    thin = "-" * 62
+
+    child_present = result.get("child_present", False)
+    child_str = "YES" if child_present else "NO"
+
+    print(f"\n{sep}")
+    print(f"  Developmental Assessment  [description mode]")
+    print(f"  {Path(result['video_path']).name}")
+    print(f"  Child present: {child_str}")
+    print(sep)
+
+    if not child_present:
+        print("\n  No child detected in this video.\n")
+        print(f"{sep}\n")
+        return
+
+    chunks = result.get("chunk_details", [])
+    if len(chunks) == 1:
+        desc = chunks[0].get("description", "")
+        if desc:
+            print(f"\n  PLM output:")
+            for line in desc.strip().splitlines():
+                print(f"    {line}")
+            print(f"  {thin}")
+    elif len(chunks) > 1:
+        _print_chunk_timeline_desc(chunks)
+
+    print(f"\n{'Domain':<14} {'Feature scores':<30} {'Age est.'}")
+    print(thin)
+
+    for domain in DOMAINS:
+        features = result["plm_features"].get(domain)
+        age      = result["domain_ages"].get(domain)
+        age_str  = f"{age:.1f} mo" if age is not None else "n/a"
+
+        if features is None:
+            print(f"  {domain:<12} not observed{'':<22} {age_str}")
+            continue
+
+        feature_names = _DOMAIN_FEATURES[domain]
+        matched_kw    = features.get("matched_keywords", {})
+        lines    = []
+        kw_lines = []
+        for fname in feature_names:
+            val = features.get(fname)
+            if val is not None:
+                lines.append(f"{fname}: {val:.2f} {_bar(val, 10)}")
+                kw_lines.append(f"  matched: {matched_kw.get(fname, '?')}")
+            else:
+                lines.append(f"{fname}: --")
+                kw_lines.append("")
+
+        print(f"  {domain:<12} {lines[0]:<32} {age_str}")
+        if kw_lines[0]:
+            print(f"  {'':<12} {kw_lines[0]}")
+        for line, kw_line in zip(lines[1:], kw_lines[1:]):
+            print(f"  {'':<12} {line}")
+            if kw_line:
+                print(f"  {'':<12} {kw_line}")
+
+        evidence = features.get("evidence")
+        if evidence:
+            import textwrap
+            wrapped = textwrap.wrap(str(evidence), width=54)
+            print(f"  {'':<12} \033[3mEvidence: {wrapped[0]}\033[0m")
+            for w in wrapped[1:]:
+                print(f"  {'':<12}           {w}")
+
+    overall = result["overall_age_months"]
+    print(f"\n{thin}")
+    print(f"  Overall estimated age: "
+          f"{'%.1f months' % overall if overall is not None else 'insufficient data'}")
+
+    dist = result["stage_distribution"]
+    if dist:
+        print(f"\n  Stage distribution:")
+        for stage, prob in dist.items():
+            label = _STAGE_LABELS.get(stage, stage)
+            print(f"    {stage} ({label:<17}) {_bar(prob, 20)} {prob:.3f}")
+
+    print(f"\n{sep}\n")
+
+
+# ------------------------------------------------------------------------------
 # CLI
 # ------------------------------------------------------------------------------
 
@@ -420,9 +568,7 @@ Examples:
     if args.json_only:
         print(json.dumps(result, indent=2))
     else:
-        print_report(result)
-        print("--- Behavioral description ---")
-        print(result["raw_plm_output"])
+        print_report_desc(result)
 
     if args.save:
         with open(args.save, "w") as f:
