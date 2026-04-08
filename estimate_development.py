@@ -306,7 +306,17 @@ def _parse_domain_output(domain: str, text: str) -> dict:
         m = pattern.search(text)
         if not m:
             continue
-        answer = m.group(1).strip().rstrip(".").lower()
+        raw = m.group(1).strip()
+
+        # 8B model sometimes wraps the answer in angle brackets: <phrase>
+        raw = raw.strip("<>").strip()
+        answer = raw.rstrip(".").lower()
+
+        # If the model echoed the full option list (joined by " < "), it did
+        # not select one — treat as not visible.
+        if " < " in answer:
+            continue
+
         # Explicit "not visible" means the feature is unobservable in this clip
         if answer in ("not visible", "not observed", "none", "n/a"):
             continue
@@ -867,9 +877,17 @@ def print_report(result: dict) -> None:
         print(f"{sep}\n")
         return
 
-    # Per-chunk breakdown (only when chunking was used)
     chunks = result.get("chunk_details", [])
-    if len(chunks) > 1:
+    if len(chunks) == 1:
+        # Single chunk: print description inline before the scores table
+        desc = chunks[0].get("description", "")
+        if desc:
+            thin = "-" * 62
+            print(f"\n  Description:")
+            for line in desc.strip().splitlines():
+                print(f"    {line}")
+            print(f"  {thin}")
+    elif len(chunks) > 1:
         _print_chunk_timeline(chunks)
 
     print(f"\n{'Domain':<14} {'Feature scores (keyword)':<30} {'Age est.'}")
