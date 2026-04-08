@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -220,28 +221,33 @@ def process_clips(
             results[key] = entry
             continue
 
+        t0 = time.time()
         logger.info(f"[{i+1}/{total}] Processing: {Path(clip_path).name}")
 
         if need_describe:
-            logger.info("  → description")
+            logger.info("  → description ...")
             entry["description"] = get_description(
                 clip_path, model, tokenizer, config, num_frames, temperature
             )
             logger.info(f"     {entry['description'][:80]!r}")
 
         if need_stage:
-            logger.info("  → stage")
+            logger.info("  → stage ...")
             entry["stage"] = get_stage(
                 clip_path, model, tokenizer, config, num_frames, temperature
             )
             logger.info(f"     {entry['stage']!r}")
 
         if need_evidence:
-            logger.info("  → evidence")
+            logger.info("  → evidence ...")
             entry["evidence"] = get_evidence(
                 clip_path, model, tokenizer, config, num_frames, temperature
             )
             logger.info(f"     motor: {entry['evidence'].get('motor','')[:60]!r}")
+
+        elapsed = time.time() - t0
+        remaining = (total - i - 1) * elapsed
+        logger.info(f"  clip done in {elapsed:.1f}s | est. remaining: {remaining/60:.0f} min")
 
         results[key] = entry
 
@@ -323,8 +329,12 @@ Examples:
     else:
         output_path = str(Path(args.clips_json).parent / "descriptions.json")
 
-    logger.info(f"Loading model: {args.ckpt}")
+    logger.info(f"Loading model: {args.ckpt}  (this can take 2-4 min for 8B) ...")
     model, tokenizer, config = load_consolidated_model_and_tokenizer(args.ckpt)
+    logger.info("Model loaded and ready.")
+
+    tasks = [t for t, f in [("describe", do_describe), ("stage", do_stage), ("evidence", do_evidence)] if f]
+    logger.info(f"Tasks: {tasks}  |  clips: {len(clips)}  |  output: {output_path}")
 
     process_clips(
         clips=clips,
