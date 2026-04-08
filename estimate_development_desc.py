@@ -70,17 +70,9 @@ _PROMPT_CHILD = (
     "and active in this video? Answer only: yes or no."
 )
 
-# Focused description prompt: elicits observable developmental behaviors.
-_PROMPT_DESCRIBE_BEHAVIOR = (
-    "Describe this child's behavior in detail. "
-    "Focus on: how they move (crawling, walking, running, climbing), "
-    "what their hands do (grasping, stacking, drawing), "
-    "how long they stay focused on one activity, "
-    "whether they pursue a goal or solve a problem, "
-    "how they interact with people around them, "
-    "how dependent they seem on a caregiver, "
-    "and how they communicate (sounds, words, gestures)."
-)
+# Focused description prompt — kept short to avoid triggering early EOS.
+# The model generates better responses to simple, direct prompts.
+_PROMPT_DESCRIBE_BEHAVIOR = "Describe what the child is doing in this video in detail."
 
 
 # ------------------------------------------------------------------------------
@@ -284,18 +276,27 @@ def assess_desc(
                 num_frames=num_frames, temperature=temperature,
                 max_gen_len=desc_max_gen_len,
             )
-            logger.info(
-                f"  Description ({len(description)} chars): "
-                f"{description[:100]!r}{'...' if len(description) > 100 else ''}"
-            )
+            if not description:
+                logger.warning(
+                    f"  Description empty for segment {i + 1} — "
+                    "PLM generated no text. Skipping domain matching for this chunk."
+                )
+            else:
+                logger.info(
+                    f"  Description ({len(description)} chars): "
+                    f"{description[:100]!r}{'...' if len(description) > 100 else ''}"
+                )
 
-            # Step 2: semantic match description → domain vocabulary (no PLM)
+            # Step 2: NLI-match description → domain vocabulary (only if non-empty)
             domain_scores: dict = {}
             for domain in DOMAINS:
-                ds = _match_description_to_domain(
-                    description, domain,
-                    threshold=sim_threshold, debug=debug,
-                )
+                if not description:
+                    ds = {"features": {}, "phrases": {}, "age": None, "raw_outputs": []}
+                else:
+                    ds = _match_description_to_domain(
+                        description, domain,
+                        threshold=sim_threshold, debug=debug,
+                    )
                 domain_scores[domain] = ds
                 if debug:
                     age_d = ds["age"]
