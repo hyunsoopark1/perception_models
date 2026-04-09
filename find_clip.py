@@ -126,6 +126,20 @@ def _period_label(year_month: str, period: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _exact_score(text: str, query: str) -> float:
+    """Fraction of query words found in text (case-insensitive, whole-word match).
+
+    Returns 1.0 only when every query word appears in the text.
+    Returns 0.0 when no query words match.
+    """
+    words = re.findall(r"\w+", query.lower())
+    if not words:
+        return 0.0
+    text_lower = text.lower()
+    matched = sum(1 for w in words if re.search(rf"\b{re.escape(w)}\b", text_lower))
+    return matched / len(words)
+
+
 def find_best_clips(
     descriptions: dict,
     query: str,
@@ -135,6 +149,7 @@ def find_best_clips(
     top_k: int = 1,
     threshold: float = 0.0,
     period: str = "quarter",
+    exact: bool = False,
 ) -> dict:
     """Find the best-matching clip for each time period.
 
@@ -186,11 +201,14 @@ def find_best_clips(
         logger.warning("No text found in entries for the selected fields.")
         return {}
 
-    logger.info(f"Encoding {len(all_texts)} clip texts and query ...")
-    corpus_embs = _embed(all_texts, encoder_model)
-    query_emb   = _embed_query(query, encoder_model)
-
-    sims = corpus_embs @ query_emb   # cosine similarity
+    if exact:
+        logger.info(f"Exact word matching for {len(all_texts)} clips ...")
+        sims = [_exact_score(t, query) for t in all_texts]
+    else:
+        logger.info(f"Encoding {len(all_texts)} clip texts and query ...")
+        corpus_embs = _embed(all_texts, encoder_model)
+        query_emb   = _embed_query(query, encoder_model)
+        sims = list(corpus_embs @ query_emb)
 
     # Build per-period ranked results
     period_scores: dict = {}
@@ -414,8 +432,10 @@ Examples:
                         help="Sentence transformer model (default: all-mpnet-base-v2). "
                              "Try BAAI/bge-large-en-v1.5 for best quality.")
     parser.add_argument("--threshold",     type=float, default=0.0,
-                        help="Minimum cosine similarity to include a month (default: 0.0). "
-                             "Months where the best-matching clip scores below this are excluded.")
+                        help="Minimum score to include a period (default: 0.0).")
+    parser.add_argument("--exact",          action="store_true",
+                        help="Match query words exactly (whole-word, case-insensitive) instead "
+                             "of semantic similarity. Score = fraction of query words found in text.")
     parser.add_argument("--compile",        type=str, default=None,
                         metavar="OUTPUT_VIDEO",
                         help="Create a compilation video from the selected clips "
@@ -437,6 +457,7 @@ Examples:
         top_k=args.top_k,
         threshold=args.threshold,
         period=args.period,
+        exact=args.exact,
     )
 
     if not results:
