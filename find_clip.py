@@ -36,7 +36,6 @@ import json
 import logging
 import os
 import re
-import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -381,25 +380,23 @@ def main():
         epilog="""
 Examples:
   %(prog)s --descriptions data/clips/descriptions.json \\
-           --query "child climbing independently" \\
-           --output_dir best_clips/
+           --query "child walking independently" \\
+           --compile compilation.mp4
 
   %(prog)s --descriptions descriptions.json \\
            --query "first steps unsteady walking" \\
-           --month 2025-06 \\
-           --top_k 3
+           --period month --compile out.mp4
 
   %(prog)s --descriptions descriptions.json \\
            --query "runs, says two-word phrases" \\
-           --match_fields description stage evidence
+           --match_fields description stage evidence \\
+           --compile out.mp4
         """,
     )
     parser.add_argument("--descriptions",  type=str, required=True,
                         help="descriptions.json from extract_description.py.")
     parser.add_argument("--query",         type=str, required=True,
                         help="Query text to match against.")
-    parser.add_argument("--output_dir",    type=str, default=None,
-                        help="Copy best clips here. If omitted, just prints results.")
     parser.add_argument("--month",         type=str, default=None,
                         help="Restrict search to one month, e.g. 2025-06.")
     parser.add_argument("--match_fields",  type=str, nargs="+",
@@ -422,9 +419,6 @@ Examples:
                         metavar="OUTPUT_VIDEO",
                         help="Create a compilation video from the selected clips "
                              "(e.g. --compile compilation.mp4).")
-    parser.add_argument("--copy",          action="store_true",
-                        help="Alias for --output_dir: copy files even if no dir set "
-                             "(uses ./best_clips/).")
     args = parser.parse_args()
 
     # Load descriptions
@@ -450,11 +444,11 @@ Examples:
 
     # Display results
     print(f"\nQuery: {args.query!r}")
-    print(f"Match fields: {args.match_fields}")
+    print(f"Period: {args.period}  |  Match fields: {args.match_fields}")
     print()
-    for ym in sorted(results):
-        print(f"  Month {ym}:")
-        for rank, item in enumerate(results[ym], 1):
+    for pk in sorted(results):
+        print(f"  {pk}:")
+        for rank, item in enumerate(results[pk], 1):
             entry = item["entry"]
             print(f"    [{rank}] score={item['score']:.3f}  {Path(item['clip_path']).name}")
             if entry.get("stage"):
@@ -464,43 +458,9 @@ Examples:
                 print(f"         desc:  {desc[:100]}{'...' if len(desc) > 100 else ''}")
         print()
 
-    # Copy best clips if requested
-    output_dir = args.output_dir or ("best_clips" if args.copy else None)
-    if output_dir:
-        out = Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        copied = 0
-        for ym in sorted(results):
-            for rank, item in enumerate(results[ym], 1):
-                src = Path(item["clip_path"])
-                if not src.exists():
-                    logger.warning(f"Source not found: {src}")
-                    continue
-                # Rename to include month and rank for clarity
-                suffix = f"_rank{rank:02d}" if args.top_k > 1 else ""
-                dst = out / f"{ym}{suffix}_{src.name}"
-                shutil.copy2(str(src), str(dst))
-                logger.info(f"  Copied: {src.name} → {dst.name}")
-                copied += 1
-        logger.info(f"Copied {copied} clip(s) to {out}")
-
     # Create compilation video
     if args.compile:
         create_compilation(results, args.compile)
-
-    # Save search results as JSON
-    save_path = (Path(output_dir) / "search_results.json") if output_dir else None
-    if save_path:
-        serialisable = {
-            ym: [{"clip_path": it["clip_path"], "score": it["score"],
-                  "stage": it["entry"].get("stage", ""),
-                  "description": it["entry"].get("description", "")}
-                 for it in items]
-            for ym, items in results.items()
-        }
-        with open(save_path, "w") as f:
-            json.dump({"query": args.query, "results": serialisable}, f, indent=2)
-        logger.info(f"Search results saved to: {save_path}")
 
 
 if __name__ == "__main__":
