@@ -2,13 +2,13 @@
 """
 Plot developmental stage predictions over time from extract_description.py output.
 
-Each clip is plotted as a point: x = recording date, y = developmental stage.
-Multiple clips from the same date are jittered vertically to avoid overlap.
+x axis: child's age in months (recording date − birthdate)
+y axis: predicted developmental stage (discrete)
 
 Usage:
     python plot_development.py descriptions.json
-    python plot_development.py descriptions.json --output growth.png
-    python plot_development.py descriptions.json --smooth       # add trend line
+    python plot_development.py descriptions.json --output growth.png --smooth
+    python plot_development.py descriptions.json --birthdate 2023-08-10
 """
 
 import argparse
@@ -19,8 +19,9 @@ from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 import numpy as np
+
+BIRTHDATE_DEFAULT = datetime(2023, 8, 10)
 
 # Ordered developmental stages (youngest → oldest)
 STAGE_ORDER = [
@@ -33,9 +34,6 @@ STAGE_ORDER = [
     "25-36 months",
 ]
 
-# Approximate midpoint in months for each stage (used for trend line fitting)
-STAGE_MONTHS = [1.5, 5, 8, 11, 15.5, 21.5, 30.5]
-
 
 def _parse_stage(raw: str) -> int | None:
     """Return 0-based index into STAGE_ORDER, or None if unrecognised."""
@@ -45,7 +43,6 @@ def _parse_stage(raw: str) -> int | None:
     for i, label in enumerate(STAGE_ORDER):
         if label.lower() in raw or raw in label.lower():
             return i
-    # Try matching just the numeric part, e.g. "13-18" inside a longer string
     m = re.search(r"\d+[-–]\d+", raw)
     if m:
         token = m.group().replace("–", "-")
@@ -67,11 +64,15 @@ def _extract_date(clip_path: str) -> datetime | None:
     return None
 
 
-def load_data(json_path: str):
+def _age_months(dt: datetime, birthdate: datetime) -> float:
+    return (dt - birthdate).days / 30.4375
+
+
+def load_data(json_path: str, birthdate: datetime):
     with open(json_path) as f:
         records = json.load(f)
 
-    dates, stage_idxs, labels, paths = [], [], [], []
+    ages, stage_idxs, paths = [], [], []
     skipped = 0
     for clip_path, entry in records.items():
         stage_raw = entry.get("stage", "")
@@ -80,76 +81,71 @@ def load_data(json_path: str):
         if dt is None or idx is None:
             skipped += 1
             continue
-        dates.append(dt)
+        ages.append(_age_months(dt, birthdate))
         stage_idxs.append(idx)
-        labels.append(STAGE_ORDER[idx])
         paths.append(clip_path)
 
     if skipped:
         print(f"Skipped {skipped} clip(s) with missing date or unrecognised stage.")
 
-    order = np.argsort(dates)
-    dates      = [dates[i]       for i in order]
+    order = np.argsort(ages)
+    ages       = [ages[i]       for i in order]
     stage_idxs = [stage_idxs[i] for i in order]
-    labels     = [labels[i]      for i in order]
-    paths      = [paths[i]       for i in order]
-    return dates, stage_idxs, labels, paths
+    paths      = [paths[i]      for i in order]
+    return ages, stage_idxs, paths
 
 
-def add_jitter(stage_idxs, dates, jitter_y=0.18):
-    """Vertically jitter points that share the same date+stage."""
-    from collections import Counter
-    y = np.array(stage_idxs, dtype=float)
-    x_num = mdates.date2num(dates)
-    counter: dict[tuple, int] = {}
-    for i, (xi, yi) in enumerate(zip(x_num, stage_idxs)):
-        key = (xi, yi)
-        n = counter.get(key, 0)
-        # Alternate above/below: 0, +1, -1, +2, -2, ...
+def _horizontal_jitter(ages, stage_idxs, jitter_x=0.3):
+    """Horizontally jitter points that share the same rounded age+stage bucket."""
+    x = np.array(ages, dtype=float)
+    buckets: dict[tuple, int] = {}
+    for i, (a, s) in enumerate(zip(ages, stage_idxs)):
+        key = (round(a), s)
+        n = buckets.get(key, 0)
         sign = 1 if n % 2 == 1 else -1
-        offset = sign * ((n + 1) // 2) * jitter_y
-        y[i] += offset
-        counter[key] = n + 1
-    return y
+        x[i] += sign * ((n + 1) // 2) * jitter_x
+        buckets[key] = n + 1
+    return x
 
 
-def plot(dates, stage_idxs, labels, output_path=None, smooth=False, title=None):
+def plot(ages, stage_idxs, paths, birthdate, output_path=None, smooth=False, title=None):
     fig, ax = plt.subplots(figsize=(12, 5))
 
-    y_jittered = add_jitter(stage_idxs, dates)
+    x = _horizontal_jitter(ages, stage_idxs)
+    y = np.array(stage_idxs, dtype=int)  # strictly integer — no vertical jitter
 
-    # Color by stage index
     cmap = plt.get_cmap("plasma", len(STAGE_ORDER))
     colors = [cmap(idx / (len(STAGE_ORDER) - 1)) for idx in stage_idxs]
 
-    ax.scatter(dates, y_jittered, c=colors, s=60, alpha=0.75, zorder=3,
+    ax.scatter(x, y, c=colors, s=60, alpha=0.75, zorder=3,
                edgecolors="white", linewidths=0.4)
 
-    # Optional LOWESS-style trend: fit a degree-1 poly over time
-    if smooth and len(dates) >= 4:
-        x_num = mdates.date2num(dates)
-        coeffs = np.polyfit(x_num, stage_idxs, deg=1)
-        x_fit = np.linspace(x_num[0], x_num[-1], 200)
+    # Optional linear trend line
+    if smooth and len(ages) >= 4:
+        coeffs = np.polyfit(ages, stage_idxs, deg=1)
+        x_fit = np.linspace(min(ages), max(ages), 200)
         y_fit = np.polyval(coeffs, x_fit)
-        ax.plot(mdates.num2date(x_fit), y_fit, color="steelblue",
-                lw=2, alpha=0.7, linestyle="--", label="trend (linear fit)")
+        ax.plot(x_fit, y_fit, color="steelblue", lw=2, alpha=0.7,
+                linestyle="--", label="trend (linear fit)")
         ax.legend(fontsize=9)
 
-    # y axis: stage labels
+    # y axis: discrete stage labels only
     ax.set_yticks(range(len(STAGE_ORDER)))
     ax.set_yticklabels(STAGE_ORDER, fontsize=9)
     ax.set_ylim(-0.6, len(STAGE_ORDER) - 0.4)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.4)
 
-    # x axis: dates
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    ax.xaxis.set_major_locator(mdates.MonthLocator())
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right", fontsize=9)
-
-    ax.set_xlabel("Recording date", fontsize=11)
+    # x axis: age in months
+    ax.set_xlabel(f"Child's age (months)  [born {birthdate.strftime('%Y-%m-%d')}]", fontsize=11)
     ax.set_ylabel("Predicted developmental stage", fontsize=11)
-    ax.set_title(title or "Developmental stage over time", fontsize=13)
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-    ax.grid(axis="x", linestyle=":", alpha=0.3)
+    ax.set_title(title or "Developmental stage by age", fontsize=13)
+    ax.xaxis.grid(True, linestyle=":", alpha=0.3)
+
+    # Minor tick every month, major every 3
+    max_age = max(ages) if ages else 36
+    ax.set_xlim(max(0, min(ages) - 1), max_age + 1)
+    ax.xaxis.set_major_locator(plt.MultipleLocator(3))
+    ax.xaxis.set_minor_locator(plt.MultipleLocator(1))
 
     plt.tight_layout()
 
@@ -161,26 +157,34 @@ def plot(dates, stage_idxs, labels, output_path=None, smooth=False, title=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot developmental stage predictions over time.")
+    parser = argparse.ArgumentParser(description="Plot developmental stage predictions by child age.")
     parser.add_argument("descriptions_json",
                         help="JSON file produced by extract_description.py")
+    parser.add_argument("--birthdate", type=str, default="2023-08-10",
+                        help="Child's birthdate as YYYY-MM-DD (default: 2023-08-10).")
     parser.add_argument("--output", "-o", type=str, default=None,
-                        help="Save plot to this file (PNG/PDF/SVG). Displays interactively if omitted.")
+                        help="Save plot to file (PNG/PDF/SVG). Shows interactively if omitted.")
     parser.add_argument("--smooth", action="store_true",
                         help="Overlay a linear trend line.")
     parser.add_argument("--title", type=str, default=None,
                         help="Custom plot title.")
     args = parser.parse_args()
 
-    dates, stage_idxs, labels, paths = load_data(args.descriptions_json)
-    if not dates:
+    try:
+        birthdate = datetime.strptime(args.birthdate, "%Y-%m-%d")
+    except ValueError:
+        print(f"Invalid birthdate format: {args.birthdate!r}. Use YYYY-MM-DD.")
+        sys.exit(1)
+
+    ages, stage_idxs, paths = load_data(args.descriptions_json, birthdate)
+    if not ages:
         print("No plottable data found — check that 'stage' fields are populated.")
         sys.exit(1)
 
-    print(f"Plotting {len(dates)} clip(s) spanning "
-          f"{dates[0].strftime('%Y-%m-%d')} → {dates[-1].strftime('%Y-%m-%d')}")
+    print(f"Plotting {len(ages)} clip(s), age range "
+          f"{min(ages):.1f} → {max(ages):.1f} months")
 
-    plot(dates, stage_idxs, labels,
+    plot(ages, stage_idxs, paths, birthdate,
          output_path=args.output,
          smooth=args.smooth,
          title=args.title)
