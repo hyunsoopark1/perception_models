@@ -50,21 +50,32 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────────
 
 _encoder = None
+_encoder_name = None
 
 
-def _load_encoder(model_name: str = "all-MiniLM-L6-v2"):
-    global _encoder
-    if _encoder is None:
+def _load_encoder(model_name: str = "all-mpnet-base-v2"):
+    global _encoder, _encoder_name
+    if _encoder is None or _encoder_name != model_name:
         from sentence_transformers import SentenceTransformer
         logger.info(f"Loading sentence encoder ({model_name}) ...")
         _encoder = SentenceTransformer(model_name)
+        _encoder_name = model_name
     return _encoder
 
 
-def _embed(texts: list, model_name: str = "all-MiniLM-L6-v2") -> np.ndarray:
+def _embed(texts: list, model_name: str = "all-mpnet-base-v2") -> np.ndarray:
     """Encode a list of strings; returns (N, D) float32 array, L2-normalised."""
     enc = _load_encoder(model_name)
     return enc.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+
+
+def _embed_query(query: str, model_name: str) -> np.ndarray:
+    """Encode the query, adding the BGE instruction prefix when appropriate."""
+    enc = _load_encoder(model_name)
+    # BGE models benefit from a retrieval instruction on the query side
+    if "bge" in model_name.lower():
+        query = f"Represent this sentence for searching relevant passages: {query}"
+    return enc.encode([query], normalize_embeddings=True, show_progress_bar=False)[0]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -99,7 +110,7 @@ def find_best_clips(
     query: str,
     match_fields: list = None,
     month_filter: Optional[str] = None,
-    encoder_model: str = "all-MiniLM-L6-v2",
+    encoder_model: str = "all-mpnet-base-v2",
     top_k: int = 1,
     threshold: float = 0.0,
 ) -> dict:
@@ -156,7 +167,7 @@ def find_best_clips(
 
     logger.info(f"Encoding {len(all_texts)} clip texts and query ...")
     corpus_embs = _embed(all_texts, encoder_model)
-    query_emb   = _embed([query], encoder_model)[0]
+    query_emb   = _embed_query(query, encoder_model)
 
     sims = corpus_embs @ query_emb   # cosine similarity
 
@@ -222,8 +233,9 @@ Examples:
     parser.add_argument("--top_k",         type=int, default=1,
                         help="Clips to select per month (default: 1).")
     parser.add_argument("--encoder",       type=str,
-                        default="all-MiniLM-L6-v2",
-                        help="Sentence transformer model (default: all-MiniLM-L6-v2).")
+                        default="all-mpnet-base-v2",
+                        help="Sentence transformer model (default: all-mpnet-base-v2). "
+                             "Try BAAI/bge-large-en-v1.5 for best quality.")
     parser.add_argument("--threshold",     type=float, default=0.0,
                         help="Minimum cosine similarity to include a month (default: 0.0). "
                              "Months where the best-matching clip scores below this are excluded.")
