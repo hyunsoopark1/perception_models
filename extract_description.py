@@ -47,7 +47,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".m4v"}
 # Prompts
 # ──────────────────────────────────────────────────────────────────────────────
 
-PROMPT_DESCRIBE = "Describe what the child is doing in this video in detail."
+PROMPT_DESCRIBE = "Describe what is happening in this video in detail."
 
 PROMPT_STAGE = (
     "What is the developmental stage of the child in this video?\n"
