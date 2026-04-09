@@ -95,24 +95,11 @@ def load_data(json_path: str, birthdate: datetime):
     return ages, stage_idxs, paths
 
 
-def _horizontal_jitter(ages, stage_idxs, jitter_x=0.3):
-    """Horizontally jitter points that share the same rounded age+stage bucket."""
-    x = np.array(ages, dtype=float)
-    buckets: dict[tuple, int] = {}
-    for i, (a, s) in enumerate(zip(ages, stage_idxs)):
-        key = (round(a), s)
-        n = buckets.get(key, 0)
-        sign = 1 if n % 2 == 1 else -1
-        x[i] += sign * ((n + 1) // 2) * jitter_x
-        buckets[key] = n + 1
-    return x
-
-
 def plot(ages, stage_idxs, paths, birthdate, output_path=None, smooth=False, title=None):
     fig, ax = plt.subplots(figsize=(12, 5))
 
-    x = _horizontal_jitter(ages, stage_idxs)
-    y = np.array(stage_idxs, dtype=int)  # strictly integer — no vertical jitter
+    x = np.array(ages, dtype=float)
+    y = np.array(stage_idxs, dtype=int)
 
     cmap = plt.get_cmap("plasma", len(STAGE_ORDER))
     colors = [cmap(idx / (len(STAGE_ORDER) - 1)) for idx in stage_idxs]
