@@ -101,6 +101,7 @@ def find_best_clips(
     month_filter: Optional[str] = None,
     encoder_model: str = "all-MiniLM-L6-v2",
     top_k: int = 1,
+    threshold: float = 0.0,
 ) -> dict:
     """Find the best-matching clip for each calendar month.
 
@@ -111,6 +112,8 @@ def find_best_clips(
                        (default: ["description"]).
         month_filter:  If set (e.g. "2025-06"), only search within that month.
         top_k:         Number of clips to return per month (default 1).
+        threshold:     Minimum cosine similarity to include a clip (default 0.0).
+                       Months where the best score is below this are excluded.
 
     Returns:
         {year_month: [{"clip_path": ..., "score": ..., "entry": ...}, ...]}
@@ -166,10 +169,14 @@ def find_best_clips(
             "entry":     descriptions[clip_path],
         })
 
-    # Sort and keep top_k per month
+    # Sort and keep top_k per month; drop months below threshold
     results = {}
     for ym, items in month_scores.items():
         items.sort(key=lambda x: x["score"], reverse=True)
+        best_score = items[0]["score"]
+        if best_score < threshold:
+            logger.info(f"  Month {ym}: best score {best_score:.3f} < threshold {threshold:.3f} — skipped.")
+            continue
         results[ym] = items[:top_k]
 
     return results
@@ -217,6 +224,9 @@ Examples:
     parser.add_argument("--encoder",       type=str,
                         default="all-MiniLM-L6-v2",
                         help="Sentence transformer model (default: all-MiniLM-L6-v2).")
+    parser.add_argument("--threshold",     type=float, default=0.0,
+                        help="Minimum cosine similarity to include a month (default: 0.0). "
+                             "Months where the best-matching clip scores below this are excluded.")
     parser.add_argument("--copy",          action="store_true",
                         help="Alias for --output_dir: copy files even if no dir set "
                              "(uses ./best_clips/).")
@@ -235,6 +245,7 @@ Examples:
         month_filter=args.month,
         encoder_model=args.encoder,
         top_k=args.top_k,
+        threshold=args.threshold,
     )
 
     if not results:
