@@ -126,7 +126,7 @@ def get_evidence(video_path, model, tokenizer, config,
                  num_frames=8, temperature=0.0) -> dict:
     """Return per-domain evidence dict."""
     raw = _run(video_path, PROMPT_EVIDENCE, model, tokenizer, config,
-               num_frames=num_frames, temperature=temperature, max_gen_len=512)
+               num_frames=num_frames, temperature=temperature, max_gen_len=1024)
     evidence = {}
     for domain in EVIDENCE_DOMAINS:
         pattern = re.compile(
@@ -244,7 +244,10 @@ def process_clips(
             entry["evidence"] = get_evidence(
                 clip_path, model, tokenizer, config, num_frames, temperature
             )
-            logger.info(f"     motor: {entry['evidence'].get('motor','')[:60]!r}")
+            for dom in ["motor", "autonomy", "attention", "interaction", "language"]:
+                val = entry["evidence"].get(dom, "")
+                status = repr(val[:80]) if val else "(empty)"
+                logger.info(f"     {dom}: {status}")
 
         elapsed = time.time() - t0
         remaining = (total - i - 1) * elapsed
