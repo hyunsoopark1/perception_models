@@ -250,7 +250,8 @@ def _wrapped_lines(text: str, font, scale: float, thickness: int, max_w: int) ->
 
 
 def _draw_overlay(frame: np.ndarray, date_str: str, stage_str: str,
-                  description: str, evidence: dict, overlay_h: int) -> np.ndarray:
+                  description: str, evidence: dict, overlay_h: int,
+                  score: float = 0.0) -> np.ndarray:
     """Draw a semi-transparent text panel at the bottom of frame."""
     h, w = frame.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -265,8 +266,8 @@ def _draw_overlay(frame: np.ndarray, date_str: str, stage_str: str,
 
     y = h - overlay_h + 26
 
-    # Line 1: date + stage (highlighted)
-    header = f"{date_str}   |   {stage_str}"
+    # Line 1: date + stage + score (highlighted)
+    header = f"{date_str}   |   {stage_str}   |   score: {score:.3f}"
     cv2.putText(frame, header, (margin_x, y), font, 0.65,
                 (255, 210, 60), 2, cv2.LINE_AA)
     y += 30
@@ -327,11 +328,11 @@ def create_compilation(results: dict, output_path: str,
     ordered = []
     for pk in sorted(results.keys()):
         for item in results[pk]:
-            ordered.append((pk, item["clip_path"], item["entry"]))
+            ordered.append((pk, item["clip_path"], item["entry"], item["score"]))
 
     logger.info(f"Creating compilation: {len(ordered)} clip(s) → {output_path}")
 
-    for period_key, clip_path, entry in ordered:
+    for period_key, clip_path, entry, score in ordered:
         # Extract full date from filename
         dm = re.search(r"(\d{4}-\d{2}-\d{2})", clip_path)
         date_str = dm.group(1) if dm else entry.get("year_month", "")
@@ -357,7 +358,7 @@ def create_compilation(results: dict, output_path: str,
             if fi % frame_step == 0:
                 frame = _letterbox(frame, target_w, target_h)
                 frame = _draw_overlay(frame, date_str, stage_str,
-                                      description, evidence, overlay_h)
+                                      description, evidence, overlay_h, score)
                 writer.write(frame)
             fi += 1
 
