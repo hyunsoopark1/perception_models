@@ -47,6 +47,11 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".m4v"}
 # Prompts
 # ──────────────────────────────────────────────────────────────────────────────
 
+PROMPT_CHILD_PRESENT = (
+    "Is there a child (baby, toddler, or young child) visible in this video?\n"
+    "Reply with exactly one word: yes or no."
+)
+
 PROMPT_DESCRIBE = "Describe what is happening in this video in detail."
 
 PROMPT_STAGE = (
@@ -102,6 +107,14 @@ def _run(video_path: str, prompt: str, model, tokenizer, config,
         temperature=temperature, max_gen_len=max_gen_len,
     )
     return result["description"]
+
+
+def get_child_present(video_path, model, tokenizer, config,
+                      num_frames=8, temperature=0.0) -> bool:
+    """Return True if the model detects a child in the clip."""
+    raw = _run(video_path, PROMPT_CHILD_PRESENT, model, tokenizer, config,
+               num_frames=num_frames, temperature=temperature, max_gen_len=8)
+    return raw.strip().lower().startswith("yes")
 
 
 def get_description(video_path, model, tokenizer, config,
@@ -214,17 +227,33 @@ def process_clips(
         entry.update({k: v for k, v in clip.items() if k not in entry})
 
         # Determine what needs to be run
+        need_child    = overwrite or entry.get("child_present") is None
         need_describe = do_describe and (overwrite or not entry.get("description"))
         need_stage    = do_stage    and (overwrite or not entry.get("stage"))
         need_evidence = do_evidence and (overwrite or not entry.get("evidence"))
 
-        if not (need_describe or need_stage or need_evidence):
+        if not (need_child or need_describe or need_stage or need_evidence):
             logger.info(f"[{i+1}/{total}] Skip (already processed): {Path(clip_path).name}")
             results[key] = entry
             continue
 
         t0 = time.time()
         logger.info(f"[{i+1}/{total}] Processing: {Path(clip_path).name}")
+
+        # Child presence check — gates all other tasks
+        if need_child:
+            logger.info("  → child present? ...")
+            entry["child_present"] = get_child_present(
+                clip_path, model, tokenizer, config, num_frames, temperature
+            )
+            logger.info(f"     {'yes' if entry['child_present'] else 'no'}")
+
+        if not entry.get("child_present"):
+            logger.info("  No child detected — skipping description/stage/evidence.")
+            results[key] = entry
+            with open(output_path, "w") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            continue
 
         if need_describe:
             logger.info("  → description ...")
