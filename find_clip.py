@@ -169,8 +169,12 @@ def find_best_clips(
         match_fields = ["description"]
 
     # Group entries by period
+    skipped_no_child = 0
     by_period: dict = {}
     for clip_path, entry in descriptions.items():
+        if entry.get("child_present") is False:
+            skipped_no_child += 1
+            continue
         ym = entry.get("year_month", "")
         if not ym:
             m = re.search(r"(\d{4}-\d{2})", clip_path)
@@ -181,6 +185,8 @@ def find_best_clips(
         pk = _period_label(ym, period)
         by_period.setdefault(pk, []).append((clip_path, entry))
 
+    if skipped_no_child:
+        logger.info(f"Skipped {skipped_no_child} clip(s) with no child detected.")
     if not by_period:
         logger.warning("No clips matched the filter criteria.")
         return {}
