@@ -144,7 +144,7 @@ def get_evidence(video_path, model, tokenizer, config,
     for domain in EVIDENCE_DOMAINS:
         pattern = re.compile(
             rf"^\s*{re.escape(domain)}\s*:\s*(.+?)(?=\n\s*(?:{'|'.join(EVIDENCE_DOMAINS)})\s*:|$)",
-            re.IGNORECASE | re.DOTALL,
+            re.IGNORECASE | re.DOTALL | re.MULTILINE,
         )
         m = pattern.search(raw)
         evidence[domain.lower()] = m.group(1).strip() if m else ""
