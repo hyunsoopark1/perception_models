@@ -41,7 +41,6 @@ from typing import Optional
 
 import cv2
 import numpy as np
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -235,6 +234,63 @@ def find_best_clips(
             continue
         results[pk] = items[:top_k]
 
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PLM-based verification
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _plm_verify(clip_path: str, query: str, model, tokenizer, config,
+                num_frames: int = 8) -> bool:
+    """Ask PLM 8B whether the query activity is visible in the clip.
+
+    Returns True if the model answers 'yes'.
+    """
+    from generate_video_description import generate_description
+    prompt = (
+        f"Does this video show: {query}?\n"
+        "Answer with exactly one word: yes or no."
+    )
+    result = generate_description(
+        video_path=clip_path, model=model, tokenizer=tokenizer,
+        config=config, prompt=prompt, num_frames=num_frames,
+        temperature=0.0, max_gen_len=8,
+    )
+    return result["description"].strip().lower().startswith("yes")
+
+
+def plm_rerank(candidates: dict, query: str, model, tokenizer, config,
+               num_frames: int = 8) -> dict:
+    """Re-rank/filter candidates using PLM yes/no verification per clip.
+
+    Args:
+        candidates: Output of find_best_clips — {period: [{clip_path, score, entry}]}.
+        query:      The original search query.
+        model/tokenizer/config: Loaded PLM 8B model.
+
+    Returns:
+        Filtered dict keeping only periods where PLM answered 'yes' for
+        the top candidate. Score updated to 1.0 (yes) or 0.0 (no).
+    """
+    results = {}
+    for pk, items in candidates.items():
+        verified = []
+        for item in items:
+            clip_path = item["clip_path"]
+            if not os.path.exists(clip_path):
+                logger.warning(f"  PLM verify: file not found — {clip_path}")
+                continue
+            logger.info(f"  PLM verify [{pk}]: {Path(clip_path).name} ...")
+            yes = _plm_verify(clip_path, query, model, tokenizer, config, num_frames)
+            logger.info(f"    → {'yes ✓' if yes else 'no ✗'}  (embed score was {item['score']:.3f})")
+            if yes:
+                verified.append({**item, "score": 1.0, "plm_verified": True})
+        if verified:
+            results[pk] = verified
+        else:
+            logger.info(f"  Period {pk}: no clips verified by PLM — skipped.")
     return results
 
 
@@ -446,6 +502,14 @@ Examples:
                         metavar="OUTPUT_VIDEO",
                         help="Create a compilation video from the selected clips "
                              "(e.g. --compile compilation.mp4).")
+    parser.add_argument("--plm_verify",     action="store_true",
+                        help="Use PLM 8B to verify each candidate clip with a yes/no question. "
+                             "More accurate than embedding similarity. Requires --ckpt.")
+    parser.add_argument("--ckpt",           type=str, default="facebook/Perception-LM-8B",
+                        help="PLM checkpoint for --plm_verify (default: facebook/Perception-LM-8B).")
+    parser.add_argument("--plm_top_k",      type=int, default=3,
+                        help="Number of candidates per period to send to PLM for verification "
+                             "(default: 3). Higher = more accurate, slower.")
     args = parser.parse_args()
 
     # Load descriptions
@@ -453,14 +517,16 @@ Examples:
         descriptions = json.load(f)
     logger.info(f"Loaded {len(descriptions)} entries from {args.descriptions}")
 
-    # Run search
+    # Run initial embedding/exact search
+    # When PLM verify is on, fetch more candidates per period to give PLM options
+    initial_top_k = args.plm_top_k if args.plm_verify else args.top_k
     results = find_best_clips(
         descriptions=descriptions,
         query=args.query,
         match_fields=args.match_fields,
         month_filter=args.month,
         encoder_model=args.encoder,
-        top_k=args.top_k,
+        top_k=initial_top_k,
         threshold=args.threshold,
         period=args.period,
         exact=args.exact,
@@ -469,6 +535,19 @@ Examples:
     if not results:
         logger.info("No results.")
         return
+
+    # PLM verification pass
+    if args.plm_verify:
+        from apps.plm.generate import load_consolidated_model_and_tokenizer
+        logger.info(f"Loading PLM model for verification: {args.ckpt} ...")
+        model, tokenizer, config = load_consolidated_model_and_tokenizer(args.ckpt)
+        logger.info("PLM loaded. Verifying candidates ...")
+        results = plm_rerank(results, args.query, model, tokenizer, config)
+        # Trim to requested top_k after verification
+        results = {pk: items[:args.top_k] for pk, items in results.items()}
+        if not results:
+            logger.info("No clips verified by PLM.")
+            return
 
     # Display results
     print(f"\nQuery: {args.query!r}")
