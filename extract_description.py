@@ -55,9 +55,8 @@ PROMPT_CHILD_PRESENT = (
 PROMPT_DESCRIBE = "Describe what is happening in this video in detail."
 
 PROMPT_STAGE = (
-    "If there is a child in this video, what is their developmental stage?\n"
-    "Choose exactly ONE of these stages based on what you directly observe, "
-    "or reply \"no child visible\" if there is no child in the video:\n\n"
+    "What is the developmental stage of the child in this video?\n"
+    "Choose exactly ONE of these stages based on what you directly observe:\n\n"
     "  0-3 months  : lying/rolling, limited movement, crying or cooing\n"
     "  4-6 months  : reaching, rolling, sitting with support, babbling\n"
     "  7-9 months  : crawling, pulling up, exploring objects, babbling\n"
@@ -69,8 +68,7 @@ PROMPT_STAGE = (
 )
 
 PROMPT_EVIDENCE = (
-    "If a child is visible in this video, describe the specific evidence for each developmental domain.\n"
-    "If no child is visible, reply \"no child visible\" for each domain.\n"
+    "Describe the specific evidence you see in this video for each developmental domain.\n"
     "Be concrete — refer to actions and behaviors visible in the clip.\n\n"
     "Motor (movement, balance, hand and finger skills):\n"
     "Autonomy (self-care, independence, self-initiated activities):\n"
