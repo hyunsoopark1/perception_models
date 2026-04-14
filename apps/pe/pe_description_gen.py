@@ -63,7 +63,6 @@ Usage
     python apps/pe/pe_description_gen.py \\
         --video        input.mp4 \\
         --track-file   tracks.json \\
-        --image-size   1920 1080 \\
         --out          descriptions.json \\
         --out-video    overlay.mp4
 
@@ -71,7 +70,6 @@ Usage
     python apps/pe/pe_description_gen.py \\
         --video        input.mp4 \\
         --track-file   tracks.json \\
-        --image-size   1920 1080 \\
         --max-frames   600 \\
         --no-video \\
         --out          descriptions.json
@@ -146,8 +144,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Input video file.")
     p.add_argument("--track-file", required=True, metavar="FILE",
                    help="Identity-format JSON: {id: [[frame,cx,cy,w,h], ...], ...}")
-    p.add_argument("--image-size", required=True, type=int, nargs=2, metavar=("W", "H"),
-                   help="Original frame size in pixels.")
+    p.add_argument("--image-size", default=None, type=int, nargs=2, metavar=("W", "H"),
+                   help="Original frame size in pixels (W H). "
+                        "Inferred from the video file when omitted.")
     # --- model ---
     p.add_argument("--plm-ckpt", default="facebook/Perception-LM-8B", metavar="CKPT",
                    help="PLM checkpoint or HF model ID (default: facebook/Perception-LM-8B).")
@@ -425,7 +424,22 @@ if __name__ == "__main__":
     except ImportError:
         sys.exit("opencv-python required.  pip install opencv-python-headless")
 
-    frame_w, frame_h = args.image_size
+    # ------------------------------------------------------------------
+    # 0. Resolve frame size (auto-detect from video when not supplied)
+    # ------------------------------------------------------------------
+    if args.image_size is not None:
+        frame_w, frame_h = args.image_size
+    else:
+        _probe = cv2.VideoCapture(args.video)
+        if not _probe.isOpened():
+            sys.exit(f"Cannot open video to detect resolution: {args.video}")
+        frame_w = int(_probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(_probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        _probe.release()
+        if frame_w == 0 or frame_h == 0:
+            sys.exit("Could not read frame size from video. "
+                     "Supply it manually with --image-size W H.")
+    print(f"Frame size: {frame_w}×{frame_h}")
 
     # ------------------------------------------------------------------
     # 1. Load PLM + set up generator
