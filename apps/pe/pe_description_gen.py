@@ -73,6 +73,10 @@ Usage
         --max-frames   600 \\
         --no-video \\
         --out          descriptions.json
+
+The full video frame is fed to PLM — no bbox cropping.  The bounding box
+coordinates are passed in the text prompt so PLM knows which person to focus
+on in each frame.
 """
 
 import argparse
@@ -161,9 +165,6 @@ def _parse_args() -> argparse.Namespace:
                    help="Clip duration in seconds (default: 2.0).")
     p.add_argument("--fps", type=float, default=None, metavar="N",
                    help="Override video FPS (inferred from file when omitted).")
-    # --- crop ---
-    p.add_argument("--context-scale", type=float, default=1.5, metavar="S",
-                   help="Expand bbox before cropping (default: 1.5).")
     # --- runtime ---
     p.add_argument("--max-frames", type=int, default=None, metavar="N",
                    help="Stop after this many frames (default: all).")
@@ -272,29 +273,6 @@ def _find_nearby_ids(
             nearby.append(other_id)
 
     return sorted(nearby)
-
-
-# ---------------------------------------------------------------------------
-# Crop helper
-# ---------------------------------------------------------------------------
-
-def _crop_bbox(
-    pil_image: PILImage.Image,
-    cx: float, cy: float, w: float, h: float,
-    context_scale: float,
-    frame_w: int, frame_h: int,
-) -> PILImage.Image:
-    ew, eh = w * context_scale, h * context_scale
-    x1 = max(0, int(cx - ew / 2))
-    y1 = max(0, int(cy - eh / 2))
-    x2 = min(frame_w, int(cx + ew / 2))
-    y2 = min(frame_h, int(cy + eh / 2))
-    if x2 <= x1 or y2 <= y1:
-        x1 = max(0, int(cx) - 1)
-        y1 = max(0, int(cy) - 1)
-        x2 = min(frame_w, x1 + 2)
-        y2 = min(frame_h, y1 + 2)
-    return pil_image.crop((x1, y1, x2, y2))
 
 
 # ---------------------------------------------------------------------------
@@ -498,17 +476,20 @@ if __name__ == "__main__":
           f"max_frames={max_frames}")
 
     # ------------------------------------------------------------------
-    # 4. Single-pass read — buffer crops per window, generate per window
+    # 4. Single-pass read — buffer full frames per window, generate per window
+    #
+    # Each unique video frame is stored once (shared across all identities
+    # visible in that frame).  Per-identity we only keep bbox coordinates.
     # ------------------------------------------------------------------
     # identity → {wid: result_dict}
     identity_windows: Dict[str, Dict[int, Dict]] = {ident: {} for ident in tracks}
 
-    # window_crops stores (crop_image, cx, cy, w, h) per identity
-    WCropEntry = Tuple[PILImage.Image, float, float, float, float]
-
-    def _process_window(wid: int,
-                        wcrops: Dict[str, List[WCropEntry]]) -> None:
-        """Run PLM generation for every identity that has crops in this window."""
+    def _process_window(
+        wid: int,
+        frame_cache: Dict[int, PILImage.Image],          # frame_idx → full PIL frame
+        bbox_map_w:  Dict[str, List[Tuple]],             # identity → [(fidx,cx,cy,w,h)]
+    ) -> None:
+        """Run PLM generation for every identity visible in window *wid*."""
         start_fr  = wid * window_frames
         end_fr    = (wid + 1) * window_frames - 1
         start_sec = round(start_fr / fps, 3)
@@ -516,37 +497,39 @@ if __name__ == "__main__":
 
         print(f"\n  window {wid}  [{start_sec:.1f}s – {end_sec:.1f}s]")
 
-        for ident, entries in wcrops.items():
-            if not entries:
+        for ident, bbox_entries in bbox_map_w.items():
+            if not bbox_entries:
                 continue
 
-            crops_only  = [e[0] for e in entries]
-            bbox_coords = [(e[1], e[2], e[3], e[4]) for e in entries]
+            # Collect full frames (in frame order, from the shared cache)
+            frame_indices = [e[0] for e in bbox_entries]
+            pil_frames    = [frame_cache[fidx] for fidx in frame_indices]
+            bbox_coords   = [(e[1], e[2], e[3], e[4]) for e in bbox_entries]
 
-            # Average bbox across the window (representative position for prompt)
+            # Average bbox for the prompt (representative position)
             avg_cx = sum(b[0] for b in bbox_coords) / len(bbox_coords)
             avg_cy = sum(b[1] for b in bbox_coords) / len(bbox_coords)
             avg_w  = sum(b[2] for b in bbox_coords) / len(bbox_coords)
             avg_h  = sum(b[3] for b in bbox_coords) / len(bbox_coords)
 
-            # Per-identity, per-window prompt with ID + bbox location
+            # Per-identity prompt: ID + bbox in full frame
             prompt = _make_prompt(
                 ident, avg_cx, avg_cy, avg_w, avg_h, frame_w, frame_h
             )
 
-            n = len(crops_only)
             # Uniform subsample to num_plm_frames
+            n = len(pil_frames)
             if n > args.num_plm_frames:
                 idxs = [int(round(i * (n - 1) / (args.num_plm_frames - 1)))
                         for i in range(args.num_plm_frames)]
-                crops_only = [crops_only[i] for i in idxs]
+                pil_frames = [pil_frames[i] for i in idxs]
             elif n == 1:
-                crops_only = crops_only * 2   # PLM needs ≥ 2 frames
+                pil_frames = pil_frames * 2   # PLM needs ≥ 2 frames
 
-            # Convert PIL crops → (N, 3, H, W) tensor via VideoTransform
-            frames_tensor, _ = plm_transform._process_multiple_images_pil(crops_only)
+            # Full frames → (N, 3, H, W) tensor
+            frames_tensor, _ = plm_transform._process_multiple_images_pil(pil_frames)
 
-            # PLM generative inference with per-identity structured prompt
+            # PLM generative inference
             responses, _, _ = generator.generate([(prompt, frames_tensor)])
             raw = responses[0].strip()
 
@@ -564,7 +547,7 @@ if __name__ == "__main__":
                 "end_frame":          end_fr,
                 "start_sec":          start_sec,
                 "end_sec":            end_sec,
-                "n_frames":           len(crops),
+                "n_frames":           len(pil_frames),
                 "motion":             motion,
                 "social_interaction": {
                     "label":      social,
@@ -581,14 +564,16 @@ if __name__ == "__main__":
             if "not determined" in (motion, social, activity):
                 print(f"      raw → {raw!r}")
 
-    print(f"\nReading {args.video} and running PLM on 2-sec crop clips …")
+    print(f"\nReading {args.video} and running PLM on 2-sec full-frame clips …")
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
         sys.exit(f"Cannot open video: {args.video}")
 
     current_wid: int = -1
-    # Each entry: (crop_image, cx, cy, w, h)
-    window_crops: Dict[str, List] = defaultdict(list)
+    # Shared full-frame cache for current window (frame_idx → PIL image)
+    win_frame_cache: Dict[int, PILImage.Image] = {}
+    # Per-identity bbox entries for current window: [(frame_idx, cx, cy, w, h)]
+    win_bbox_map: Dict[str, List] = defaultdict(list)
     frame_idx = 0
 
     while frame_idx < max_frames:
@@ -598,20 +583,21 @@ if __name__ == "__main__":
 
         wid = frame_idx // window_frames
 
-        # Window boundary crossed — process the completed window
+        # Window boundary crossed — process the completed window then clear buffers
         if wid != current_wid and current_wid >= 0:
-            _process_window(current_wid, window_crops)
-            window_crops = defaultdict(list)
+            _process_window(current_wid, win_frame_cache, win_bbox_map)
+            win_frame_cache = {}
+            win_bbox_map    = defaultdict(list)
 
         current_wid = wid
 
         if frame_idx in frame_map:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            # Store the full frame once, shared across all identities in this frame
             pil_frame = PILImage.fromarray(rgb)
+            win_frame_cache[frame_idx] = pil_frame
             for (ident, cx, cy, w, h) in frame_map[frame_idx]:
-                crop = _crop_bbox(pil_frame, cx, cy, w, h,
-                                  args.context_scale, frame_w, frame_h)
-                window_crops[ident].append((crop, cx, cy, w, h))
+                win_bbox_map[ident].append((frame_idx, cx, cy, w, h))
 
         frame_idx += 1
         if frame_idx % 60 == 0:
@@ -621,8 +607,8 @@ if __name__ == "__main__":
     print()
 
     # Process last (possibly partial) window
-    if current_wid >= 0 and any(window_crops.values()):
-        _process_window(current_wid, window_crops)
+    if current_wid >= 0 and win_frame_cache:
+        _process_window(current_wid, win_frame_cache, win_bbox_map)
 
     # ------------------------------------------------------------------
     # 5. Build results + write JSON
