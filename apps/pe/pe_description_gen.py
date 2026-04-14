@@ -91,16 +91,45 @@ from PIL import Image as PILImage
 
 
 # ---------------------------------------------------------------------------
-# Structured description prompt sent to PLM for each 2-sec clip
+# Prompt builder — per identity, per window
 # ---------------------------------------------------------------------------
 
-DESCRIPTION_PROMPT = (
-    "This is a short video clip of a single person. "
-    "Answer the following questions concisely:\n"
-    "Motion: <describe the person's body movement in 2-5 words>\n"
-    "Social: <describe who the person is near or interacting with in 2-5 words>\n"
-    "Activity: <describe what the person is doing in 2-5 words>"
-)
+def _make_prompt(
+    ident: str,
+    avg_cx: float, avg_cy: float,
+    avg_w: float, avg_h: float,
+    frame_w: int, frame_h: int,
+) -> str:
+    """
+    Build the PLM prompt for one identity + window.
+
+    Includes:
+      • The identity ID so the model knows which track we are asking about.
+      • The bounding box in the original frame so the model has spatial
+        context (useful when the crop contains neighbouring people).
+      • The crop size as a fraction of the frame, giving a sense of scale.
+
+    The clip fed to PLM is already cropped and centred on this person, so
+    the model should focus on the centre of the video.
+    """
+    x1 = max(0, int(avg_cx - avg_w / 2))
+    y1 = max(0, int(avg_cy - avg_h / 2))
+    x2 = min(frame_w, int(avg_cx + avg_w / 2))
+    y2 = min(frame_h, int(avg_cy + avg_h / 2))
+    frac_w = round(avg_w / frame_w, 2)
+    frac_h = round(avg_h / frame_h, 2)
+
+    return (
+        f"This video clip is cropped around a tracked person with ID '{ident}'. "
+        f"In the original {frame_w}\u00d7{frame_h} video, this person's bounding box is "
+        f"approximately ({x1}, {y1}) to ({x2}, {y2}), "
+        f"covering about {frac_w:.0%} of the frame width and {frac_h:.0%} of the height. "
+        f"The clip is centred on this person; focus on the person in the centre.\n"
+        "Answer the following questions concisely:\n"
+        "Motion: <describe this person's body movement in 2-5 words>\n"
+        "Social: <describe who this person is near or interacting with in 2-5 words>\n"
+        "Activity: <describe what this person is doing in 2-5 words>"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -426,8 +455,8 @@ if __name__ == "__main__":
 
     print(f"  generator ready  (max_gen_len={args.max_gen_len}, "
           f"temperature={args.temperature})")
-    print(f"\nPrompt used for every clip:\n"
-          f"  {DESCRIPTION_PROMPT!r}\n")
+    print(f"\nPrompt template per clip includes: identity ID, bbox (x1,y1,x2,y2) "
+          f"in the original frame, and Motion/Social/Activity questions.\n")
 
     # ------------------------------------------------------------------
     # 2. Load tracks
@@ -460,7 +489,11 @@ if __name__ == "__main__":
     # identity → {wid: result_dict}
     identity_windows: Dict[str, Dict[int, Dict]] = {ident: {} for ident in tracks}
 
-    def _process_window(wid: int, wcrops: Dict[str, List[PILImage.Image]]) -> None:
+    # window_crops stores (crop_image, cx, cy, w, h) per identity
+    WCropEntry = Tuple[PILImage.Image, float, float, float, float]
+
+    def _process_window(wid: int,
+                        wcrops: Dict[str, List[WCropEntry]]) -> None:
         """Run PLM generation for every identity that has crops in this window."""
         start_fr  = wid * window_frames
         end_fr    = (wid + 1) * window_frames - 1
@@ -469,24 +502,38 @@ if __name__ == "__main__":
 
         print(f"\n  window {wid}  [{start_sec:.1f}s – {end_sec:.1f}s]")
 
-        for ident, crops in wcrops.items():
-            if not crops:
+        for ident, entries in wcrops.items():
+            if not entries:
                 continue
 
-            n = len(crops)
+            crops_only  = [e[0] for e in entries]
+            bbox_coords = [(e[1], e[2], e[3], e[4]) for e in entries]
+
+            # Average bbox across the window (representative position for prompt)
+            avg_cx = sum(b[0] for b in bbox_coords) / len(bbox_coords)
+            avg_cy = sum(b[1] for b in bbox_coords) / len(bbox_coords)
+            avg_w  = sum(b[2] for b in bbox_coords) / len(bbox_coords)
+            avg_h  = sum(b[3] for b in bbox_coords) / len(bbox_coords)
+
+            # Per-identity, per-window prompt with ID + bbox location
+            prompt = _make_prompt(
+                ident, avg_cx, avg_cy, avg_w, avg_h, frame_w, frame_h
+            )
+
+            n = len(crops_only)
             # Uniform subsample to num_plm_frames
             if n > args.num_plm_frames:
                 idxs = [int(round(i * (n - 1) / (args.num_plm_frames - 1)))
                         for i in range(args.num_plm_frames)]
-                crops = [crops[i] for i in idxs]
+                crops_only = [crops_only[i] for i in idxs]
             elif n == 1:
-                crops = crops * 2   # PLM needs ≥ 2 frames
+                crops_only = crops_only * 2   # PLM needs ≥ 2 frames
 
             # Convert PIL crops → (N, 3, H, W) tensor via VideoTransform
-            frames_tensor, _ = plm_transform._process_multiple_images_pil(crops)
+            frames_tensor, _ = plm_transform._process_multiple_images_pil(crops_only)
 
-            # PLM generative inference with structured prompt
-            responses, _, _ = generator.generate([(DESCRIPTION_PROMPT, frames_tensor)])
+            # PLM generative inference with per-identity structured prompt
+            responses, _, _ = generator.generate([(prompt, frames_tensor)])
             raw = responses[0].strip()
 
             motion, social, activity = _parse_plm_response(raw)
@@ -526,7 +573,8 @@ if __name__ == "__main__":
         sys.exit(f"Cannot open video: {args.video}")
 
     current_wid: int = -1
-    window_crops: Dict[str, List[PILImage.Image]] = defaultdict(list)
+    # Each entry: (crop_image, cx, cy, w, h)
+    window_crops: Dict[str, List] = defaultdict(list)
     frame_idx = 0
 
     while frame_idx < max_frames:
@@ -549,7 +597,7 @@ if __name__ == "__main__":
             for (ident, cx, cy, w, h) in frame_map[frame_idx]:
                 crop = _crop_bbox(pil_frame, cx, cy, w, h,
                                   args.context_scale, frame_w, frame_h)
-                window_crops[ident].append(crop)
+                window_crops[ident].append((crop, cx, cy, w, h))
 
         frame_idx += 1
         if frame_idx % 60 == 0:
