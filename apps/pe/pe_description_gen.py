@@ -6,24 +6,24 @@ For each tracked identity, generates a structured description covering:
   • Social       — how the person relates to others in the scene
   • Activity     — the high-level activity being performed
 
-Each identity is processed as a **2-second video clip** (bbox crops stacked
-into a short video) fed to the Perception Language Model (PLM) with a
-structured text prompt.  PLM is a *generative* model trained with vision+LLM
-— we use it by asking it to answer three questions about the clip and parsing
-the free-form text response.
+Each identity is processed as a **2-second video clip** (full frames from the
+original video, sampled uniformly) fed to the Perception Language Model (PLM)
+with a structured text prompt that includes the identity ID and bounding box
+coordinates.  PLM is a *generative* model trained with vision+LLM — we use
+it by asking it to answer three questions about the clip and parsing the
+free-form text response.
 
 This is fundamentally different from cosine-similarity classification.  The
-model sees the actual clip and is asked to describe it in natural language,
-so the output is specific to each person rather than picking the same
-"most common" category bucket across everyone.
+model sees the full scene and is told which person to focus on, so the output
+is specific to each person rather than picking the same "most common" category
+bucket across everyone.
 
 Processing loop
 ---------------
   for each 2-second window (stride = window = 2 s):
       for each identity visible in this window:
-          crops  = [crop_bbox(frame, bbox) for frame in window_frames]
-          frames = VideoTransform(crops)        # (N, 3, H, W) tensor
-          prompt = DESCRIPTION_PROMPT           # asks for Motion/Social/Activity
+          frames = full video frames for this window   # (N, 3, H, W) tensor
+          prompt = _make_prompt(identity_id, bbox)     # asks for Motion/Social/Activity
           response = PLM.generate([(prompt, frames)])
           motion, social, activity = parse(response)
           nearby_ids = spatial_proximity(tracks, identity, window)
@@ -107,12 +107,9 @@ def _make_prompt(
 
     Includes:
       • The identity ID so the model knows which track we are asking about.
-      • The bounding box in the original frame so the model has spatial
-        context (useful when the crop contains neighbouring people).
-      • The crop size as a fraction of the frame, giving a sense of scale.
-
-    The clip fed to PLM is already cropped and centred on this person, so
-    the model should focus on the centre of the video.
+      • The bounding box in the original frame so the model knows where to
+        look (the full frame is passed as video, not a crop).
+      • The bbox size as a fraction of the frame, giving a sense of scale.
     """
     x1 = max(0, int(avg_cx - avg_w / 2))
     y1 = max(0, int(avg_cy - avg_h / 2))
@@ -122,11 +119,11 @@ def _make_prompt(
     frac_h = round(avg_h / frame_h, 2)
 
     return (
-        f"This video clip is cropped around a tracked person with ID '{ident}'. "
-        f"In the original {frame_w}\u00d7{frame_h} video, this person's bounding box is "
-        f"approximately ({x1}, {y1}) to ({x2}, {y2}), "
-        f"covering about {frac_w:.0%} of the frame width and {frac_h:.0%} of the height. "
-        f"The clip is centred on this person; focus on the person in the centre.\n"
+        f"This is a video clip from a {frame_w}\u00d7{frame_h} scene. "
+        f"A tracked person with ID '{ident}' is located at bounding box "
+        f"({x1}, {y1}) to ({x2}, {y2}), "
+        f"occupying about {frac_w:.0%} of the frame width and {frac_h:.0%} of the height. "
+        f"Focus on this specific person.\n"
         "Answer the following questions concisely:\n"
         "Motion: <describe this person's body movement in 2-5 words>\n"
         "Social: <describe who this person is near or interacting with in 2-5 words>\n"
