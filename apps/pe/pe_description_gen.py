@@ -10,6 +10,14 @@ Descriptions are produced by comparing mean-pooled crop embeddings (from the
 baseline PE vision encoder) against category-specific text candidates, then
 selecting the best-matching label in each category.
 
+Proximity detection
+-------------------
+Within each temporal window the script computes center-to-center distances
+between all identity pairs (using bbox data from the track JSON — no extra
+video pass needed).  Other identities that are "close" (within
+--proximity-scale × avg_bbox_size for ≥ 30 % of co-visible frames) are
+reported as nearby_ids in the social_interaction field.
+
 Output: a single JSON file structured as:
 
     {
@@ -20,7 +28,11 @@ Output: a single JSON file structured as:
           "start_sec":           <float>,
           "end_sec":             <float>,
           "motion":              {"label": "...", "score": <float>},
-          "social_interaction":  {"label": "...", "score": <float>},
+          "social_interaction":  {
+              "label":      "...",
+              "score":      <float>,
+              "nearby_ids": ["id_2", "id_5"]   ← IDs spatially close in this window
+          },
           "activity":            {"label": "...", "score": <float>},
           "description":         "..."       ← short human-readable sentence
         },
@@ -30,7 +42,8 @@ Output: a single JSON file structured as:
     }
 
 The "description" field is a composed sentence, e.g.:
-  "A child walking alone and playing with objects."
+  "A person walking, interacting with a small group of peers (id_2, id_5),
+   and playing with toys."
 
 Usage
 -----
@@ -150,6 +163,10 @@ def _parse_args() -> argparse.Namespace:
                         "similarities when selecting the best label.")
     p.add_argument("--out", default="descriptions.json", metavar="PATH",
                    help="Output JSON file path (default: descriptions.json).")
+    p.add_argument("--proximity-scale", type=float, default=2.0, metavar="S",
+                   help="Two identities are considered 'nearby' when their "
+                        "center-to-center distance is less than this multiple of "
+                        "the target's average bbox dimension (default: 2.0).")
     p.add_argument("--pretty", action="store_true",
                    help="Pretty-print the output JSON (indent=2).")
     return p.parse_args()
@@ -177,6 +194,75 @@ def _build_frame_map(tracks: Dict[str, List]) -> Dict[int, List[Tuple]]:
             fidx, cx, cy, w, h = entry
             frame_map[int(fidx)].append((identity, cx, cy, w, h))
     return dict(frame_map)
+
+
+# ---------------------------------------------------------------------------
+# Proximity detection (pure track-data, no video re-read)
+# ---------------------------------------------------------------------------
+
+def _find_nearby_ids(
+    ident: str,
+    wid: int,
+    window_frames: int,
+    tracks: Dict[str, List],
+    proximity_scale: float,
+    max_frames: int,
+    min_close_ratio: float = 0.30,
+) -> List[str]:
+    """
+    Return IDs of identities spatially close to *ident* in window *wid*.
+
+    Two identities are "close" in a frame when
+        dist(centers) < proximity_scale × avg_bbox_dim(target)
+    where avg_bbox_dim = (w + h) / 2 of the target bbox in that frame.
+
+    An identity is reported as nearby when it is close in at least
+    *min_close_ratio* of frames where both identities are visible.
+    """
+    frame_start = wid * window_frames
+    frame_end   = (wid + 1) * window_frames
+
+    # Build frame → (cx, cy, w, h) for the target within this window
+    target: Dict[int, Tuple[float, float, float, float]] = {}
+    for entry in tracks[ident]:
+        fidx = int(entry[0])
+        if frame_start <= fidx < frame_end < max_frames + 1:
+            if fidx < max_frames:
+                target[fidx] = (float(entry[1]), float(entry[2]),
+                                float(entry[3]), float(entry[4]))
+
+    if not target:
+        return []
+
+    nearby: List[str] = []
+    for other_id, other_entries in tracks.items():
+        if other_id == ident:
+            continue
+
+        # Build frame → (cx, cy) for the other identity in this window
+        other: Dict[int, Tuple[float, float]] = {}
+        for entry in other_entries:
+            fidx = int(entry[0])
+            if fidx in target:
+                other[fidx] = (float(entry[1]), float(entry[2]))
+
+        co_visible = set(target.keys()) & set(other.keys())
+        if not co_visible:
+            continue
+
+        close_count = 0
+        for fidx in co_visible:
+            tcx, tcy, tw, th = target[fidx]
+            ocx, ocy = other[fidx]
+            dist = ((tcx - ocx) ** 2 + (tcy - ocy) ** 2) ** 0.5
+            threshold = proximity_scale * (tw + th) / 2.0
+            if dist < threshold:
+                close_count += 1
+
+        if close_count / len(co_visible) >= min_close_ratio:
+            nearby.append(other_id)
+
+    return sorted(nearby)
 
 
 # ---------------------------------------------------------------------------
@@ -240,12 +326,20 @@ def _best_match(
 # Description composer
 # ---------------------------------------------------------------------------
 
-def _compose_description(motion: str, social: str, activity: str) -> str:
+def _compose_description(
+    motion: str,
+    social: str,
+    activity: str,
+    nearby_ids: List[str],
+) -> str:
     """
     Build a short human-readable sentence from the three category winners.
 
     The raw labels start with "a person …"; we strip the prefix and assemble:
-        "A person <motion>, <social>, and <activity>."
+        "A person <motion>, <social> (<ids>), and <activity>."
+
+    When nearby_ids is non-empty the IDs are appended in parentheses after
+    the social phrase so the reader knows exactly who is nearby.
     """
     def _strip(label: str) -> str:
         for prefix in ("a person ", "a child "):
@@ -256,6 +350,11 @@ def _compose_description(motion: str, social: str, activity: str) -> str:
     m = _strip(motion)
     s = _strip(social)
     a = _strip(activity)
+
+    if nearby_ids:
+        ids_str = ", ".join(nearby_ids)
+        s = f"{s} ({ids_str})"
+
     return f"A person {m}, {s}, and {a}."
 
 
@@ -422,7 +521,15 @@ if __name__ == "__main__":
                 mean_feat, activity_feats, ACTIVITY_LABELS, args.softmax, device
             )
 
-            description = _compose_description(motion_label, social_label, activity_label)
+            # Spatial proximity — which other identities are close in this window?
+            nearby_ids = _find_nearby_ids(
+                ident, wid, window_frames, tracks,
+                args.proximity_scale, max_frames,
+            )
+
+            description = _compose_description(
+                motion_label, social_label, activity_label, nearby_ids
+            )
 
             start_fr = wid * window_frames
             end_fr   = (wid + 1) * window_frames - 1
@@ -437,8 +544,9 @@ if __name__ == "__main__":
                     "score": round(motion_score, 4),
                 },
                 "social_interaction": {
-                    "label": social_label,
-                    "score": round(social_score, 4),
+                    "label":      social_label,
+                    "score":      round(social_score, 4),
+                    "nearby_ids": nearby_ids,
                 },
                 "activity": {
                     "label": activity_label,
@@ -455,8 +563,12 @@ if __name__ == "__main__":
             print(f"  {w['start_sec']:6.1f}s – {w['end_sec']:6.1f}s "
                   f"({w['n_frames']:3d} frames)")
             print(f"    motion:   {w['motion']['label']}  ({w['motion']['score']:.3f})")
+            nearby_str = (
+                f"  nearby: {w['social_interaction']['nearby_ids']}"
+                if w["social_interaction"]["nearby_ids"] else ""
+            )
             print(f"    social:   {w['social_interaction']['label']}"
-                  f"  ({w['social_interaction']['score']:.3f})")
+                  f"  ({w['social_interaction']['score']:.3f}){nearby_str}")
             print(f"    activity: {w['activity']['label']}"
                   f"  ({w['activity']['score']:.3f})")
             print(f"    → {w['description']}")
