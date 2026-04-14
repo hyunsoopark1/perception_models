@@ -1,33 +1,38 @@
 """
-PLM Description Generator + Visualizer
-=======================================
+PLM Description Generator + Visualizer  (generative inference)
+==============================================================
 For each tracked identity, generates a structured description covering:
   • Motion       — what the person's body is doing
   • Social       — how the person relates to others in the scene
   • Activity     — the high-level activity being performed
 
-The encoder is the **Perception Language Model (PLM)**, which processes a
-2-second video clip per identity per window.  This is strictly better than
-encoding single frames because the LLM backbone can reason about temporal
-patterns (movement, interaction dynamics) across the clip.
+Each identity is processed as a **2-second video clip** (bbox crops stacked
+into a short video) fed to the Perception Language Model (PLM) with a
+structured text prompt.  PLM is a *generative* model trained with vision+LLM
+— we use it by asking it to answer three questions about the clip and parsing
+the free-form text response.
+
+This is fundamentally different from cosine-similarity classification.  The
+model sees the actual clip and is asked to describe it in natural language,
+so the output is specific to each person rather than picking the same
+"most common" category bucket across everyone.
 
 Processing loop
 ---------------
   for each 2-second window (stride = window = 2 s):
       for each identity visible in this window:
           crops  = [crop_bbox(frame, bbox) for frame in window_frames]
-          feat   = PLM.encode_video(crops, num_frames=16)
-          motion, social, activity = argmax(cosine_sim(feat, text_labels))
-          nearby_ids = spatial_proximity(tracks, this_identity, this_window)
+          frames = VideoTransform(crops)        # (N, 3, H, W) tensor
+          prompt = DESCRIPTION_PROMPT           # asks for Motion/Social/Activity
+          response = PLM.generate([(prompt, frames)])
+          motion, social, activity = parse(response)
+          nearby_ids = spatial_proximity(tracks, identity, window)
 
-Both the JSON and the annotated video include timestamps for every window.
-
-Proximity detection
--------------------
-Within each window, other identities whose bbox centers stay within
-  proximity_scale × (w + h) / 2
-of the target for ≥ 30 % of co-visible frames are reported as nearby_ids.
-No extra video pass is needed — all positions come from the track JSON.
+Nearby detection
+----------------
+Uses bbox center distances from the track JSON — no extra video pass needed.
+An identity is "nearby" when its center stays within proximity_scale × bbox_avg
+for ≥ 30 % of co-visible frames in the same window.
 
 Output JSON
 -----------
@@ -39,14 +44,14 @@ Output JSON
           "start_sec":          <float>,
           "end_sec":            <float>,
           "n_frames":           <int>,
-          "motion":             {"label": "...", "score": <float>},
+          "motion":             "<free-form label>",
           "social_interaction": {
-              "label":      "...",
-              "score":      <float>,
+              "label":      "<free-form label>",
               "nearby_ids": ["id_2", "id_5"]
           },
-          "activity":           {"label": "...", "score": <float>},
-          "description":        "A person walking, interacting with id_2, and playing."
+          "activity":           "<free-form label>",
+          "raw_response":       "<full PLM response text>",
+          "description":        "A person ..., ..., and ..."
         },
         ...
       ],
@@ -62,18 +67,19 @@ Usage
         --out          descriptions.json \\
         --out-video    overlay.mp4
 
-    # Limit to first 5 minutes, skip video rendering:
+    # Skip video rendering, process first 600 frames only:
     python apps/pe/pe_description_gen.py \\
         --video        input.mp4 \\
         --track-file   tracks.json \\
         --image-size   1920 1080 \\
-        --max-frames   9000 \\
+        --max-frames   600 \\
         --no-video \\
         --out          descriptions.json
 """
 
 import argparse
 import json
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -81,51 +87,20 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image as PILImage
 
 
 # ---------------------------------------------------------------------------
-# Category text candidates
+# Structured description prompt sent to PLM for each 2-sec clip
 # ---------------------------------------------------------------------------
 
-MOTION_LABELS: List[str] = [
-    "a person standing still",
-    "a person walking",
-    "a person running",
-    "a person sitting",
-    "a person crouching or squatting",
-    "a person jumping",
-    "a person lying down",
-    "a person crawling",
-    "a person dancing or moving rhythmically",
-    "a person making hand gestures",
-]
-
-SOCIAL_LABELS: List[str] = [
-    "a person alone with no one nearby",
-    "a person talking face to face with one other person",
-    "a person interacting with a small group of peers",
-    "a person in a large group",
-    "a person interacting with an adult or teacher",
-    "a person sitting or standing side by side with others",
-    "a person watching others from a distance",
-]
-
-ACTIVITY_LABELS: List[str] = [
-    "a person reading a book or document",
-    "a person playing with toys or objects",
-    "a person drawing writing or doing craftwork",
-    "a person eating or drinking",
-    "a person building or assembling something",
-    "a person using a phone computer or electronic device",
-    "a person exercising or doing physical activity",
-    "a person talking or having a conversation",
-    "a person exploring or looking around",
-    "a person resting or doing nothing",
-    "a person playing a musical instrument",
-    "a person cleaning or tidying up",
-]
+DESCRIPTION_PROMPT = (
+    "This is a short video clip of a single person. "
+    "Answer the following questions concisely:\n"
+    "Motion: <describe the person's body movement in 2-5 words>\n"
+    "Social: <describe who the person is near or interacting with in 2-5 words>\n"
+    "Activity: <describe what the person is doing in 2-5 words>"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +109,7 @@ ACTIVITY_LABELS: List[str] = [
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="PLM-based per-identity description generator + video visualizer.",
+        description="PLM generative description per identity per 2-sec window + video overlay.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # --- inputs ---
@@ -148,9 +123,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--plm-ckpt", default="facebook/Perception-LM-8B", metavar="CKPT",
                    help="PLM checkpoint or HF model ID (default: facebook/Perception-LM-8B).")
     p.add_argument("--num-plm-frames", type=int, default=16, metavar="N",
-                   help="Frames uniformly sampled per 2-sec clip for PLM (default: 16).")
-    p.add_argument("--pool", default="mean", choices=["mean", "mean_all", "last"],
-                   help="PLM hidden-state pooling strategy (default: mean).")
+                   help="Frames sampled per 2-sec clip for PLM (default: 16).")
+    p.add_argument("--max-gen-len", type=int, default=120, metavar="N",
+                   help="Max generated tokens per clip (default: 120).")
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="Sampling temperature; 0 = greedy (default: 0).")
     # --- windowing ---
     p.add_argument("--window-sec", type=float, default=2.0, metavar="S",
                    help="Clip duration in seconds (default: 2.0).")
@@ -162,8 +139,6 @@ def _parse_args() -> argparse.Namespace:
     # --- runtime ---
     p.add_argument("--max-frames", type=int, default=None, metavar="N",
                    help="Stop after this many frames (default: all).")
-    p.add_argument("--softmax", action="store_true",
-                   help="Use softmax-normalised scores instead of raw cosine sims.")
     # --- proximity ---
     p.add_argument("--proximity-scale", type=float, default=2.0, metavar="S",
                    help="Nearby threshold = this × avg_bbox_dim (default: 2.0).")
@@ -206,22 +181,21 @@ def _build_frame_map(tracks: Dict[str, List]) -> Dict[int, List[Tuple]]:
 
 def _build_frame_annotations(tracks: Dict[str, List],
                               max_frames: int) -> Dict[int, List[Tuple]]:
-    """frame_idx → [(identity, x1, y1, x2, y2)] in corner format."""
+    """frame_idx → [(identity, x1, y1, x2, y2)] corner format."""
     fa: Dict[int, List] = defaultdict(list)
     for ident, entries in tracks.items():
         for entry in entries:
-            fidx, cx, cy, w, h = entry
-            fidx = int(fidx)
+            fidx, cx, cy, w, h = int(entry[0]), *entry[1:]
             if fidx >= max_frames:
                 continue
-            x1, y1 = int(cx - w / 2), int(cy - h / 2)
-            x2, y2 = int(cx + w / 2), int(cy + h / 2)
-            fa[fidx].append((ident, x1, y1, x2, y2))
+            fa[fidx].append((ident,
+                             int(cx - w / 2), int(cy - h / 2),
+                             int(cx + w / 2), int(cy + h / 2)))
     return dict(fa)
 
 
 # ---------------------------------------------------------------------------
-# Proximity detection (track-data only, no video re-read)
+# Proximity detection  (track data only, no video re-read)
 # ---------------------------------------------------------------------------
 
 def _find_nearby_ids(
@@ -233,18 +207,15 @@ def _find_nearby_ids(
     max_frames: int,
     min_close_ratio: float = 0.30,
 ) -> List[str]:
-    """Return sorted list of identities spatially close to *ident* in window *wid*."""
     frame_start = wid * window_frames
     frame_end   = (wid + 1) * window_frames
 
-    # Build frame → (cx, cy, w, h) for the target within this window
     target: Dict[int, Tuple] = {}
     for entry in tracks[ident]:
         fidx = int(entry[0])
         if frame_start <= fidx < frame_end and fidx < max_frames:
             target[fidx] = (float(entry[1]), float(entry[2]),
                             float(entry[3]), float(entry[4]))
-
     if not target:
         return []
 
@@ -252,7 +223,6 @@ def _find_nearby_ids(
     for other_id, other_entries in tracks.items():
         if other_id == ident:
             continue
-
         other: Dict[int, Tuple] = {}
         for entry in other_entries:
             fidx = int(entry[0])
@@ -270,7 +240,6 @@ def _find_nearby_ids(
                 (target[fidx][1] - other[fidx][1]) ** 2
             ) ** 0.5 < proximity_scale * (target[fidx][2] + target[fidx][3]) / 2.0
         )
-
         if close_count / len(co_visible) >= min_close_ratio:
             nearby.append(other_id)
 
@@ -287,8 +256,7 @@ def _crop_bbox(
     context_scale: float,
     frame_w: int, frame_h: int,
 ) -> PILImage.Image:
-    ew = w * context_scale
-    eh = h * context_scale
+    ew, eh = w * context_scale, h * context_scale
     x1 = max(0, int(cx - ew / 2))
     y1 = max(0, int(cy - eh / 2))
     x2 = min(frame_w, int(cx + ew / 2))
@@ -302,106 +270,45 @@ def _crop_bbox(
 
 
 # ---------------------------------------------------------------------------
-# PLM video encoding from PIL frames (no temp file needed)
+# PLM response parsing
 # ---------------------------------------------------------------------------
 
-@torch.inference_mode()
-def _encode_frames_plm(
-    model,
-    tokenizer,
-    transform,
-    pil_frames: List[PILImage.Image],
-    num_frames: int = 16,
-    pool: str = "mean",
-) -> Optional[torch.Tensor]:
+def _parse_plm_response(text: str) -> Tuple[str, str, str]:
     """
-    Encode a list of PIL images as a video clip through PLM.
+    Extract Motion / Social / Activity labels from the PLM's response text.
 
-    Uniformly subsamples to *num_frames*, converts through VideoTransform,
-    then runs the full PLM forward pass (vision encoder + LLM layers).
-
-    Returns a normalised embedding tensor [dim] on the model's device,
-    or None if the frame list is empty.
+    Looks for lines starting with "Motion:", "Social:", "Activity:" (case-
+    insensitive).  Falls back to "not determined" for any missing field.
     """
-    if not pil_frames:
-        return None
-
-    n = len(pil_frames)
-    if n > num_frames:
-        # Uniform subsample
-        idxs = [int(round(i * (n - 1) / (num_frames - 1))) for i in range(num_frames)]
-        pil_frames = [pil_frames[i] for i in idxs]
-    elif n == 1:
-        pil_frames = pil_frames * 2  # PLM needs ≥ 2 frames
-
-    # transform._process_multiple_images_pil → (N, 3, H, W) float32 on CPU
-    frames, _ = transform._process_multiple_images_pil(pil_frames)
-
-    param = next(model.parameters())
-    dev, dtype = param.device, param.dtype
-
-    # Build token sequence with image placeholders
-    text_ids, image_pos = tokenizer._tokenize_for_generation("", frames)
-    token_values = torch.tensor([text_ids], dtype=torch.long, device=dev)
-    image_pos_index = torch.full(token_values.shape, -1, dtype=torch.int, device=dev)
-    image_pos_index[0, image_pos] = torch.arange(len(image_pos), dtype=torch.int, device=dev)
-
-    images = frames.to(device=dev, dtype=dtype)
-
-    # Full PLM forward — return hidden states before LM head
-    _, hidden = model.forward(
-        token_values,
-        images=images,
-        image_pos_index=image_pos_index,
-        num_chunks=[frames.size(0)],
-        media_type=["video"],
-        return_hidden_states=True,
-    )  # hidden: (1, seqlen, dim)
-
-    if pool == "mean":
-        img_pos_t = torch.tensor(image_pos, device=hidden.device)
-        embedding = hidden[0, img_pos_t].mean(dim=0)
-    elif pool == "mean_all":
-        embedding = hidden[0].mean(dim=0)
-    else:  # last
-        embedding = hidden[0, -1, :]
-
-    return F.normalize(embedding, dim=-1)
-
-
-# ---------------------------------------------------------------------------
-# Best-label selection
-# ---------------------------------------------------------------------------
-
-def _best_match(
-    feat: torch.Tensor,        # [dim] on any device
-    text_feats: torch.Tensor,  # [N, dim] on same device
-    labels: List[str],
-    use_softmax: bool,
-) -> Tuple[str, float]:
-    cos = (feat @ text_feats.T).cpu()
-    display = F.softmax(cos, dim=0) if use_softmax else cos
-    best = int(display.argmax())
-    return labels[best], float(display[best])
+    motion = social = activity = "not determined"
+    for line in text.splitlines():
+        stripped = line.strip()
+        low = stripped.lower()
+        if low.startswith("motion:"):
+            val = stripped.split(":", 1)[1].strip()
+            if val:
+                motion = val
+        elif low.startswith("social:"):
+            val = stripped.split(":", 1)[1].strip()
+            if val:
+                social = val
+        elif low.startswith("activity:"):
+            val = stripped.split(":", 1)[1].strip()
+            if val:
+                activity = val
+    return motion, social, activity
 
 
 # ---------------------------------------------------------------------------
 # Description composer
 # ---------------------------------------------------------------------------
 
-def _compose_description(
-    motion: str, social: str, activity: str, nearby_ids: List[str]
-) -> str:
-    def _strip(label: str) -> str:
-        for pfx in ("a person ", "a child "):
-            if label.lower().startswith(pfx):
-                return label[len(pfx):]
-        return label
-
-    m, s, a = _strip(motion), _strip(social), _strip(activity)
+def _compose_description(motion: str, social: str, activity: str,
+                          nearby_ids: List[str]) -> str:
+    s = social
     if nearby_ids:
         s += f" ({', '.join(nearby_ids)})"
-    return f"A person {m}, {s}, and {a}."
+    return f"A person {motion}, {s}, and {activity}."
 
 
 # ---------------------------------------------------------------------------
@@ -432,60 +339,49 @@ def _draw_window_overlay(
     font_scale: float,
 ) -> None:
     """
-    Draw a bounding box with three description rows above it:
+    Draw bbox + 3 description rows above it:
 
-        ┌─────────────────────────────────────────────┐
-        │ M: <motion>  score                          │ ← identity color
-        │ S: <social> (id_2, id_5)  score             │ ← darker
-        │ A: <activity>  score                        │ ← darkest
-        └──── bbox ───────────────────────────────────┘
+        ┌───────────────────────────────────────┐
+        │ M: <motion>                           │  ← identity color
+        │ S: <social> (id_2, id_5)              │  ← darker
+        │ A: <activity>                         │  ← darkest
+        └──── bbox ─────────────────────────────┘
     """
     import cv2
 
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
     if win is None:
         return
 
-    motion = win["motion"]
-    social = win["social_interaction"]
-    activity = win["activity"]
-    nearby_ids: List[str] = social.get("nearby_ids", [])
+    motion   = win.get("motion", "")
+    social   = win.get("social_interaction", {})
+    activity = win.get("activity", "")
+    nearby_ids: List[str] = social.get("nearby_ids", []) if isinstance(social, dict) else []
+    social_lbl = social.get("label", "") if isinstance(social, dict) else str(social)
+    if nearby_ids:
+        social_lbl += f" ({', '.join(nearby_ids)})"
+
+    rows = [
+        (f"M: {motion}",   color),
+        (f"S: {social_lbl}", _darken(color, 0.60)),
+        (f"A: {activity}", _darken(color, 0.38)),
+    ]
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    ft = 1
-    pad = 3
+    ft   = 1
+    pad  = 3
     (_, th), baseline = cv2.getTextSize("A", font, font_scale, ft)
     row_h = th + 2 * pad
+    y_bottom = max(y1, len(rows) * row_h + 4)
 
-    color_m = color
-    color_s = _darken(color, 0.60)
-    color_a = _darken(color, 0.38)
-
-    def _draw_row(y_bottom: int, text: str, bg: Tuple) -> int:
+    # Draw rows bottom-to-top: Activity closest to box, Motion at top
+    for text, bg in reversed(rows):
         (tw, _), _ = cv2.getTextSize(text, font, font_scale, ft)
         y_top = y_bottom - th - 2 * pad
         cv2.rectangle(frame, (x1, y_top), (x1 + tw + 2 * pad, y_bottom), bg, -1)
         cv2.putText(frame, text, (x1 + pad, y_bottom - pad - baseline),
                     font, font_scale, (255, 255, 255), ft, cv2.LINE_AA)
-        return y_top
-
-    # Reserve headroom above bbox (3 rows)
-    y_bottom = max(y1, 3 * row_h + 4)
-
-    # Activity — closest to box
-    a_lbl = activity["label"].replace("a person ", "")
-    y_bottom = _draw_row(y_bottom, f"A: {a_lbl}  {activity['score']:.2f}", color_a)
-
-    # Social — with nearby IDs if any
-    s_lbl = social["label"].replace("a person ", "")
-    if nearby_ids:
-        s_lbl += f" ({', '.join(nearby_ids)})"
-    y_bottom = _draw_row(y_bottom, f"S: {s_lbl}  {social['score']:.2f}", color_s)
-
-    # Motion — topmost
-    m_lbl = motion["label"].replace("a person ", "")
-    _draw_row(y_bottom, f"M: {m_lbl}  {motion['score']:.2f}", color_m)
+        y_bottom = y_top
 
 
 # ---------------------------------------------------------------------------
@@ -503,41 +399,47 @@ if __name__ == "__main__":
     frame_w, frame_h = args.image_size
 
     # ------------------------------------------------------------------
-    # 1. Load PLM
+    # 1. Load PLM + set up generator
     # ------------------------------------------------------------------
     print(f"Loading PLM from {args.plm_ckpt} …")
-    from apps.plm.generate import load_consolidated_model_and_tokenizer
+    from apps.plm.generate import (
+        PackedCausalTransformerGenerator,
+        PackedCausalTransformerGeneratorArgs,
+        load_consolidated_model_and_tokenizer,
+    )
     from core.transforms.video_transform import get_video_transform
-    from extract_plm_features import encode_text
 
-    plm_model, plm_tokenizer, _ = load_consolidated_model_and_tokenizer(args.plm_ckpt)
+    plm_model, plm_tokenizer, plm_config = load_consolidated_model_and_tokenizer(
+        args.plm_ckpt
+    )
     plm_transform = get_video_transform(image_res=plm_model.vision_model.image_size)
     print(f"  vision input size: {plm_model.vision_model.image_size}px")
 
-    # ------------------------------------------------------------------
-    # 2. Encode category text labels
-    # ------------------------------------------------------------------
-    print("Encoding category labels …")
-    motion_feats   = torch.stack([encode_text(plm_model, plm_tokenizer, t, args.pool)
-                                  for t in MOTION_LABELS])    # [N, dim] cuda
-    social_feats   = torch.stack([encode_text(plm_model, plm_tokenizer, t, args.pool)
-                                  for t in SOCIAL_LABELS])
-    activity_feats = torch.stack([encode_text(plm_model, plm_tokenizer, t, args.pool)
-                                  for t in ACTIVITY_LABELS])
-    print(f"  motion {len(MOTION_LABELS)} | social {len(SOCIAL_LABELS)} "
-          f"| activity {len(ACTIVITY_LABELS)}")
+    gen_cfg = PackedCausalTransformerGeneratorArgs(
+        temperature=args.temperature,
+        max_gen_len=args.max_gen_len,
+        until=[],           # let the model generate all 3 lines
+        dtype="bf16",
+        device="cuda",
+    )
+    generator = PackedCausalTransformerGenerator(gen_cfg, plm_model, plm_tokenizer)
+
+    print(f"  generator ready  (max_gen_len={args.max_gen_len}, "
+          f"temperature={args.temperature})")
+    print(f"\nPrompt used for every clip:\n"
+          f"  {DESCRIPTION_PROMPT!r}\n")
 
     # ------------------------------------------------------------------
-    # 3. Load tracks
+    # 2. Load tracks
     # ------------------------------------------------------------------
     print(f"Loading tracks from {args.track_file} …")
-    tracks   = _load_tracks(args.track_file)
+    tracks    = _load_tracks(args.track_file)
     frame_map = _build_frame_map(tracks)
     print(f"  {len(tracks)} identities, "
           f"{sum(len(v) for v in tracks.values())} track entries")
 
     # ------------------------------------------------------------------
-    # 4. Probe video
+    # 3. Probe video
     # ------------------------------------------------------------------
     cap_probe = cv2.VideoCapture(args.video)
     if not cap_probe.isOpened():
@@ -546,25 +448,22 @@ if __name__ == "__main__":
     vid_total     = int(cap_probe.get(cv2.CAP_PROP_FRAME_COUNT))
     cap_probe.release()
 
-    fps          = args.fps or vid_fps_probe
+    fps           = args.fps or vid_fps_probe
     window_frames = max(1, int(args.window_sec * fps))
-    max_frames   = args.max_frames or vid_total
+    max_frames    = args.max_frames or vid_total
     print(f"  fps={fps:.3f}  window={args.window_sec}s ({window_frames} frames)  "
           f"max_frames={max_frames}")
 
     # ------------------------------------------------------------------
-    # 5. Single-pass video read — stream crops window by window
-    #
-    # Memory strategy: buffer ONE window at a time.  When the window ID
-    # changes, encode + classify + clear before continuing.
+    # 4. Single-pass read — buffer crops per window, generate per window
     # ------------------------------------------------------------------
-    # identity → {wid: window_result_dict}
+    # identity → {wid: result_dict}
     identity_windows: Dict[str, Dict[int, Dict]] = {ident: {} for ident in tracks}
 
     def _process_window(wid: int, wcrops: Dict[str, List[PILImage.Image]]) -> None:
-        """Encode all accumulated crops for *wid* and store results."""
-        start_fr = wid * window_frames
-        end_fr   = (wid + 1) * window_frames - 1
+        """Run PLM generation for every identity that has crops in this window."""
+        start_fr  = wid * window_frames
+        end_fr    = (wid + 1) * window_frames - 1
         start_sec = round(start_fr / fps, 3)
         end_sec   = round((end_fr + 1) / fps, 3)
 
@@ -574,28 +473,30 @@ if __name__ == "__main__":
             if not crops:
                 continue
 
-            embedding = _encode_frames_plm(
-                plm_model, plm_tokenizer, plm_transform,
-                crops, args.num_plm_frames, args.pool,
-            )
-            if embedding is None:
-                continue
+            n = len(crops)
+            # Uniform subsample to num_plm_frames
+            if n > args.num_plm_frames:
+                idxs = [int(round(i * (n - 1) / (args.num_plm_frames - 1)))
+                        for i in range(args.num_plm_frames)]
+                crops = [crops[i] for i in idxs]
+            elif n == 1:
+                crops = crops * 2   # PLM needs ≥ 2 frames
 
-            motion_lbl,   motion_sc   = _best_match(embedding, motion_feats,
-                                                     MOTION_LABELS, args.softmax)
-            social_lbl,   social_sc   = _best_match(embedding, social_feats,
-                                                     SOCIAL_LABELS, args.softmax)
-            activity_lbl, activity_sc = _best_match(embedding, activity_feats,
-                                                     ACTIVITY_LABELS, args.softmax)
+            # Convert PIL crops → (N, 3, H, W) tensor via VideoTransform
+            frames_tensor, _ = plm_transform._process_multiple_images_pil(crops)
+
+            # PLM generative inference with structured prompt
+            responses, _, _ = generator.generate([(DESCRIPTION_PROMPT, frames_tensor)])
+            raw = responses[0].strip()
+
+            motion, social, activity = _parse_plm_response(raw)
 
             nearby_ids = _find_nearby_ids(
                 ident, wid, window_frames, tracks,
                 args.proximity_scale, max_frames,
             )
 
-            description = _compose_description(
-                motion_lbl, social_lbl, activity_lbl, nearby_ids
-            )
+            description = _compose_description(motion, social, activity, nearby_ids)
 
             win = {
                 "start_frame":        start_fr,
@@ -603,29 +504,23 @@ if __name__ == "__main__":
                 "start_sec":          start_sec,
                 "end_sec":            end_sec,
                 "n_frames":           len(crops),
-                "motion": {
-                    "label": motion_lbl,
-                    "score": round(motion_sc, 4),
-                },
+                "motion":             motion,
                 "social_interaction": {
-                    "label":      social_lbl,
-                    "score":      round(social_sc, 4),
+                    "label":      social,
                     "nearby_ids": nearby_ids,
                 },
-                "activity": {
-                    "label": activity_lbl,
-                    "score": round(activity_sc, 4),
-                },
-                "description": description,
+                "activity":           activity,
+                "raw_response":       raw,
+                "description":        description,
             }
             identity_windows[ident][wid] = win
 
-            nearby_str = f" → nearby: {nearby_ids}" if nearby_ids else ""
-            print(f"    [{ident}]  M: {motion_lbl!r}  "
-                  f"S: {social_lbl!r}{nearby_str}  "
-                  f"A: {activity_lbl!r}")
+            nearby_str = f"  nearby={nearby_ids}" if nearby_ids else ""
+            print(f"    [{ident}]  M:{motion!r}  S:{social!r}  A:{activity!r}{nearby_str}")
+            if "not determined" in (motion, social, activity):
+                print(f"      raw → {raw!r}")
 
-    print(f"\nReading {args.video} and encoding 2-sec crops …")
+    print(f"\nReading {args.video} and running PLM on 2-sec crop clips …")
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
         sys.exit(f"Cannot open video: {args.video}")
@@ -663,12 +558,12 @@ if __name__ == "__main__":
     cap.release()
     print()
 
-    # Process last (possibly incomplete) window
+    # Process last (possibly partial) window
     if current_wid >= 0 and any(window_crops.values()):
         _process_window(current_wid, window_crops)
 
     # ------------------------------------------------------------------
-    # 6. Build results list + write JSON
+    # 5. Build results + write JSON
     # ------------------------------------------------------------------
     results: Dict[str, List[Dict]] = {
         ident: [win for _, win in sorted(identity_windows[ident].items())]
@@ -685,10 +580,9 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # ------------------------------------------------------------------
-    # 7. Render annotated video (second pass — no GPU work)
+    # 6. Render annotated video  (second pass — no GPU work)
     # ------------------------------------------------------------------
     print(f"\nRendering overlay video …")
-
     frame_anns = _build_frame_annotations(tracks, max_frames)
     identity_colors = {ident: _identity_color(ident) for ident in tracks}
 
@@ -712,24 +606,18 @@ if __name__ == "__main__":
         for ident, x1, y1, x2, y2 in frame_anns.get(frame_idx, []):
             wid  = frame_idx // window_frames
             wins = identity_windows.get(ident, {})
-
-            # Use the current window, or the most recent earlier one
             if wid not in wins:
                 earlier = [k for k in wins if k <= wid]
                 wid = max(earlier) if earlier else None  # type: ignore[assignment]
-
             win_data = wins.get(wid) if wid is not None else None  # type: ignore[arg-type]
 
             _draw_window_overlay(
                 frame, x1, y1, x2, y2,
-                win_data,
-                identity_colors[ident],
-                args.font_scale,
+                win_data, identity_colors[ident], args.font_scale,
             )
 
         # Timestamp watermark
-        ts = f"t={frame_idx / fps:.1f}s"
-        cv2.putText(frame, ts, (8, vid_h - 8),
+        cv2.putText(frame, f"t={frame_idx / fps:.1f}s", (8, vid_h - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
 
         writer.write(frame)
