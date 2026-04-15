@@ -163,6 +163,9 @@ def _parse_args() -> argparse.Namespace:
     # --- runtime ---
     p.add_argument("--max-frames", type=int, default=None, metavar="N",
                    help="Stop after this many frames (default: all).")
+    p.add_argument("--max-minutes", type=float, default=None, metavar="M",
+                   help="Stop after this many minutes of video (default: all). "
+                        "Overridden by --max-frames if both are given.")
     # --- proximity ---
     p.add_argument("--proximity-scale", type=float, default=2.0, metavar="S",
                    help="Nearby threshold = this × avg_bbox_dim (default: 2.0).")
@@ -496,7 +499,12 @@ if __name__ == "__main__":
 
     fps           = args.fps or vid_fps_probe
     window_frames = max(1, int(args.window_sec * fps))
-    max_frames    = args.max_frames or vid_total
+    if args.max_frames is not None:
+        max_frames = args.max_frames
+    elif args.max_minutes is not None:
+        max_frames = int(args.max_minutes * 60 * fps)
+    else:
+        max_frames = vid_total
     print(f"  fps={fps:.3f}  window={args.window_sec}s ({window_frames} frames)  "
           f"max_frames={max_frames}")
 
