@@ -51,7 +51,7 @@ Output JSON
           },
           "activity":           "<free-form label>",
           "raw_response":       "<full PLM response text>",
-          "description":        "A person ..., ..., and ..."
+          "description":        "<same as raw_response — full PLM output>"
         },
         ...
       ],
@@ -301,23 +301,6 @@ def _parse_plm_response(text: str) -> Tuple[str, str, str, str]:
 # ---------------------------------------------------------------------------
 # Description composer
 # ---------------------------------------------------------------------------
-
-def _compose_description(motion: str, social: str, activity: str,
-                          nearby_ids: List[str]) -> str:
-    parts = []
-    if motion and motion.lower() != "unclear":
-        parts.append(motion)
-    s = social if social else ""
-    if nearby_ids:
-        s += f" ({', '.join(nearby_ids)})"
-    if s and s.lower() not in ("unclear", ""):
-        parts.append(s)
-    if activity and activity.lower() != "unclear":
-        parts.append(activity)
-    if not parts:
-        return "No clear description available."
-    return "A person " + ", ".join(parts) + "."
-
 
 # ---------------------------------------------------------------------------
 # Per-frame bbox annotation
@@ -609,8 +592,6 @@ if __name__ == "__main__":
                 args.proximity_scale, max_frames,
             )
 
-            description = _compose_description(motion, social, activity, nearby_ids)
-
             win = {
                 "start_frame":        start_fr,
                 "end_frame":          end_fr,
@@ -625,7 +606,7 @@ if __name__ == "__main__":
                 },
                 "activity":           activity,
                 "raw_response":       raw,
-                "description":        description,
+                "description":        raw,
             }
             identity_windows[ident][wid] = win
 
