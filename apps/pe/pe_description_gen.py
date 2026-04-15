@@ -408,12 +408,9 @@ def _draw_window_overlay(
     motion      = win.get("motion", "")
     social_dict = win.get("social_interaction", {})
     activity    = win.get("activity", "")
-    nearby_ids: List[str] = (social_dict.get("nearby_ids", [])
-                             if isinstance(social_dict, dict) else [])
+    # label already has nearby IDs embedded (e.g. "looking at child (d14709)")
     social_lbl  = (social_dict.get("label", "")
                    if isinstance(social_dict, dict) else str(social_dict))
-    if nearby_ids:
-        social_lbl += f" ({', '.join(nearby_ids)})"
 
     # Build rows bottom → top above the box.
     # First item ends up closest to the box; last item is topmost.
@@ -590,6 +587,12 @@ if __name__ == "__main__":
                 args.proximity_scale, max_frames,
             )
 
+            # Embed nearby IDs directly into the social label so the
+            # association is explicit everywhere (JSON, overlay, description).
+            social_with_ids = social
+            if nearby_ids:
+                social_with_ids += f" ({', '.join(nearby_ids)})"
+
             win = {
                 "start_frame":        start_fr,
                 "end_frame":          end_fr,
@@ -598,7 +601,7 @@ if __name__ == "__main__":
                 "n_frames":           len(pil_frames),
                 "motion":             motion,
                 "social_interaction": {
-                    "label":      social,
+                    "label":      social_with_ids,
                     "nearby_ids": nearby_ids,
                 },
                 "activity":           activity,
@@ -606,8 +609,7 @@ if __name__ == "__main__":
             }
             identity_windows[ident][wid] = win
 
-            nearby_str = f"  nearby={nearby_ids}" if nearby_ids else ""
-            print(f"    [{ident}]  M:{motion!r}  S:{social!r}  A:{activity!r}{nearby_str}")
+            print(f"    [{ident}]  M:{motion!r}  S:{social_with_ids!r}  A:{activity!r}")
             if not all([motion, social, activity]):
                 print(f"      raw → {raw!r}")
 
