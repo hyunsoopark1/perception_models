@@ -23,7 +23,7 @@ Processing loop
   for each window (stride = window = window_sec, default 6 s):
       for each identity visible in this window:
           frames = full video frames for this window   # (N, 3, H, W) tensor
-          prompt = _make_prompt(identity_id, bbox)     # asks for Motion/Social/Activity
+          prompt = _make_prompt(identity_id)            # asks for Motion/Social/Activity
           response = PLM.generate([(prompt, frames)])
           motion, social, activity = parse(response)
           nearby_ids = spatial_proximity(tracks, identity, window)
@@ -96,31 +96,21 @@ from PIL import Image as PILImage
 # Prompt builder — per identity, per window
 # ---------------------------------------------------------------------------
 
-def _make_prompt(
-    ident: str,
-    avg_cx: float, avg_cy: float,
-    avg_w: float, avg_h: float,
-    frame_w: int, frame_h: int,
-) -> str:
+def _make_prompt(ident: str) -> str:
     """
     Build the PLM prompt for one identity + window.
 
-    Includes:
-      • The identity ID so the model knows which track we are asking about.
-      • The bounding box in the original frame so the model knows where to
-        look (the full frame is passed as video, not a crop).
-      • The bbox size as a fraction of the frame, giving a sense of scale.
+    Each frame in the clip has a colored bounding box drawn directly onto
+    the pixels marking the tracked person.  The prompt instructs the model
+    to use that visible box as its spatial anchor rather than relying on
+    numeric coordinates.
     """
-    x1 = max(0, int(avg_cx - avg_w / 2))
-    y1 = max(0, int(avg_cy - avg_h / 2))
-    x2 = min(frame_w, int(avg_cx + avg_w / 2))
-    y2 = min(frame_h, int(avg_cy + avg_h / 2))
-
     return (
-        f"This is a video clip from a {frame_w}\u00d7{frame_h} scene. "
-        f"A tracked person with ID '{ident}' is located at bounding box "
-        f"({x1}, {y1}) to ({x2}, {y2}). "
-        f"Focus on this specific person and answer the following questions concisely. "
+        f"This is a video clip. In each frame a colored bounding box marks "
+        f"a specific tracked person (ID '{ident}'). "
+        f"Focus exclusively on the person inside the colored bounding box — "
+        f"the box moves with the person across frames. "
+        f"Answer the following questions about that person concisely. "
         f"If something is not clearly visible, respond with 'unclear' — do not guess.\n"
         "Description: <one sentence describing this person's appearance and overall situation>\n"
         "Motion: <this person's body movement in 2-5 words, or 'unclear'>\n"
@@ -591,14 +581,8 @@ if __name__ == "__main__":
                 pil_frames  = pil_frames  * 2   # PLM needs ≥ 2 frames
                 bbox_coords = bbox_coords * 2
 
-            # Use the midframe bbox as the representative position in the prompt.
-            mid = len(bbox_coords) // 2
-            mid_cx, mid_cy, mid_w, mid_h = bbox_coords[mid]
-
-            # Per-identity prompt: ID + midframe bbox in full frame
-            prompt = _make_prompt(
-                ident, mid_cx, mid_cy, mid_w, mid_h, frame_w, frame_h
-            )
+            # Prompt tells the model to attend to the drawn colored bbox
+            prompt = _make_prompt(ident)
 
             # Annotate each frame with its own per-frame bbox so PLM's visual
             # attention can follow the moving person across the clip.
