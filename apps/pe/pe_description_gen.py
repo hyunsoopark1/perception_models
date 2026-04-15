@@ -51,7 +51,7 @@ Output JSON
           },
           "activity":           "<free-form label>",
           "raw_response":       "<full PLM response text>",
-          "description":        "<same as raw_response — full PLM output>"
+          "description":        "<verbatim PLM output>"
         },
         ...
       ],
@@ -112,7 +112,6 @@ def _make_prompt(ident: str) -> str:
         f"the box moves with the person across frames. "
         f"Answer the following questions about that person concisely. "
         f"If something is not clearly visible, respond with 'unclear' — do not guess.\n"
-        "Description: <one sentence describing this person's appearance and overall situation>\n"
         "Motion: <this person's body movement in 2-5 words, or 'unclear'>\n"
         "Social: <who this person is near or interacting with in 2-5 words, or 'unclear'>\n"
         "Activity: <what this person is doing in 2-5 words, or 'unclear'>"
@@ -267,35 +266,41 @@ def _find_nearby_ids(
 # PLM response parsing
 # ---------------------------------------------------------------------------
 
-def _parse_plm_response(text: str) -> Tuple[str, str, str, str]:
+def _parse_plm_response(text: str) -> Tuple[str, str, str]:
     """
-    Extract Description / Motion / Social / Activity from the PLM's response.
+    Extract Motion / Social / Activity from the PLM's response.
 
-    Looks for lines starting with each keyword (case-insensitive).
+    Robust to common PLM formatting variations:
+      - "Motion: sitting still"
+      - "**Motion:** sitting still"   (markdown bold)
+      - "Motion - sitting still"      (dash separator)
+      - lowercase / mixed case
     Returns empty string for any field the model didn't fill in.
     """
-    description = motion = social = activity = ""
+    motion = social = activity = ""
     for line in text.splitlines():
-        stripped = line.strip()
+        # Strip markdown bold markers before matching
+        stripped = line.strip().replace("**", "")
         low = stripped.lower()
-        for key, field in (
-            ("description:", "description"),
-            ("motion:",      "motion"),
-            ("social:",      "social"),
-            ("activity:",    "activity"),
+        for prefix, field in (
+            ("motion",   "motion"),
+            ("social",   "social"),
+            ("activity", "activity"),
         ):
-            if low.startswith(key):
-                val = stripped[len(key):].strip()
-                if field == "description":
-                    description = val
-                elif field == "motion":
+            m = re.match(rf"^{prefix}\s*[:–\-]\s*", low)
+            if m:
+                val = stripped[m.end():].strip()
+                # Discard unanswered template placeholders like <...>
+                if re.fullmatch(r"<[^>]*>", val):
+                    val = ""
+                if field == "motion":
                     motion = val
                 elif field == "social":
                     social = val
                 elif field == "activity":
                     activity = val
                 break
-    return description, motion, social, activity
+    return motion, social, activity
 
 
 # ---------------------------------------------------------------------------
@@ -360,10 +365,9 @@ def _draw_window_overlay(
     font_scale: float,
 ) -> None:
     """
-    Draw bbox with identity badge + D/M/S/A rows above it:
+    Draw bbox with identity badge + M/S/A rows above it:
 
-        D: <description>               ← topmost, identity color
-        M: <motion>                    ← identity color
+        M: <motion>                    ← topmost, identity color
         S: <social> (id_2, id_5)       ← darker
         A: <activity>                  ← darkest
         ┌[id]──── bbox ───────────────┐
@@ -401,7 +405,6 @@ def _draw_window_overlay(
         return
 
     # --- collect field values ---
-    person_desc = win.get("person_description", "")
     motion      = win.get("motion", "")
     social_dict = win.get("social_interaction", {})
     activity    = win.get("activity", "")
@@ -421,11 +424,6 @@ def _draw_window_overlay(
         rows.append((f"S: {social_lbl[:MAX_CHARS]}", _darken(color, 0.60)))
     if motion:
         rows.append((f"M: {motion[:MAX_CHARS]}", color))
-    # D: use PLM's appearance description; fall back to the composed sentence
-    # so the row is always present even when PLM parsing fails.
-    desc_text = person_desc or win.get("description", "")
-    if desc_text:
-        rows.append((f"D: {desc_text[:MAX_CHARS]}", color))
 
     if not rows:
         return
@@ -585,7 +583,7 @@ if __name__ == "__main__":
             responses, _, _ = generator.generate([(prompt, frames_tensor)])
             raw = responses[0].strip()
 
-            person_desc, motion, social, activity = _parse_plm_response(raw)
+            motion, social, activity = _parse_plm_response(raw)
 
             nearby_ids = _find_nearby_ids(
                 ident, wid, window_frames, tracks,
@@ -598,22 +596,19 @@ if __name__ == "__main__":
                 "start_sec":          start_sec,
                 "end_sec":            end_sec,
                 "n_frames":           len(pil_frames),
-                "person_description": person_desc,
                 "motion":             motion,
                 "social_interaction": {
                     "label":      social,
                     "nearby_ids": nearby_ids,
                 },
                 "activity":           activity,
-                "raw_response":       raw,
                 "description":        raw,
             }
             identity_windows[ident][wid] = win
 
             nearby_str = f"  nearby={nearby_ids}" if nearby_ids else ""
-            print(f"    [{ident}]  {person_desc!r}")
-            print(f"      M:{motion!r}  S:{social!r}  A:{activity!r}{nearby_str}")
-            if not all([person_desc, motion, social, activity]):
+            print(f"    [{ident}]  M:{motion!r}  S:{social!r}  A:{activity!r}{nearby_str}")
+            if not all([motion, social, activity]):
                 print(f"      raw → {raw!r}")
 
     print(f"\nReading {args.video} and running PLM on 2-sec full-frame clips …")
