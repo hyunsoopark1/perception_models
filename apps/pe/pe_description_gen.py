@@ -6,7 +6,7 @@ For each tracked identity, generates a structured description covering:
   • Social       — how the person relates to others in the scene
   • Activity     — the high-level activity being performed
 
-Each identity is processed as a **2-second video clip** (full frames from the
+Each identity is processed as a **video clip** (full frames from the
 original video, sampled uniformly) fed to the Perception Language Model (PLM)
 with a structured text prompt that includes the identity ID and bounding box
 coordinates.  PLM is a *generative* model trained with vision+LLM — we use
@@ -20,7 +20,7 @@ bucket across everyone.
 
 Processing loop
 ---------------
-  for each 2-second window (stride = window = 2 s):
+  for each window (stride = window = window_sec, default 6 s):
       for each identity visible in this window:
           frames = full video frames for this window   # (N, 3, H, W) tensor
           prompt = _make_prompt(identity_id, bbox)     # asks for Motion/Social/Activity
@@ -156,8 +156,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=0.0,
                    help="Sampling temperature; 0 = greedy (default: 0).")
     # --- windowing ---
-    p.add_argument("--window-sec", type=float, default=2.0, metavar="S",
-                   help="Clip duration in seconds (default: 2.0).")
+    p.add_argument("--window-sec", type=float, default=6.0, metavar="S",
+                   help="Clip duration in seconds (default: 6.0).")
     p.add_argument("--fps", type=float, default=None, metavar="N",
                    help="Override video FPS (inferred from file when omitted).")
     # --- runtime ---
@@ -358,25 +358,26 @@ def _draw_window_overlay(
     font_scale: float,
 ) -> None:
     """
-    Draw bbox with identity ID + description rows above it:
+    Draw bbox with identity badge + D/M/S/A rows above it:
 
-        ┌───────────────────────────────────────┐
-        │ [id]  <person description>            │  ← identity color (topmost)
-        │ M: <motion>                           │  ← identity color
-        │ S: <social> (id_2, id_5)              │  ← darker
-        │ A: <activity>                         │  ← darkest (closest to box)
-        └──── bbox ─────────────────────────────┘
+        D: <description>               ← topmost, identity color
+        M: <motion>                    ← identity color
+        S: <social> (id_2, id_5)       ← darker
+        A: <activity>                  ← darkest
+        ┌[id]──── bbox ───────────────┐
+        │                             │
+        └─────────────────────────────┘
     """
     import cv2
-
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     ft   = 1
     pad  = 3
+    MAX_CHARS = 70   # truncate long text to prevent horizontal overflow
     (_, th), baseline = cv2.getTextSize("A", font, font_scale, ft)
 
     def _draw_row(y_bottom: int, text: str, bg: Tuple) -> int:
+        """Draw a filled label row; returns the top y of the drawn row."""
         (tw, _), _ = cv2.getTextSize(text, font, font_scale, ft)
         y_top = y_bottom - th - 2 * pad
         cv2.rectangle(frame, (x1, y_top), (x1 + tw + 2 * pad, y_bottom), bg, -1)
@@ -384,15 +385,24 @@ def _draw_window_overlay(
                     font, font_scale, (255, 255, 255), ft, cv2.LINE_AA)
         return y_top
 
+    # --- bounding box ---
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+    # --- identity badge pinned to top-left corner of box ---
+    id_tag = f"[{ident}]"
+    (tw, _), _ = cv2.getTextSize(id_tag, font, font_scale, ft)
+    cv2.rectangle(frame, (x1, y1), (x1 + tw + 2 * pad, y1 + th + 2 * pad), color, -1)
+    cv2.putText(frame, id_tag, (x1 + pad, y1 + th + pad - baseline),
+                font, font_scale, (255, 255, 255), ft, cv2.LINE_AA)
+
     if win is None:
-        # No description yet — just draw the ID on the box
-        _draw_row(y1, f"[{ident}]", color)
         return
 
+    # --- collect field values ---
+    person_desc = win.get("person_description", "")
     motion      = win.get("motion", "")
     social_dict = win.get("social_interaction", {})
     activity    = win.get("activity", "")
-    person_desc = win.get("person_description", "")
     nearby_ids: List[str] = (social_dict.get("nearby_ids", [])
                              if isinstance(social_dict, dict) else [])
     social_lbl  = (social_dict.get("label", "")
@@ -400,21 +410,23 @@ def _draw_window_overlay(
     if nearby_ids:
         social_lbl += f" ({', '.join(nearby_ids)})"
 
-    # Build rows (bottom → top above the box)
+    # Build rows bottom → top above the box.
+    # First item ends up closest to the box; last item is topmost.
     rows: List[Tuple[str, Tuple]] = []
     if activity:
-        rows.append((f"A: {activity}", _darken(color, 0.38)))
+        rows.append((f"A: {activity[:MAX_CHARS]}", _darken(color, 0.38)))
     if social_lbl:
-        rows.append((f"S: {social_lbl}", _darken(color, 0.60)))
+        rows.append((f"S: {social_lbl[:MAX_CHARS]}", _darken(color, 0.60)))
     if motion:
-        rows.append((f"M: {motion}", color))
+        rows.append((f"M: {motion[:MAX_CHARS]}", color))
     if person_desc:
-        rows.append((f"[{ident}] {person_desc}", color))
-    else:
-        rows.append((f"[{ident}]", color))
+        rows.append((f"D: {person_desc[:MAX_CHARS]}", color))
+
+    if not rows:
+        return
 
     y_bottom = max(y1, len(rows) * (th + 2 * pad) + 4)
-    for text, bg in rows:          # already in bottom-to-top order
+    for text, bg in rows:
         y_bottom = _draw_row(y_bottom, text, bg)
 
 
