@@ -115,19 +115,17 @@ def _make_prompt(
     y1 = max(0, int(avg_cy - avg_h / 2))
     x2 = min(frame_w, int(avg_cx + avg_w / 2))
     y2 = min(frame_h, int(avg_cy + avg_h / 2))
-    frac_w = round(avg_w / frame_w, 2)
-    frac_h = round(avg_h / frame_h, 2)
 
     return (
         f"This is a video clip from a {frame_w}\u00d7{frame_h} scene. "
         f"A tracked person with ID '{ident}' is located at bounding box "
-        f"({x1}, {y1}) to ({x2}, {y2}), "
-        f"occupying about {frac_w:.0%} of the frame width and {frac_h:.0%} of the height. "
-        f"Focus on this specific person.\n"
-        "Answer the following questions concisely:\n"
-        "Motion: <describe this person's body movement in 2-5 words>\n"
-        "Social: <describe who this person is near or interacting with in 2-5 words>\n"
-        "Activity: <describe what this person is doing in 2-5 words>"
+        f"({x1}, {y1}) to ({x2}, {y2}). "
+        f"Focus on this specific person and answer the following questions concisely. "
+        f"If something is not clearly visible, respond with 'unclear' — do not guess.\n"
+        "Description: <one sentence describing this person's appearance and overall situation>\n"
+        "Motion: <this person's body movement in 2-5 words, or 'unclear'>\n"
+        "Social: <who this person is near or interacting with in 2-5 words, or 'unclear'>\n"
+        "Activity: <what this person is doing in 2-5 words, or 'unclear'>"
     )
 
 
@@ -276,30 +274,35 @@ def _find_nearby_ids(
 # PLM response parsing
 # ---------------------------------------------------------------------------
 
-def _parse_plm_response(text: str) -> Tuple[str, str, str]:
+def _parse_plm_response(text: str) -> Tuple[str, str, str, str]:
     """
-    Extract Motion / Social / Activity labels from the PLM's response text.
+    Extract Description / Motion / Social / Activity from the PLM's response.
 
-    Looks for lines starting with "Motion:", "Social:", "Activity:" (case-
-    insensitive).  Falls back to "not determined" for any missing field.
+    Looks for lines starting with each keyword (case-insensitive).
+    Returns empty string for any field the model didn't fill in.
     """
-    motion = social = activity = "not determined"
+    description = motion = social = activity = ""
     for line in text.splitlines():
         stripped = line.strip()
         low = stripped.lower()
-        if low.startswith("motion:"):
-            val = stripped.split(":", 1)[1].strip()
-            if val:
-                motion = val
-        elif low.startswith("social:"):
-            val = stripped.split(":", 1)[1].strip()
-            if val:
-                social = val
-        elif low.startswith("activity:"):
-            val = stripped.split(":", 1)[1].strip()
-            if val:
-                activity = val
-    return motion, social, activity
+        for key, field in (
+            ("description:", "description"),
+            ("motion:",      "motion"),
+            ("social:",      "social"),
+            ("activity:",    "activity"),
+        ):
+            if low.startswith(key):
+                val = stripped[len(key):].strip()
+                if field == "description":
+                    description = val
+                elif field == "motion":
+                    motion = val
+                elif field == "social":
+                    social = val
+                elif field == "activity":
+                    activity = val
+                break
+    return description, motion, social, activity
 
 
 # ---------------------------------------------------------------------------
@@ -308,10 +311,19 @@ def _parse_plm_response(text: str) -> Tuple[str, str, str]:
 
 def _compose_description(motion: str, social: str, activity: str,
                           nearby_ids: List[str]) -> str:
-    s = social
+    parts = []
+    if motion and motion.lower() != "unclear":
+        parts.append(motion)
+    s = social if social else ""
     if nearby_ids:
         s += f" ({', '.join(nearby_ids)})"
-    return f"A person {motion}, {s}, and {activity}."
+    if s and s.lower() not in ("unclear", ""):
+        parts.append(s)
+    if activity and activity.lower() != "unclear":
+        parts.append(activity)
+    if not parts:
+        return "No clear description available."
+    return "A person " + ", ".join(parts) + "."
 
 
 # ---------------------------------------------------------------------------
@@ -337,54 +349,70 @@ def _darken(color: Tuple[int, int, int], factor: float) -> Tuple[int, int, int]:
 def _draw_window_overlay(
     frame: np.ndarray,
     x1: int, y1: int, x2: int, y2: int,
+    ident: str,
     win: Optional[Dict],
     color: Tuple[int, int, int],
     font_scale: float,
 ) -> None:
     """
-    Draw bbox + 3 description rows above it:
+    Draw bbox with identity ID + description rows above it:
 
         ┌───────────────────────────────────────┐
+        │ [id]  <person description>            │  ← identity color (topmost)
         │ M: <motion>                           │  ← identity color
         │ S: <social> (id_2, id_5)              │  ← darker
-        │ A: <activity>                         │  ← darkest
+        │ A: <activity>                         │  ← darkest (closest to box)
         └──── bbox ─────────────────────────────┘
     """
     import cv2
 
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    if win is None:
-        return
-
-    motion   = win.get("motion", "")
-    social   = win.get("social_interaction", {})
-    activity = win.get("activity", "")
-    nearby_ids: List[str] = social.get("nearby_ids", []) if isinstance(social, dict) else []
-    social_lbl = social.get("label", "") if isinstance(social, dict) else str(social)
-    if nearby_ids:
-        social_lbl += f" ({', '.join(nearby_ids)})"
-
-    rows = [
-        (f"M: {motion}",   color),
-        (f"S: {social_lbl}", _darken(color, 0.60)),
-        (f"A: {activity}", _darken(color, 0.38)),
-    ]
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     ft   = 1
     pad  = 3
     (_, th), baseline = cv2.getTextSize("A", font, font_scale, ft)
-    row_h = th + 2 * pad
-    y_bottom = max(y1, len(rows) * row_h + 4)
 
-    # Draw rows bottom-to-top: Activity closest to box, Motion at top
-    for text, bg in reversed(rows):
+    def _draw_row(y_bottom: int, text: str, bg: Tuple) -> int:
         (tw, _), _ = cv2.getTextSize(text, font, font_scale, ft)
         y_top = y_bottom - th - 2 * pad
         cv2.rectangle(frame, (x1, y_top), (x1 + tw + 2 * pad, y_bottom), bg, -1)
         cv2.putText(frame, text, (x1 + pad, y_bottom - pad - baseline),
                     font, font_scale, (255, 255, 255), ft, cv2.LINE_AA)
-        y_bottom = y_top
+        return y_top
+
+    if win is None:
+        # No description yet — just draw the ID on the box
+        _draw_row(y1, f"[{ident}]", color)
+        return
+
+    motion      = win.get("motion", "")
+    social_dict = win.get("social_interaction", {})
+    activity    = win.get("activity", "")
+    person_desc = win.get("person_description", "")
+    nearby_ids: List[str] = (social_dict.get("nearby_ids", [])
+                             if isinstance(social_dict, dict) else [])
+    social_lbl  = (social_dict.get("label", "")
+                   if isinstance(social_dict, dict) else str(social_dict))
+    if nearby_ids:
+        social_lbl += f" ({', '.join(nearby_ids)})"
+
+    # Build rows (bottom → top above the box)
+    rows: List[Tuple[str, Tuple]] = []
+    if activity:
+        rows.append((f"A: {activity}", _darken(color, 0.38)))
+    if social_lbl:
+        rows.append((f"S: {social_lbl}", _darken(color, 0.60)))
+    if motion:
+        rows.append((f"M: {motion}", color))
+    if person_desc:
+        rows.append((f"[{ident}] {person_desc}", color))
+    else:
+        rows.append((f"[{ident}]", color))
+
+    y_bottom = max(y1, len(rows) * (th + 2 * pad) + 4)
+    for text, bg in rows:          # already in bottom-to-top order
+        y_bottom = _draw_row(y_bottom, text, bg)
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +558,7 @@ if __name__ == "__main__":
             responses, _, _ = generator.generate([(prompt, frames_tensor)])
             raw = responses[0].strip()
 
-            motion, social, activity = _parse_plm_response(raw)
+            person_desc, motion, social, activity = _parse_plm_response(raw)
 
             nearby_ids = _find_nearby_ids(
                 ident, wid, window_frames, tracks,
@@ -545,6 +573,7 @@ if __name__ == "__main__":
                 "start_sec":          start_sec,
                 "end_sec":            end_sec,
                 "n_frames":           len(pil_frames),
+                "person_description": person_desc,
                 "motion":             motion,
                 "social_interaction": {
                     "label":      social,
@@ -557,8 +586,9 @@ if __name__ == "__main__":
             identity_windows[ident][wid] = win
 
             nearby_str = f"  nearby={nearby_ids}" if nearby_ids else ""
-            print(f"    [{ident}]  M:{motion!r}  S:{social!r}  A:{activity!r}{nearby_str}")
-            if "not determined" in (motion, social, activity):
+            print(f"    [{ident}]  {person_desc!r}")
+            print(f"      M:{motion!r}  S:{social!r}  A:{activity!r}{nearby_str}")
+            if not all([person_desc, motion, social, activity]):
                 print(f"      raw → {raw!r}")
 
     print(f"\nReading {args.video} and running PLM on 2-sec full-frame clips …")
@@ -658,7 +688,7 @@ if __name__ == "__main__":
 
             _draw_window_overlay(
                 frame, x1, y1, x2, y2,
-                win_data, identity_colors[ident], args.font_scale,
+                ident, win_data, identity_colors[ident], args.font_scale,
             )
 
         # Timestamp watermark
