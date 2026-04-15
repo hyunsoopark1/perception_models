@@ -551,15 +551,15 @@ if __name__ == "__main__":
             pil_frames    = [frame_cache[fidx] for fidx in frame_indices]
             bbox_coords   = [(e[1], e[2], e[3], e[4]) for e in bbox_entries]
 
-            # Average bbox for the prompt (representative position)
-            avg_cx = sum(b[0] for b in bbox_coords) / len(bbox_coords)
-            avg_cy = sum(b[1] for b in bbox_coords) / len(bbox_coords)
-            avg_w  = sum(b[2] for b in bbox_coords) / len(bbox_coords)
-            avg_h  = sum(b[3] for b in bbox_coords) / len(bbox_coords)
+            # Use the midframe bbox as the representative position in the prompt.
+            # The person can move significantly over 6 s, so the time-average
+            # would point to empty space; the middle frame is an actual position.
+            mid = len(bbox_coords) // 2
+            mid_cx, mid_cy, mid_w, mid_h = bbox_coords[mid]
 
             # Per-identity prompt: ID + bbox in full frame
             prompt = _make_prompt(
-                ident, avg_cx, avg_cy, avg_w, avg_h, frame_w, frame_h
+                ident, mid_cx, mid_cy, mid_w, mid_h, frame_w, frame_h
             )
 
             # Uniform subsample to num_plm_frames
