@@ -330,6 +330,35 @@ def _compose_description(motion: str, social: str, activity: str,
 
 
 # ---------------------------------------------------------------------------
+# Per-frame bbox annotation
+# ---------------------------------------------------------------------------
+
+def _annotate_frame(
+    pil_frame: PILImage.Image,
+    cx: float, cy: float, w: float, h: float,
+    color: Tuple[int, int, int] = (0, 255, 0),
+    thickness: int = 4,
+) -> PILImage.Image:
+    """
+    Draw the tracked person's bbox onto a copy of the frame (RGB).
+
+    This embeds the spatial location directly into the pixels so PLM's
+    visual attention can follow the moving box across frames, rather than
+    relying on a single static bbox coordinate in the text prompt.
+    """
+    import cv2
+    frame = np.array(pil_frame)          # H×W×3 uint8, RGB
+    x1 = max(0, int(cx - w / 2))
+    y1 = max(0, int(cy - h / 2))
+    x2 = min(frame.shape[1], int(cx + w / 2))
+    y2 = min(frame.shape[0], int(cy + h / 2))
+    # cv2 expects BGR but we keep the array as RGB — swap color channels
+    bgr_color = (color[2], color[1], color[0])
+    cv2.rectangle(frame, (x1, y1), (x2, y2), bgr_color, thickness)
+    return PILImage.fromarray(frame)
+
+
+# ---------------------------------------------------------------------------
 # Colour helpers
 # ---------------------------------------------------------------------------
 
@@ -551,28 +580,36 @@ if __name__ == "__main__":
             pil_frames    = [frame_cache[fidx] for fidx in frame_indices]
             bbox_coords   = [(e[1], e[2], e[3], e[4]) for e in bbox_entries]
 
-            # Use the midframe bbox as the representative position in the prompt.
-            # The person can move significantly over 6 s, so the time-average
-            # would point to empty space; the middle frame is an actual position.
-            mid = len(bbox_coords) // 2
-            mid_cx, mid_cy, mid_w, mid_h = bbox_coords[mid]
-
-            # Per-identity prompt: ID + bbox in full frame
-            prompt = _make_prompt(
-                ident, mid_cx, mid_cy, mid_w, mid_h, frame_w, frame_h
-            )
-
-            # Uniform subsample to num_plm_frames
+            # Uniform subsample to num_plm_frames (keep bbox_coords in sync)
             n = len(pil_frames)
             if n > args.num_plm_frames:
                 idxs = [int(round(i * (n - 1) / (args.num_plm_frames - 1)))
                         for i in range(args.num_plm_frames)]
-                pil_frames = [pil_frames[i] for i in idxs]
+                pil_frames  = [pil_frames[i]  for i in idxs]
+                bbox_coords = [bbox_coords[i] for i in idxs]
             elif n == 1:
-                pil_frames = pil_frames * 2   # PLM needs ≥ 2 frames
+                pil_frames  = pil_frames  * 2   # PLM needs ≥ 2 frames
+                bbox_coords = bbox_coords * 2
 
-            # Full frames → (N, 3, H, W) tensor
-            frames_tensor, _ = plm_transform._process_multiple_images_pil(pil_frames)
+            # Use the midframe bbox as the representative position in the prompt.
+            mid = len(bbox_coords) // 2
+            mid_cx, mid_cy, mid_w, mid_h = bbox_coords[mid]
+
+            # Per-identity prompt: ID + midframe bbox in full frame
+            prompt = _make_prompt(
+                ident, mid_cx, mid_cy, mid_w, mid_h, frame_w, frame_h
+            )
+
+            # Annotate each frame with its own per-frame bbox so PLM's visual
+            # attention can follow the moving person across the clip.
+            ann_color = _identity_color(ident)
+            annotated = [
+                _annotate_frame(f, cx, cy, w, h, color=ann_color)
+                for f, (cx, cy, w, h) in zip(pil_frames, bbox_coords)
+            ]
+
+            # Annotated frames → (N, 3, H, W) tensor
+            frames_tensor, _ = plm_transform._process_multiple_images_pil(annotated)
 
             # PLM generative inference
             responses, _, _ = generator.generate([(prompt, frames_tensor)])
