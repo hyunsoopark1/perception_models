@@ -438,8 +438,11 @@ def _draw_window_overlay(
         rows.append((f"S: {social_lbl[:MAX_CHARS]}", _darken(color, 0.60)))
     if motion:
         rows.append((f"M: {motion[:MAX_CHARS]}", color))
-    if person_desc:
-        rows.append((f"D: {person_desc[:MAX_CHARS]}", color))
+    # D: use PLM's appearance description; fall back to the composed sentence
+    # so the row is always present even when PLM parsing fails.
+    desc_text = person_desc or win.get("description", "")
+    if desc_text:
+        rows.append((f"D: {desc_text[:MAX_CHARS]}", color))
 
     if not rows:
         return
