@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Video Compilation</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                   Helvetica, Arial, sans-serif;
+      max-width: 880px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      line-height: 1.5;
+    }
+    h1 { margin-bottom: 1.5rem; }
+    section {
+      border: 1px solid #8884;
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 1.25rem;
+    }
+    section h2 { margin-top: 0; font-size: 1.1rem; }
+    button {
+      padding: 0.5rem 1rem;
+      font-size: 1rem;
+      border-radius: 6px;
+      border: 1px solid #8886;
+      background: #0d6efd;
+      color: white;
+      cursor: pointer;
+    }
+    button:disabled { background: #8888; cursor: not-allowed; }
+    button.secondary { background: transparent; color: inherit; }
+    input[type="text"] {
+      padding: 0.5rem;
+      font-size: 1rem;
+      border-radius: 6px;
+      border: 1px solid #8886;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+    .status { font-size: 0.9rem; opacity: 0.85; min-height: 1.2em; }
+    .error { color: #c0392b; }
+    ul.files { margin: 0.5rem 0 0.75rem; padding-left: 1.2rem; }
+    video { width: 100%; margin-top: 1rem; background: black; border-radius: 6px; }
+    .spinner {
+      display: inline-block; width: 1em; height: 1em;
+      border: 2px solid currentColor; border-right-color: transparent;
+      border-radius: 50%; animation: spin 0.8s linear infinite;
+      vertical-align: -0.15em;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>Video Compilation</h1>
+
+  <section>
+    <h2>1. Upload videos</h2>
+    <div class="row">
+      <input type="file" id="files" multiple
+             accept="video/mp4,video/quicktime,video/x-matroska,video/webm,video/x-msvideo,.mov,.mp4,.mkv,.webm,.avi,.flv,.m4v" />
+      <button id="uploadBtn">Upload</button>
+      <button id="clearBtn" class="secondary">Clear workspace</button>
+    </div>
+    <div class="status" id="uploadStatus"></div>
+    <ul class="files" id="fileList"></ul>
+  </section>
+
+  <section>
+    <h2>2. Process</h2>
+    <p>Splits each video into 5-second clips and extracts descriptions.</p>
+    <button id="processBtn" disabled>Processing</button>
+    <div class="status" id="processStatus"></div>
+  </section>
+
+  <section>
+    <h2>3. Create</h2>
+    <p>Enter a query and build a compilation from the matching clips.</p>
+    <div class="row">
+      <input type="text" id="query" placeholder="e.g. child taking first steps" />
+    </div>
+    <div class="row" style="margin-top: 0.5rem;">
+      <button id="createBtn" disabled>Creating</button>
+    </div>
+    <div class="status" id="createStatus"></div>
+    <video id="result" controls style="display:none;"></video>
+  </section>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const filesInput   = $("files");
+  const uploadBtn    = $("uploadBtn");
+  const clearBtn     = $("clearBtn");
+  const uploadStatus = $("uploadStatus");
+  const fileList     = $("fileList");
+  const processBtn   = $("processBtn");
+  const processStatus= $("processStatus");
+  const queryInput   = $("query");
+  const createBtn    = $("createBtn");
+  const createStatus = $("createStatus");
+  const resultVideo  = $("result");
+
+  let state = {
+    uploaded: [], processing: false, processed: false,
+    creating: false, compilation: null, last_error: null,
+  };
+  let polling = null;
+
+  const setError = (el, msg) => {
+    el.textContent = msg || "";
+    el.classList.toggle("error", !!msg);
+  };
+
+  function render() {
+    // File list
+    fileList.innerHTML = "";
+    for (const name of state.uploaded) {
+      const li = document.createElement("li");
+      li.textContent = name;
+      fileList.appendChild(li);
+    }
+
+    // Process button: needs uploads; not running; not currently creating
+    processBtn.disabled = state.processing || state.creating
+                       || state.uploaded.length === 0;
+    processBtn.innerHTML = state.processing
+      ? '<span class="spinner"></span> Processing...'
+      : "Processing";
+
+    // Create button: needs processed === true, query non-empty, nothing running
+    const hasQuery = queryInput.value.trim().length > 0;
+    createBtn.disabled = !state.processed || state.creating
+                      || state.processing || !hasQuery;
+    createBtn.innerHTML = state.creating
+      ? '<span class="spinner"></span> Creating...'
+      : "Creating";
+
+    // Status lines
+    if (state.processing) {
+      setError(processStatus, "");
+      processStatus.textContent = "Running generate_clip.py + extract_description.py...";
+    } else if (state.last_error && !state.processed && !state.creating) {
+      setError(processStatus, "Error: " + state.last_error);
+    } else if (state.processed) {
+      setError(processStatus, "");
+      processStatus.textContent = "Processed. You can now Create.";
+    } else {
+      processStatus.textContent = "";
+    }
+
+    if (state.creating) {
+      setError(createStatus, "");
+      createStatus.textContent = "Running find_clip.py...";
+    } else if (state.last_error && state.processed) {
+      setError(createStatus, "Error: " + state.last_error);
+    } else if (state.compilation) {
+      setError(createStatus, "");
+      createStatus.textContent = "Compilation ready.";
+    } else {
+      createStatus.textContent = "";
+    }
+
+    // Video
+    if (state.compilation) {
+      resultVideo.style.display = "";
+      const src = `/compilation.mp4?v=${state.compilation}`;
+      if (resultVideo.dataset.token !== state.compilation) {
+        resultVideo.src = src;
+        resultVideo.dataset.token = state.compilation;
+        resultVideo.load();
+      }
+    } else {
+      resultVideo.style.display = "none";
+      resultVideo.removeAttribute("src");
+      delete resultVideo.dataset.token;
+    }
+  }
+
+  async function refresh() {
+    try {
+      const r = await fetch("/status");
+      state = await r.json();
+      render();
+    } catch (e) { /* ignore transient */ }
+  }
+
+  function pollWhileBusy() {
+    if (polling) return;
+    polling = setInterval(async () => {
+      await refresh();
+      if (!state.processing && !state.creating) {
+        clearInterval(polling); polling = null;
+      }
+    }, 1500);
+  }
+
+  uploadBtn.addEventListener("click", async () => {
+    if (!filesInput.files.length) {
+      setError(uploadStatus, "Pick at least one video file.");
+      return;
+    }
+    const fd = new FormData();
+    for (const f of filesInput.files) fd.append("videos", f);
+    uploadBtn.disabled = true;
+    setError(uploadStatus, "");
+    uploadStatus.textContent = "Uploading...";
+    try {
+      const r = await fetch("/upload", { method: "POST", body: fd });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || "Upload failed.");
+      let msg = `Uploaded ${data.saved.length} file(s).`;
+      if (data.rejected && data.rejected.length) {
+        msg += ` Rejected: ${data.rejected.join(", ")}.`;
+      }
+      uploadStatus.textContent = msg;
+      filesInput.value = "";
+      await refresh();
+    } catch (e) {
+      setError(uploadStatus, e.message);
+    } finally {
+      uploadBtn.disabled = false;
+    }
+  });
+
+  clearBtn.addEventListener("click", async () => {
+    if (!confirm("Delete all uploaded videos, clips, and descriptions?")) return;
+    try {
+      const r = await fetch("/clear", { method: "POST" });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || "Clear failed.");
+      uploadStatus.textContent = "Workspace cleared.";
+      await refresh();
+    } catch (e) {
+      setError(uploadStatus, e.message);
+    }
+  });
+
+  processBtn.addEventListener("click", async () => {
+    try {
+      const r = await fetch("/process", { method: "POST" });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || "Process failed to start.");
+      await refresh();
+      pollWhileBusy();
+    } catch (e) {
+      setError(processStatus, e.message);
+    }
+  });
+
+  createBtn.addEventListener("click", async () => {
+    const query = queryInput.value.trim();
+    if (!query) return;
+    try {
+      const r = await fetch("/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || "Create failed to start.");
+      await refresh();
+      pollWhileBusy();
+    } catch (e) {
+      setError(createStatus, e.message);
+    }
+  });
+
+  queryInput.addEventListener("input", render);
+  refresh();
+})();
+</script>
+</body>
+</html>

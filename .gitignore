@@ -8,3 +8,4 @@ data-gym-cache/*
 torchinductor_*/*
 tmp*/*
 apps/plm/dummy_datasets
+web/workspace/
