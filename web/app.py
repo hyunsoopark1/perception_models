@@ -43,7 +43,7 @@ CLIPS_JSON = CLIPS_DIR / "clips.json"
 DESCRIPTIONS_JSON = WORKSPACE / "descriptions.json"
 COMPILATION_MP4 = WORKSPACE / "compilation.mp4"
 
-ALLOWED_EXTENSIONS = {".mov", ".mp4", ".avi", ".mkv", ".webm", ".flv", ".m4v"}
+ALLOWED_EXTENSIONS = {".mp4", ".mov"}
 MAX_CONTENT_LENGTH = 2 * 1024 * 1024 * 1024  # 2 GB per request
 
 # ──────────────────────────────────────────────────────────────────────────────

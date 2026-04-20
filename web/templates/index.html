@@ -60,12 +60,23 @@
 
   <section>
     <h2>1. Upload videos</h2>
+    <p>Pick a folder (subfolders included) or individual files. Only
+       <code>.mp4</code> and <code>.mov</code> are uploaded.</p>
     <div class="row">
-      <input type="file" id="files" multiple
-             accept="video/mp4,video/quicktime,video/x-matroska,video/webm,video/x-msvideo,.mov,.mp4,.mkv,.webm,.avi,.flv,.m4v" />
-      <button id="uploadBtn">Upload</button>
+      <label class="secondary">
+        <input type="file" id="folder" multiple webkitdirectory directory
+               style="display:none" />
+        <button type="button" id="pickFolderBtn" class="secondary">Select folder</button>
+      </label>
+      <label class="secondary">
+        <input type="file" id="files" multiple accept=".mp4,.mov,video/mp4,video/quicktime"
+               style="display:none" />
+        <button type="button" id="pickFilesBtn" class="secondary">Select files</button>
+      </label>
+      <button id="uploadBtn" disabled>Upload</button>
       <button id="clearBtn" class="secondary">Clear workspace</button>
     </div>
+    <div class="status" id="pickStatus"></div>
     <div class="status" id="uploadStatus"></div>
     <ul class="files" id="fileList"></ul>
   </section>
@@ -93,11 +104,79 @@
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
+  const folderInput  = $("folder");
   const filesInput   = $("files");
+  const pickFolderBtn= $("pickFolderBtn");
+  const pickFilesBtn = $("pickFilesBtn");
+  const pickStatus   = $("pickStatus");
   const uploadBtn    = $("uploadBtn");
   const clearBtn     = $("clearBtn");
   const uploadStatus = $("uploadStatus");
   const fileList     = $("fileList");
+
+  const VIDEO_RE = /\.(mp4|mov)$/i;
+  let selectedFiles = [];  // filtered File objects, dedup by name
+
+  function filterAndStage(fileList) {
+    const seen = new Set();
+    const kept = [];
+    let skipped = 0;
+    for (const f of fileList) {
+      if (!VIDEO_RE.test(f.name)) { skipped++; continue; }
+      if (seen.has(f.name)) continue;
+      seen.add(f.name);
+      kept.push(f);
+    }
+    selectedFiles = kept;
+    uploadBtn.disabled = kept.length === 0;
+    const parts = [`${kept.length} video file(s) selected.`];
+    if (skipped) parts.push(`Ignored ${skipped} non-mp4/mov file(s).`);
+    pickStatus.textContent = parts.join(" ");
+  }
+
+  pickFolderBtn.addEventListener("click", () => folderInput.click());
+  pickFilesBtn.addEventListener("click", () => filesInput.click());
+  folderInput.addEventListener("change", (e) => onPick(e.target.files));
+  filesInput.addEventListener("change", (e) => onPick(e.target.files));
+
+  function probeDuration(file) {
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(file);
+      const v = document.createElement("video");
+      v.preload = "metadata";
+      v.muted = true;
+      const cleanup = () => { URL.revokeObjectURL(url); v.src = ""; };
+      v.onloadedmetadata = () => {
+        const d = isFinite(v.duration) ? v.duration : NaN;
+        cleanup();
+        resolve(d);
+      };
+      v.onerror = () => { cleanup(); resolve(NaN); };
+      v.src = url;
+    });
+  }
+
+  async function onPick(fileList) {
+    filterAndStage(fileList);
+    if (!selectedFiles.length) return;
+    uploadBtn.disabled = true;
+    pickStatus.textContent = `Checking durations (0/${selectedFiles.length})...`;
+    const kept = [];
+    let short = 0;
+    for (let i = 0; i < selectedFiles.length; i++) {
+      const f = selectedFiles[i];
+      const d = await probeDuration(f);
+      if (isFinite(d) && d > 5) kept.push(f);
+      else short++;
+      pickStatus.textContent =
+        `Checking durations (${i + 1}/${selectedFiles.length})...`;
+    }
+    selectedFiles = kept;
+    uploadBtn.disabled = kept.length === 0;
+    const parts = [`${kept.length} video(s) longer than 5s ready to upload.`];
+    if (short) parts.push(`Skipped ${short} that were 5s or shorter.`);
+    pickStatus.textContent = parts.join(" ");
+  }
   const processBtn   = $("processBtn");
   const processStatus= $("processStatus");
   const queryInput   = $("query");
@@ -200,15 +279,15 @@
   }
 
   uploadBtn.addEventListener("click", async () => {
-    if (!filesInput.files.length) {
+    if (!selectedFiles.length) {
       setError(uploadStatus, "Pick at least one video file.");
       return;
     }
     const fd = new FormData();
-    for (const f of filesInput.files) fd.append("videos", f);
+    for (const f of selectedFiles) fd.append("videos", f, f.name);
     uploadBtn.disabled = true;
     setError(uploadStatus, "");
-    uploadStatus.textContent = "Uploading...";
+    uploadStatus.textContent = `Uploading ${selectedFiles.length} file(s)...`;
     try {
       const r = await fetch("/upload", { method: "POST", body: fd });
       const data = await r.json();
@@ -218,12 +297,15 @@
         msg += ` Rejected: ${data.rejected.join(", ")}.`;
       }
       uploadStatus.textContent = msg;
+      selectedFiles = [];
       filesInput.value = "";
+      folderInput.value = "";
+      pickStatus.textContent = "";
       await refresh();
     } catch (e) {
       setError(uploadStatus, e.message);
     } finally {
-      uploadBtn.disabled = false;
+      uploadBtn.disabled = selectedFiles.length === 0;
     }
   });
 
