@@ -364,24 +364,18 @@ def process():
     return jsonify({"started": True})
 
 
-def _do_create(query: str, start: str, end: str, period: str) -> None:
+def _do_create(query: str, period: str) -> None:
     try:
-        extra = []
-        if start: extra += ["--start", start]
-        if end:   extra += ["--end",   end]
-        if period in ("month", "quarter"):
-            extra += ["--period", period]
-        _log(f'=== Creating compilation for query: "{query}" '
-             f'[start={start or "-"}, end={end or "-"}, period={period}] ===')
+        _log(f'=== Creating compilation for query: "{query}" [period={period}] ===')
         if COMPILATION_MP4.exists():
             COMPILATION_MP4.unlink()
         _run([
             sys.executable, "find_clip.py",
             "--descriptions", str(DESCRIPTIONS_JSON),
             "--query", query,
+            "--period", period,
             "--plm_verify",
             "--compile", str(COMPILATION_MP4),
-            *extra,
         ])
         if not COMPILATION_MP4.exists():
             raise RuntimeError("find_clip.py produced no compilation.mp4")
@@ -401,25 +395,14 @@ def _do_create(query: str, start: str, end: str, period: str) -> None:
             STATE["creating"] = False
 
 
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
-
 @app.route("/create", methods=["POST"])
 def create():
     body = request.json or {}
     query  = str(body.get("query", "")).strip()
-    start  = str(body.get("start", "")).strip()
-    end    = str(body.get("end", "")).strip()
     period = str(body.get("period", "quarter")).strip() or "quarter"
 
     if not query:
         return jsonify({"error": "Query is empty."}), 400
-    if start and not DATE_RE.match(start):
-        return jsonify({"error": "start must be YYYY-MM-DD"}), 400
-    if end and not DATE_RE.match(end):
-        return jsonify({"error": "end must be YYYY-MM-DD"}), 400
-    if start and end and start > end:
-        return jsonify({"error": "start is after end"}), 400
     if period not in ("month", "quarter"):
         return jsonify({"error": "period must be 'month' or 'quarter'"}), 400
 
@@ -433,7 +416,7 @@ def create():
         STATE["last_error"] = None
 
     threading.Thread(
-        target=_do_create, args=(query, start, end, period), daemon=True,
+        target=_do_create, args=(query, period), daemon=True,
     ).start()
     return jsonify({"started": True})
 
