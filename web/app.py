@@ -16,6 +16,7 @@ Run:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -53,6 +54,8 @@ MAX_CONTENT_LENGTH = 2 * 1024 * 1024 * 1024  # 2 GB per request
 # App state (single-user dev server)
 # ──────────────────────────────────────────────────────────────────────────────
 
+MAX_LOG_LINES = 500
+
 STATE = {
     "uploaded": [],      # filenames present in videos/
     "processing": False, # a processing job is running
@@ -60,8 +63,20 @@ STATE = {
     "creating": False,   # a create job is running
     "compilation": None, # token to bust the browser video cache
     "last_error": None,
+    "log": [],           # recent stdout lines from subprocess + app events
 }
 STATE_LOCK = threading.Lock()
+
+
+def _log(message: str) -> None:
+    """Append a line to the shared log buffer (bounded)."""
+    stamp = datetime.now().strftime("%H:%M:%S")
+    line = f"[{stamp}] {message}"
+    logger.info(message)
+    with STATE_LOCK:
+        STATE["log"].append(line)
+        if len(STATE["log"]) > MAX_LOG_LINES:
+            del STATE["log"][: len(STATE["log"]) - MAX_LOG_LINES]
 
 
 HAS_FFPROBE = shutil.which("ffprobe") is not None
@@ -115,11 +130,26 @@ def _next_index_for_day(date_str: str, ext: str) -> int:
 
 
 def _run(cmd: list[str]) -> None:
-    """Run a subprocess with the repo root as CWD; raise on non-zero exit."""
-    logger.info("$ %s", " ".join(cmd))
-    proc = subprocess.run(cmd, cwd=str(REPO_ROOT))
-    if proc.returncode != 0:
-        raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
+    """Run a subprocess and stream its stdout/stderr into the shared log."""
+    _log("$ " + " ".join(cmd))
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        text=True,
+        env=env,
+    )
+    assert proc.stdout is not None
+    for raw in proc.stdout:
+        line = raw.rstrip()
+        if line:
+            _log(line)
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"Command failed ({rc}): {' '.join(cmd)}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -146,6 +176,12 @@ def status():
             "compilation": STATE["compilation"],
             "last_error": STATE["last_error"],
         })
+
+
+@app.route("/log")
+def log_route():
+    with STATE_LOCK:
+        return jsonify({"lines": list(STATE["log"])})
 
 
 @app.route("/upload", methods=["POST"])
@@ -192,6 +228,7 @@ def upload():
         dest = VIDEOS_DIR / f"{date_str}-{idx}{ext}"
         tmp.rename(dest)
         saved.append(dest.name)
+        _log(f"Uploaded {orig} -> {dest.name}")
 
     # Any new upload invalidates a prior processed state.
     with STATE_LOCK:
@@ -222,6 +259,7 @@ def clear():
 
 def _do_process() -> None:
     try:
+        _log("=== Processing started ===")
         # 1) split into 5-second clips
         _run([
             sys.executable, "generate_clip.py",
@@ -241,11 +279,13 @@ def _do_process() -> None:
         if not DESCRIPTIONS_JSON.exists():
             raise RuntimeError(f"descriptions.json not found at {DESCRIPTIONS_JSON}")
 
+        _log("=== Processing complete ===")
         with STATE_LOCK:
             STATE["processed"] = True
             STATE["last_error"] = None
     except Exception as exc:
         logger.exception("Processing failed")
+        _log(f"ERROR: {exc}")
         with STATE_LOCK:
             STATE["processed"] = False
             STATE["last_error"] = str(exc)
@@ -271,6 +311,7 @@ def process():
 
 def _do_create(query: str) -> None:
     try:
+        _log(f'=== Creating compilation for query: "{query}" ===')
         if COMPILATION_MP4.exists():
             COMPILATION_MP4.unlink()
         _run([
@@ -282,11 +323,13 @@ def _do_create(query: str) -> None:
         ])
         if not COMPILATION_MP4.exists():
             raise RuntimeError("find_clip.py produced no compilation.mp4")
+        _log("=== Compilation ready ===")
         with STATE_LOCK:
             STATE["compilation"] = uuid.uuid4().hex
             STATE["last_error"] = None
     except Exception as exc:
         logger.exception("Create failed")
+        _log(f"ERROR: {exc}")
         with STATE_LOCK:
             STATE["compilation"] = None
             STATE["last_error"] = str(exc)

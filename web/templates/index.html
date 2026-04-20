@@ -46,6 +46,13 @@
     .error { color: #c0392b; }
     ul.files { margin: 0.5rem 0 0.75rem; padding-left: 1.2rem; }
     video { width: 100%; margin-top: 1rem; background: black; border-radius: 6px; }
+    progress { width: 100%; height: 1rem; }
+    pre.log {
+      background: #0b0b0b; color: #d6d6d6; padding: 0.75rem;
+      border-radius: 6px; max-height: 18rem; overflow: auto;
+      font-size: 0.8rem; line-height: 1.35;
+      white-space: pre-wrap; word-break: break-all;
+    }
     .spinner {
       display: inline-block; width: 1em; height: 1em;
       border: 2px solid currentColor; border-right-color: transparent;
@@ -77,8 +84,14 @@
       <button id="clearBtn" class="secondary">Clear workspace</button>
     </div>
     <div class="status" id="pickStatus"></div>
+    <progress id="uploadProgress" value="0" max="100" style="display:none;"></progress>
     <div class="status" id="uploadStatus"></div>
     <ul class="files" id="fileList"></ul>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <pre class="log" id="log">(no activity yet)</pre>
   </section>
 
   <section>
@@ -112,7 +125,9 @@
   const uploadBtn    = $("uploadBtn");
   const clearBtn     = $("clearBtn");
   const uploadStatus = $("uploadStatus");
+  const uploadProgress = $("uploadProgress");
   const fileList     = $("fileList");
+  const logPane      = $("log");
 
   const VIDEO_RE = /\.(mp4|mov)$/i;
   let selectedFiles = [];  // filtered File objects, dedup by name
@@ -268,14 +283,49 @@
     } catch (e) { /* ignore transient */ }
   }
 
+  async function refreshLog() {
+    try {
+      const r = await fetch("/log");
+      const data = await r.json();
+      const lines = data.lines || [];
+      const wasAtBottom =
+        logPane.scrollTop + logPane.clientHeight >= logPane.scrollHeight - 4;
+      logPane.textContent = lines.length ? lines.join("\n") : "(no activity yet)";
+      if (wasAtBottom) logPane.scrollTop = logPane.scrollHeight;
+    } catch (e) { /* ignore transient */ }
+  }
+
   function pollWhileBusy() {
     if (polling) return;
     polling = setInterval(async () => {
-      await refresh();
+      await Promise.all([refresh(), refreshLog()]);
       if (!state.processing && !state.creating) {
         clearInterval(polling); polling = null;
       }
-    }, 1500);
+    }, 1000);
+  }
+
+  function uploadOne(file) {
+    return new Promise((resolve, reject) => {
+      const fd = new FormData();
+      fd.append("videos", file, file.name);
+      fd.append("mtimes", String(file.lastModified || ""));
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/upload");
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          uploadProgress.value = (e.loaded / e.total) * 100;
+        }
+      };
+      xhr.onload = () => {
+        let data = {};
+        try { data = JSON.parse(xhr.responseText); } catch {}
+        if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+        else reject(new Error(data.error || `HTTP ${xhr.status}`));
+      };
+      xhr.onerror = () => reject(new Error("Network error"));
+      xhr.send(fd);
+    });
   }
 
   uploadBtn.addEventListener("click", async () => {
@@ -285,31 +335,31 @@
     }
     // Sort so the server's same-day increment reflects recording order.
     selectedFiles.sort((a, b) => (a.lastModified || 0) - (b.lastModified || 0));
-    const fd = new FormData();
-    for (const f of selectedFiles) {
-      fd.append("videos", f, f.name);
-      fd.append("mtimes", String(f.lastModified || ""));
-    }
     uploadBtn.disabled = true;
     setError(uploadStatus, "");
-    uploadStatus.textContent = `Uploading ${selectedFiles.length} file(s)...`;
+    uploadProgress.style.display = "";
+    const total = selectedFiles.length;
+    const savedAll = [];
     try {
-      const r = await fetch("/upload", { method: "POST", body: fd });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error || "Upload failed.");
-      let msg = `Uploaded ${data.saved.length} file(s).`;
-      if (data.rejected && data.rejected.length) {
-        msg += ` Rejected: ${data.rejected.join(", ")}.`;
+      for (let i = 0; i < total; i++) {
+        const f = selectedFiles[i];
+        uploadStatus.textContent = `Uploading ${i + 1}/${total}: ${f.name}`;
+        uploadProgress.value = 0;
+        const data = await uploadOne(f);
+        const renamed = (data.saved && data.saved[0]) || f.name;
+        savedAll.push(renamed);
+        await refreshLog();
       }
-      uploadStatus.textContent = msg;
+      uploadStatus.textContent = `Uploaded ${savedAll.length}/${total} file(s).`;
       selectedFiles = [];
       filesInput.value = "";
       folderInput.value = "";
       pickStatus.textContent = "";
       await refresh();
     } catch (e) {
-      setError(uploadStatus, e.message);
+      setError(uploadStatus, "Upload error: " + e.message);
     } finally {
+      uploadProgress.style.display = "none";
       uploadBtn.disabled = selectedFiles.length === 0;
     }
   });
@@ -359,6 +409,7 @@
 
   queryInput.addEventListener("input", render);
   refresh();
+  refreshLog();
 })();
 </script>
 </body>
