@@ -283,8 +283,13 @@
       setError(uploadStatus, "Pick at least one video file.");
       return;
     }
+    // Sort so the server's same-day increment reflects recording order.
+    selectedFiles.sort((a, b) => (a.lastModified || 0) - (b.lastModified || 0));
     const fd = new FormData();
-    for (const f of selectedFiles) fd.append("videos", f, f.name);
+    for (const f of selectedFiles) {
+      fd.append("videos", f, f.name);
+      fd.append("mtimes", String(f.lastModified || ""));
+    }
     uploadBtn.disabled = true;
     setError(uploadStatus, "");
     uploadStatus.textContent = `Uploading ${selectedFiles.length} file(s)...`;

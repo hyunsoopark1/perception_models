@@ -16,12 +16,15 @@ Run:
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from flask import (
     Flask,
@@ -61,6 +64,9 @@ STATE = {
 STATE_LOCK = threading.Lock()
 
 
+HAS_FFPROBE = shutil.which("ffprobe") is not None
+
+
 def _list_uploaded() -> list[str]:
     if not VIDEOS_DIR.exists():
         return []
@@ -68,6 +74,44 @@ def _list_uploaded() -> list[str]:
         p.name for p in VIDEOS_DIR.iterdir()
         if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS
     )
+
+
+def _probe_creation_time(path: Path) -> Optional[datetime]:
+    """Read the MOV/MP4 container creation_time tag via ffprobe."""
+    if not HAS_FFPROBE:
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format_tags=creation_time",
+                "-of", "default=nw=1:nk=1",
+                str(path),
+            ],
+            text=True, timeout=20,
+        ).strip()
+    except Exception:
+        return None
+    if not out:
+        return None
+    try:
+        return datetime.fromisoformat(out.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _next_index_for_day(date_str: str, ext: str) -> int:
+    """Return the next available 1-based index for `<date_str>-<n><ext>`."""
+    pattern = re.compile(rf"^{re.escape(date_str)}-(\d+)$", re.I)
+    used = 0
+    if VIDEOS_DIR.exists():
+        for p in VIDEOS_DIR.iterdir():
+            if p.suffix.lower() != ext:
+                continue
+            m = pattern.match(p.stem)
+            if m:
+                used = max(used, int(m.group(1)))
+    return used + 1
 
 
 def _run(cmd: list[str]) -> None:
@@ -110,20 +154,44 @@ def upload():
     if not files:
         return jsonify({"error": "No files received."}), 400
 
+    # Client sends one mtime (ms since epoch) per file, same order.
+    mtimes = request.form.getlist("mtimes")
+
     VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    # Pre-sort by client mtime so same-day indices are chronological.
+    order = sorted(
+        range(len(files)),
+        key=lambda i: int(mtimes[i]) if i < len(mtimes) and mtimes[i].isdigit() else 0,
+    )
+
     saved = []
     rejected = []
-    for f in files:
-        name = secure_filename(f.filename or "")
-        if not name:
+    for i in order:
+        f = files[i]
+        orig = secure_filename(f.filename or "")
+        if not orig:
             continue
-        ext = Path(name).suffix.lower()
+        ext = Path(orig).suffix.lower()
         if ext not in ALLOWED_EXTENSIONS:
-            rejected.append(name)
+            rejected.append(orig)
             continue
-        dest = VIDEOS_DIR / name
-        f.save(str(dest))
-        saved.append(name)
+
+        # Save to a temp name first so ffprobe can read the container.
+        tmp = VIDEOS_DIR / f".upload-{uuid.uuid4().hex}{ext}"
+        f.save(str(tmp))
+
+        # 1) container creation_time  2) browser lastModified  3) now
+        dt = _probe_creation_time(tmp)
+        if dt is None and i < len(mtimes) and mtimes[i].isdigit():
+            dt = datetime.fromtimestamp(int(mtimes[i]) / 1000.0, tz=timezone.utc)
+        if dt is None:
+            dt = datetime.now(tz=timezone.utc)
+
+        date_str = dt.astimezone().strftime("%Y-%m-%d")
+        idx = _next_index_for_day(date_str, ext)
+        dest = VIDEOS_DIR / f"{date_str}-{idx}{ext}"
+        tmp.rename(dest)
+        saved.append(dest.name)
 
     # Any new upload invalidates a prior processed state.
     with STATE_LOCK:
