@@ -80,6 +80,7 @@ def _log(message: str) -> None:
 
 
 HAS_FFPROBE = shutil.which("ffprobe") is not None
+HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 
 def _list_uploaded() -> list[str]:
@@ -113,6 +114,28 @@ def _probe_creation_time(path: Path) -> Optional[datetime]:
         return datetime.fromisoformat(out.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _transcode_for_browser(path: Path) -> None:
+    """Re-encode `path` in place to H.264 so <video> tags can play it.
+
+    find_clip.py writes compilation.mp4 with the OpenCV `mp4v` fourcc
+    (MPEG-4 Part 2), which Chrome/Safari/Firefox don't support. We
+    convert it to H.264 + yuv420p + faststart using ffmpeg.
+    """
+    if not HAS_FFMPEG:
+        _log("ffmpeg not found; browser may be unable to play compilation.mp4")
+        return
+    tmp = path.with_suffix(".browser.mp4")
+    _log("Re-encoding compilation to H.264 for browser playback...")
+    _run([
+        "ffmpeg", "-y", "-i", str(path),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-an",
+        str(tmp),
+    ])
+    tmp.replace(path)
 
 
 def _next_index_for_day(date_str: str, ext: str) -> int:
@@ -323,6 +346,7 @@ def _do_create(query: str) -> None:
         ])
         if not COMPILATION_MP4.exists():
             raise RuntimeError("find_clip.py produced no compilation.mp4")
+        _transcode_for_browser(COMPILATION_MP4)
         _log("=== Compilation ready ===")
         with STATE_LOCK:
             STATE["compilation"] = uuid.uuid4().hex
