@@ -430,6 +430,22 @@ def compilation():
     )
 
 
-if __name__ == "__main__":
+def _recover_state_from_disk() -> None:
+    """After a server restart, re-flag existing artifacts so the UI lets
+    the user jump straight to Creating without re-running Processing."""
     WORKSPACE.mkdir(parents=True, exist_ok=True)
+    if DESCRIPTIONS_JSON.exists():
+        with STATE_LOCK:
+            STATE["processed"] = True
+        _log(f"Recovered processed state from {DESCRIPTIONS_JSON}")
+    if COMPILATION_MP4.exists():
+        with STATE_LOCK:
+            STATE["compilation"] = uuid.uuid4().hex
+        _log(f"Found existing compilation at {COMPILATION_MP4}")
+
+
+_recover_state_from_disk()
+
+
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
