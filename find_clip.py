@@ -144,6 +144,8 @@ def find_best_clips(
     query: str,
     match_fields: list = None,
     month_filter: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     encoder_model: str = "all-mpnet-base-v2",
     top_k: int = 1,
     threshold: float = 0.0,
@@ -169,6 +171,7 @@ def find_best_clips(
 
     # Group entries by period
     skipped_no_child = 0
+    skipped_out_of_range = 0
     by_period: dict = {}
     for clip_path, entry in descriptions.items():
         if entry.get("child_present") is False:
@@ -181,8 +184,23 @@ def find_best_clips(
             entry["year_month"] = ym
         if month_filter and ym != month_filter:
             continue
+        if start_date or end_date:
+            d = re.search(r"(\d{4}-\d{2}-\d{2})", clip_path)
+            day = d.group(1) if d else (ym + "-01" if re.fullmatch(r"\d{4}-\d{2}", ym) else None)
+            if day is None:
+                skipped_out_of_range += 1
+                continue
+            if start_date and day < start_date:
+                skipped_out_of_range += 1
+                continue
+            if end_date and day > end_date:
+                skipped_out_of_range += 1
+                continue
         pk = _period_label(ym, period)
         by_period.setdefault(pk, []).append((clip_path, entry))
+
+    if skipped_out_of_range:
+        logger.info(f"Skipped {skipped_out_of_range} clip(s) outside {start_date or '-inf'}..{end_date or '+inf'}.")
 
     if skipped_no_child:
         logger.info(f"Skipped {skipped_no_child} clip(s) with no child detected.")
@@ -480,6 +498,10 @@ Examples:
                         help="Query text to match against.")
     parser.add_argument("--month",         type=str, default=None,
                         help="Restrict search to one month, e.g. 2025-06.")
+    parser.add_argument("--start",         type=str, default=None,
+                        help="Include only clips recorded on/after YYYY-MM-DD.")
+    parser.add_argument("--end",           type=str, default=None,
+                        help="Include only clips recorded on/before YYYY-MM-DD.")
     parser.add_argument("--match_fields",  type=str, nargs="+",
                         default=["description"],
                         choices=["description", "stage", "evidence"],
@@ -525,6 +547,8 @@ Examples:
         query=args.query,
         match_fields=args.match_fields,
         month_filter=args.month,
+        start_date=args.start,
+        end_date=args.end,
         encoder_model=args.encoder,
         top_k=initial_top_k,
         threshold=args.threshold,

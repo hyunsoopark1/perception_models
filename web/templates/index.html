@@ -108,6 +108,20 @@
       <input type="text" id="query" placeholder="e.g. child taking first steps" />
     </div>
     <div class="row" style="margin-top: 0.5rem;">
+      <label>Start
+        <input type="date" id="start" />
+      </label>
+      <label>End
+        <input type="date" id="end" />
+      </label>
+      <label>Period
+        <select id="period">
+          <option value="month">month</option>
+          <option value="quarter" selected>quarter</option>
+        </select>
+      </label>
+    </div>
+    <div class="row" style="margin-top: 0.5rem;">
       <button id="createBtn" disabled>Creating</button>
     </div>
     <div class="status" id="createStatus"></div>
@@ -389,14 +403,25 @@
     }
   });
 
+  const startInput  = $("start");
+  const endInput    = $("end");
+  const periodInput = $("period");
+
   createBtn.addEventListener("click", async () => {
-    const query = queryInput.value.trim();
+    const query  = queryInput.value.trim();
+    const start  = startInput.value;   // "" or YYYY-MM-DD
+    const end    = endInput.value;
+    const period = periodInput.value;
     if (!query) return;
+    if (start && end && start > end) {
+      setError(createStatus, "Start date is after end date.");
+      return;
+    }
     try {
       const r = await fetch("/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, start, end, period }),
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || "Create failed to start.");
