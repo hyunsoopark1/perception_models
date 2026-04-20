@@ -499,9 +499,10 @@ Examples:
                         help="Match query words exactly (whole-word, case-insensitive) instead "
                              "of semantic similarity. Score = fraction of query words found in text.")
     parser.add_argument("--compile",        type=str, default=None,
-                        metavar="OUTPUT_VIDEO",
-                        help="Create a compilation video from the selected clips "
-                             "(e.g. --compile compilation.mp4).")
+                        nargs="?", const="", metavar="OUTPUT_VIDEO",
+                        help="Create a compilation video. Optionally specify filename "
+                             "(e.g. --compile out.mp4). If no name given, auto-generates "
+                             "from the query (e.g. compilation_child_dancing.mp4).")
     parser.add_argument("--plm_verify",     action="store_true",
                         help="Use PLM 8B to verify each candidate clip with a yes/no question. "
                              "More accurate than embedding similarity. Requires --ckpt.")
@@ -566,8 +567,14 @@ Examples:
         print()
 
     # Create compilation video
-    if args.compile:
-        create_compilation(results, args.compile)
+    if args.compile is not None:
+        # Auto-generate filename from query if --compile given without a path
+        compile_path = args.compile
+        if not compile_path:
+            slug = re.sub(r"[^\w]+", "_", args.query.strip().lower()).strip("_")[:40]
+            compile_path = f"compilation_{slug}.mp4"
+            logger.info(f"Output video: {compile_path}")
+        create_compilation(results, compile_path)
 
 
 if __name__ == "__main__":
