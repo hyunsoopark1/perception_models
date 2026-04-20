@@ -83,6 +83,22 @@ HAS_FFPROBE = shutil.which("ffprobe") is not None
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 
+def _h264_encoder() -> Optional[str]:
+    """Return the first available H.264 encoder in the current ffmpeg."""
+    if not HAS_FFMPEG:
+        return None
+    try:
+        out = subprocess.check_output(
+            ["ffmpeg", "-hide_banner", "-encoders"], text=True, timeout=10,
+        )
+    except Exception:
+        return None
+    for name in ("libx264", "h264_nvenc", "h264_vaapi", "h264_omx", "libopenh264", "h264"):
+        if re.search(rf"^\s*V\S*\s+{re.escape(name)}\b", out, re.MULTILINE):
+            return name
+    return None
+
+
 def _list_uploaded() -> list[str]:
     if not VIDEOS_DIR.exists():
         return []
@@ -121,20 +137,36 @@ def _transcode_for_browser(path: Path) -> None:
 
     find_clip.py writes compilation.mp4 with the OpenCV `mp4v` fourcc
     (MPEG-4 Part 2), which Chrome/Safari/Firefox don't support. We
-    convert it to H.264 + yuv420p + faststart using ffmpeg.
+    convert it to H.264 + yuv420p + faststart using whatever H.264
+    encoder this ffmpeg build has available.
     """
     if not HAS_FFMPEG:
         _log("ffmpeg not found; browser may be unable to play compilation.mp4")
         return
+    encoder = _h264_encoder()
+    if encoder is None:
+        _log("ffmpeg has no H.264 encoder (install ffmpeg with libx264); "
+             "browser may be unable to play compilation.mp4")
+        return
     tmp = path.with_suffix(".browser.mp4")
-    _log("Re-encoding compilation to H.264 for browser playback...")
-    _run([
-        "ffmpeg", "-y", "-i", str(path),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        "-an",
-        str(tmp),
-    ])
+    _log(f"Re-encoding compilation to H.264 ({encoder}) for browser playback...")
+    try:
+        _run([
+            "ffmpeg", "-y", "-i", str(path),
+            "-c:v", encoder,
+            "-pix_fmt", "yuv420p",
+            # libx264 (and most H.264 encoders) require even dimensions.
+            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-movflags", "+faststart",
+            "-an",
+            str(tmp),
+        ])
+    except RuntimeError as exc:
+        _log(f"Transcode failed: {exc}")
+        _log("Serving raw compilation.mp4; it may not play inline in the browser.")
+        if tmp.exists():
+            tmp.unlink()
+        return
     tmp.replace(path)
 
 
