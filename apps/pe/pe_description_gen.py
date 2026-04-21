@@ -313,42 +313,45 @@ def _parse_plm_response(text: str) -> Tuple[str, str, str]:
 # Per-frame bbox annotation
 # ---------------------------------------------------------------------------
 
-def _annotate_frame(
+def _annotate_frame_base(
     pil_frame: PILImage.Image,
-    target_cx: float, target_cy: float, target_w: float, target_h: float,
-    target_color: Tuple[int, int, int],
-    other_bboxes: Dict[str, Tuple[float, float, float, float]],
-    thickness: int = 4,
-) -> PILImage.Image:
+    all_bboxes: Dict[str, Tuple[float, float, float, float]],
+) -> np.ndarray:
     """
-    Draw bounding boxes onto a copy of the frame (RGB):
-      - All other tracked people: grey rectangle + ID label so PLM can
-        read who is who and reference them in the Social field.
-      - Target person: colored rectangle (thicker) drawn on top.
-
-    This lets PLM answer 'which ID is this person physically touching?'
-    by reading the labels directly from the image.
+    Draw every tracked person's bbox in grey with their ID label.
+    Returns a numpy array (not PIL) so _annotate_frame_target can cheaply
+    copy it and add one colored box without re-drawing all grey boxes.
+    Called once per unique frame per window, shared across all identities.
     """
     import cv2
-    frame = np.array(pil_frame)   # H×W×3 uint8, RGB
+    frame = np.array(pil_frame)
     H, W  = frame.shape[:2]
-
-    def _corners(cx, cy, w, h):
-        return (max(0, int(cx - w / 2)), max(0, int(cy - h / 2)),
-                min(W, int(cx + w / 2)), min(H, int(cy + h / 2)))
-
-    # Draw other people first (grey) with ID label
-    for oid, (cx, cy, w, h) in other_bboxes.items():
-        x1, y1, x2, y2 = _corners(cx, cy, w, h)
+    for oid, (cx, cy, w, h) in all_bboxes.items():
+        x1 = max(0, int(cx - w / 2));  y1 = max(0, int(cy - h / 2))
+        x2 = min(W, int(cx + w / 2));  y2 = min(H, int(cy + h / 2))
         cv2.rectangle(frame, (x1, y1), (x2, y2), (180, 180, 180), 2)
         cv2.putText(frame, oid, (x1 + 3, y1 + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+    return frame
 
-    # Draw target on top (identity color, thicker)
-    x1, y1, x2, y2 = _corners(target_cx, target_cy, target_w, target_h)
-    bgr = (target_color[2], target_color[1], target_color[0])
+
+def _annotate_frame_target(
+    base_frame: np.ndarray,
+    cx: float, cy: float, w: float, h: float,
+    color: Tuple[int, int, int],
+    thickness: int = 4,
+) -> PILImage.Image:
+    """
+    Copy the pre-annotated base frame and add the target's colored box.
+    Only this function is called per-identity; the grey base is shared.
+    """
+    import cv2
+    frame = base_frame.copy()
+    H, W  = frame.shape[:2]
+    x1 = max(0, int(cx - w / 2));  y1 = max(0, int(cy - h / 2))
+    x2 = min(W, int(cx + w / 2));  y2 = min(H, int(cy + h / 2))
+    bgr = (color[2], color[1], color[0])
     cv2.rectangle(frame, (x1, y1), (x2, y2), bgr, thickness)
-
     return PILImage.fromarray(frame)
 
 
@@ -600,14 +603,13 @@ if __name__ == "__main__":
 
             prompt = _make_prompt(ident)
 
-            # Annotate: target in color + all others in grey with ID labels
+            # Annotate: all others in grey with IDs, then target in color on top
             ann_color = _identity_color(ident)
             annotated = [
-                _annotate_frame(
-                    frame_cache[fidx],
-                    cx, cy, w, h,
-                    ann_color,
-                    other_frame_bboxes.get(fidx, {}),
+                _annotate_frame_target(
+                    _annotate_frame_base(frame_cache[fidx],
+                                         other_frame_bboxes.get(fidx, {})),
+                    cx, cy, w, h, ann_color,
                 )
                 for fidx, (cx, cy, w, h) in zip(frame_indices, bbox_coords)
             ]
