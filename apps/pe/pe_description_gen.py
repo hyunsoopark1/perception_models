@@ -645,8 +645,7 @@ if __name__ == "__main__":
             identity_windows[ident][wid] = win
 
             print(f"    [{ident}]  M:{motion!r}  S:{social_with_ids!r}  A:{activity!r}")
-            if not all([motion, social, activity]):
-                print(f"      raw → {raw!r}")
+            print(f"      raw → {raw!r}")
 
     print(f"\nReading {args.video} and running PLM on 2-sec full-frame clips …")
     cap = cv2.VideoCapture(args.video)
