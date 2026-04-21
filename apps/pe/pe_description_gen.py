@@ -96,27 +96,25 @@ from PIL import Image as PILImage
 # Prompt builder — per identity, per window
 # ---------------------------------------------------------------------------
 
-def _make_prompt(ident: str, nearby_ids: List[str]) -> str:
+def _make_prompt(ident: str) -> str:
     """
     Build the PLM prompt for one identity + window.
 
-    Each frame has a green rectangle drawn on the pixels marking the tracked
-    person.  nearby_ids are provided so PLM can reference specific people by
-    ID when reporting physical contact in the Social field.
+    Each frame has:
+      - A colored rectangle following the target person (ID '{ident}').
+      - Grey rectangles with ID labels on all other tracked people.
+    PLM reads the IDs visually from the image to answer the Social field.
     """
-    nearby_part = (
-        f"The following people are visible nearby: {', '.join(nearby_ids)}. "
-        if nearby_ids else ""
-    )
     return (
-        f"Watch this video clip carefully. One person is highlighted with a "
-        f"green rectangle that follows them across all frames (ID '{ident}'). "
-        f"Describe only that person. {nearby_part}"
-        f"Reply in plain English words only — do not output any coordinates or numbers. "
+        f"Watch this video clip carefully. "
+        f"One person is highlighted with a colored rectangle across all frames. "
+        f"All other tracked people are shown with grey rectangles and their ID labels. "
+        f"Describe only the person inside the colored rectangle. "
+        f"Reply in plain English only — do not output coordinates or numbers. "
         f"Use this exact format:\n"
         f"Motion: <how this person is moving, in 2-5 words>\n"
-        f"Social: <IDs of the nearby people this person is physically touching "
-        f"(e.g. hugging, holding hands, lifting), or 'none'>\n"
+        f"Social: <IDs of people shown in grey that this person is physically "
+        f"touching (e.g. hugging, holding hands, lifting), or 'none'>\n"
         f"Activity: <what this person is doing, in 2-5 words>\n"
         f"If a field is not clearly visible write 'unclear'."
     )
@@ -317,26 +315,40 @@ def _parse_plm_response(text: str) -> Tuple[str, str, str]:
 
 def _annotate_frame(
     pil_frame: PILImage.Image,
-    cx: float, cy: float, w: float, h: float,
-    color: Tuple[int, int, int] = (0, 255, 0),
+    target_cx: float, target_cy: float, target_w: float, target_h: float,
+    target_color: Tuple[int, int, int],
+    other_bboxes: Dict[str, Tuple[float, float, float, float]],
     thickness: int = 4,
 ) -> PILImage.Image:
     """
-    Draw the tracked person's bbox onto a copy of the frame (RGB).
+    Draw bounding boxes onto a copy of the frame (RGB):
+      - All other tracked people: grey rectangle + ID label so PLM can
+        read who is who and reference them in the Social field.
+      - Target person: colored rectangle (thicker) drawn on top.
 
-    This embeds the spatial location directly into the pixels so PLM's
-    visual attention can follow the moving box across frames, rather than
-    relying on a single static bbox coordinate in the text prompt.
+    This lets PLM answer 'which ID is this person physically touching?'
+    by reading the labels directly from the image.
     """
     import cv2
-    frame = np.array(pil_frame)          # H×W×3 uint8, RGB
-    x1 = max(0, int(cx - w / 2))
-    y1 = max(0, int(cy - h / 2))
-    x2 = min(frame.shape[1], int(cx + w / 2))
-    y2 = min(frame.shape[0], int(cy + h / 2))
-    # cv2 expects BGR but we keep the array as RGB — swap color channels
-    bgr_color = (color[2], color[1], color[0])
-    cv2.rectangle(frame, (x1, y1), (x2, y2), bgr_color, thickness)
+    frame = np.array(pil_frame)   # H×W×3 uint8, RGB
+    H, W  = frame.shape[:2]
+
+    def _corners(cx, cy, w, h):
+        return (max(0, int(cx - w / 2)), max(0, int(cy - h / 2)),
+                min(W, int(cx + w / 2)), min(H, int(cy + h / 2)))
+
+    # Draw other people first (grey) with ID label
+    for oid, (cx, cy, w, h) in other_bboxes.items():
+        x1, y1, x2, y2 = _corners(cx, cy, w, h)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (180, 180, 180), 2)
+        cv2.putText(frame, oid, (x1 + 3, y1 + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+
+    # Draw target on top (identity color, thicker)
+    x1, y1, x2, y2 = _corners(target_cx, target_cy, target_w, target_h)
+    bgr = (target_color[2], target_color[1], target_color[0])
+    cv2.rectangle(frame, (x1, y1), (x2, y2), bgr, thickness)
+
     return PILImage.fromarray(frame)
 
 
@@ -559,32 +571,45 @@ if __name__ == "__main__":
             pil_frames    = [frame_cache[fidx] for fidx in frame_indices]
             bbox_coords   = [(e[1], e[2], e[3], e[4]) for e in bbox_entries]
 
-            # Uniform subsample to num_plm_frames (keep bbox_coords in sync)
+            # Uniform subsample — keep frame_indices and bbox_coords in sync
             n = len(pil_frames)
             if n > args.num_plm_frames:
                 idxs = [int(round(i * (n - 1) / (args.num_plm_frames - 1)))
                         for i in range(args.num_plm_frames)]
-                pil_frames  = [pil_frames[i]  for i in idxs]
-                bbox_coords = [bbox_coords[i] for i in idxs]
+                frame_indices = [frame_indices[i] for i in idxs]
+                pil_frames    = [pil_frames[i]    for i in idxs]
+                bbox_coords   = [bbox_coords[i]   for i in idxs]
             elif n == 1:
-                pil_frames  = pil_frames  * 2   # PLM needs ≥ 2 frames
-                bbox_coords = bbox_coords * 2
+                frame_indices = frame_indices * 2
+                pil_frames    = pil_frames    * 2
+                bbox_coords   = bbox_coords   * 2
 
-            # Nearby IDs computed first — passed into the prompt so PLM can
-            # reference specific people when reporting physical contact.
+            # Build per-frame bbox lookup for all other identities in this window
+            # so their boxes + IDs can be drawn onto each frame for PLM to read.
+            other_frame_bboxes: Dict[int, Dict[str, Tuple]] = defaultdict(dict)
+            for other_id, other_entries in bbox_map_w.items():
+                if other_id == ident:
+                    continue
+                for (fidx, cx, cy, w, h) in other_entries:
+                    other_frame_bboxes[fidx][other_id] = (cx, cy, w, h)
+
             nearby_ids = _find_nearby_ids(
                 ident, wid, window_frames, tracks,
                 args.proximity_scale, max_frames,
             )
 
-            prompt = _make_prompt(ident, nearby_ids)
+            prompt = _make_prompt(ident)
 
-            # Annotate each frame with its own per-frame bbox so PLM's visual
-            # attention can follow the moving person across the clip.
+            # Annotate: target in color + all others in grey with ID labels
             ann_color = _identity_color(ident)
             annotated = [
-                _annotate_frame(f, cx, cy, w, h, color=ann_color)
-                for f, (cx, cy, w, h) in zip(pil_frames, bbox_coords)
+                _annotate_frame(
+                    frame_cache[fidx],
+                    cx, cy, w, h,
+                    ann_color,
+                    other_frame_bboxes.get(fidx, {}),
+                )
+                for fidx, (cx, cy, w, h) in zip(frame_indices, bbox_coords)
             ]
 
             # Annotated frames → (N, 3, H, W) tensor
@@ -604,7 +629,7 @@ if __name__ == "__main__":
                 "end_frame":          end_fr,
                 "start_sec":          start_sec,
                 "end_sec":            end_sec,
-                "n_frames":           len(pil_frames),
+                "n_frames":           len(frame_indices),
                 "motion":             motion,
                 "social_interaction": {
                     "label":      social_with_ids,
