@@ -106,15 +106,16 @@ def _make_prompt(ident: str) -> str:
     numeric coordinates.
     """
     return (
-        f"This is a video clip. In each frame a colored bounding box marks "
-        f"a specific tracked person (ID '{ident}'). "
-        f"Focus exclusively on the person inside the colored bounding box — "
-        f"the box moves with the person across frames. "
-        f"Answer the following questions about that person concisely. "
-        f"If something is not clearly visible, respond with 'unclear' — do not guess.\n"
-        "Motion: <this person's body movement in 2-5 words, or 'unclear'>\n"
-        "Social: <who this person is near or interacting with in 2-5 words, or 'unclear'>\n"
-        "Activity: <what this person is doing in 2-5 words, or 'unclear'>"
+        f"Watch this video clip carefully. One person is highlighted with a "
+        f"green rectangle that follows them across all frames (ID '{ident}'). "
+        f"Describe only that person. "
+        f"Reply in plain English words only — do not output any coordinates, "
+        f"numbers, or bounding boxes. "
+        f"Use the exact format below, filling each line with 2-5 words:\n"
+        f"Motion: <how this person is moving>\n"
+        f"Social: <who they are near or interacting with>\n"
+        f"Activity: <what they are doing>\n"
+        f"If a field is not clearly visible write 'unclear'."
     )
 
 
@@ -593,9 +594,8 @@ if __name__ == "__main__":
 
             # Embed nearby IDs directly into the social label so the
             # association is explicit everywhere (JSON, overlay, description).
-            social_with_ids = social
-            if nearby_ids:
-                social_with_ids += f" ({', '.join(nearby_ids)})"
+            ids_str = f"({', '.join(nearby_ids)})" if nearby_ids else ""
+            social_with_ids = f"{social} {ids_str}".strip() if (social or ids_str) else ""
 
             win = {
                 "start_frame":        start_fr,
