@@ -1,195 +1,166 @@
 """
-Interactive query interface over pe_description_gen.py output JSON.
+Interactive QA over pe_description_gen.py output JSON using PLM's LLM.
 
-Parses natural-language questions, extracts referenced identity IDs, and
-returns answers with specific timestamps.
+The full descriptions JSON is formatted as text context and fed to the
+PLM language model (text-only, no images).  The LLM answers natural-language
+questions about any tracked identity, always citing specific timestamps.
 
 Usage
 -----
-    python apps/pe/pe_query.py --desc descriptions.json
+    python apps/pe/pe_query.py \\
+        --desc  descriptions.json \\
+        --plm-ckpt facebook/Perception-LM-8B
+
+    # Limit context to specific identities:
+    python apps/pe/pe_query.py \\
+        --desc descriptions.json \\
+        --plm-ckpt facebook/Perception-LM-8B \\
+        --ids d14717 d14709
 
 Example queries
 ---------------
     > What is d14717 doing?
     > When does d14709 interact with someone?
     > What is d14717 doing at 36 seconds?
-    > Who is near d14709?
-    > Show all windows for d14715
-    > When does d14718 pick something up?
+    > Which two people are closest together?
+    > Is anyone picking something up?
 """
 
 import argparse
 import json
 import re
 import sys
-from typing import Dict, List, Optional, Tuple
+from copy import deepcopy
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import torch
 
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Data helpers
 # ---------------------------------------------------------------------------
 
-def _load(path: str) -> Dict:
+def _load_desc(path: str) -> Dict:
     with open(path) as f:
         return json.load(f)
 
 
-# ---------------------------------------------------------------------------
-# Query parsing helpers
-# ---------------------------------------------------------------------------
-
-def _find_ids(text: str, known_ids: set) -> List[str]:
-    """Return all known identity IDs mentioned in *text*."""
+def _find_mentioned_ids(text: str, known_ids) -> List[str]:
     candidates = re.findall(r'\b[a-zA-Z]\d{4,}\b', text)
     return [c for c in candidates if c in known_ids]
 
 
-def _find_time_ref(text: str) -> Optional[float]:
-    """
-    Extract a time reference in seconds from text, e.g.:
-      'at 36 seconds', 'at 36s', 'at t=36', 'around 1:30'
-    """
-    m = re.search(r'\bat\s+(?:t\s*=\s*)?(\d+(?:\.\d+)?)\s*s(?:ec(?:onds?)?)?\b', text, re.I)
-    if m:
-        return float(m.group(1))
-    # mm:ss format
-    m = re.search(r'\b(\d+):(\d{2})\b', text)
-    if m:
-        return int(m.group(1)) * 60 + int(m.group(2))
-    return None
-
-
-def _question_type(text: str) -> str:
-    """
-    Classify the question intent:
-      'social'   — asking about interactions / nearby people
-      'motion'   — asking about movement
-      'activity' — asking about what they're doing
-      'when'     — asking for time of a specific event
-      'all'      — general / show everything
-    """
-    low = text.lower()
-    if re.search(r'\binteract|social|touch|near|with whom|who.*near|next to\b', low):
-        return 'social'
-    if re.search(r'\bmov|walk|run|stand|sit|motion\b', low):
-        return 'motion'
-    if re.search(r'\bwhen\b', low):
-        return 'when'
-    if re.search(r'\bdoing|activity|action|what\b', low):
-        return 'activity'
-    return 'all'
+def _format_context(data: Dict, ids: Optional[List[str]] = None) -> str:
+    """Render the JSON as compact structured text for LLM context."""
+    ids = ids or list(data.keys())
+    lines = []
+    for ident in ids:
+        if ident not in data:
+            continue
+        lines.append(f"Person {ident}:")
+        for w in data[ident]:
+            t0, t1 = w.get("start_sec", "?"), w.get("end_sec", "?")
+            motion   = w.get("motion",   "") or "unclear"
+            activity = w.get("activity", "") or "unclear"
+            si       = w.get("social_interaction", {}) or {}
+            social   = (si.get("label", "") if isinstance(si, dict) else str(si)) or "none"
+            nearby   = si.get("nearby_ids", []) if isinstance(si, dict) else []
+            nb_str   = f"  nearby=[{', '.join(nearby)}]" if nearby else ""
+            lines.append(
+                f"  [{t0:.1f}s-{t1:.1f}s] "
+                f"motion={motion!r}  activity={activity!r}  social={social!r}{nb_str}"
+            )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Answer formatters
+# PLM text-only generation
 # ---------------------------------------------------------------------------
 
-def _fmt_time(start: float, end: float) -> str:
-    return f"[{start:.1f}s – {end:.1f}s]"
+SYSTEM = (
+    "You are an assistant analyzing person tracking and behavior data extracted "
+    "from a video. Each person has a list of 6-second windows with fields: "
+    "motion (body movement), activity (what they are doing), social (physical "
+    "contact with others), and nearby (people within close proximity). "
+    "When answering, always include the specific time window (e.g. 36.0s-42.0s). "
+    "Be concise and factual."
+)
 
 
-def _fmt_window(win: Dict, fields: str = 'all') -> str:
-    t = _fmt_time(win['start_sec'], win['end_sec'])
-    lines = [f"  {t}"]
-
-    motion   = win.get('motion', '') or '—'
-    activity = win.get('activity', '') or '—'
-    sdict    = win.get('social_interaction', {}) or {}
-    social   = (sdict.get('label', '') if isinstance(sdict, dict) else str(sdict)) or 'none'
-    nearby   = sdict.get('nearby_ids', []) if isinstance(sdict, dict) else []
-
-    if fields in ('all', 'motion'):
-        lines.append(f"    Motion:   {motion}")
-    if fields in ('all', 'activity'):
-        lines.append(f"    Activity: {activity}")
-    if fields in ('all', 'social'):
-        lines.append(f"    Social:   {social}")
-        if nearby:
-            lines.append(f"    Nearby:   {', '.join(nearby)}")
-
-    return '\n'.join(lines)
+def _build_prompt(conv_template, context: str, question: str) -> str:
+    full_q = f"Tracking data:\n{context}\n\nQuestion: {question}"
+    # Use text-only mode: num_images=0, num_patches=0
+    return conv_template.get_generation_prompt(full_q, num_images=0, num_patches=0)
 
 
-def _answer_identity(ident: str, windows: List[Dict], qtype: str, t_ref: Optional[float]) -> str:
-    if not windows:
-        return f"{ident}: no data."
+@torch.inference_mode()
+def _generate(
+    model,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int = 300,
+) -> str:
+    token_ids = tokenizer.encode(prompt, add_bos=False, add_eos=False)
+    input_ids = torch.tensor([token_ids], dtype=torch.long).cuda()
+    generated: List[int] = []
 
-    # Filter to the window containing t_ref if specified
-    if t_ref is not None:
-        matched = [w for w in windows if w['start_sec'] <= t_ref < w['end_sec']]
-        if not matched:
-            # Snap to closest window
-            matched = [min(windows, key=lambda w: abs(w['start_sec'] - t_ref))]
-            snap_t  = matched[0]['start_sec']
-            header  = f"{ident} (nearest window to t={t_ref:.1f}s, starts at {snap_t:.1f}s):"
-        else:
-            header = f"{ident} at t={t_ref:.1f}s:"
-        windows = matched
+    for _ in range(max_new_tokens):
+        logits = model(input_ids, attn_impl="sdpa")   # (1, seqlen, vocab)
+        next_tok = int(logits[0, -1, :].argmax())
+        if next_tok in (tokenizer.eos_id, tokenizer.eot_id):
+            break
+        generated.append(next_tok)
+        next_tensor = torch.tensor([[next_tok]], dtype=torch.long, device=input_ids.device)
+        input_ids = torch.cat([input_ids, next_tensor], dim=-1)
 
-    # Filter by question type
-    elif qtype == 'social':
-        windows = [
-            w for w in windows
-            if (w.get('social_interaction', {}) or {}).get('label', '').lower() not in ('', 'none')
-        ]
-        if not windows:
-            return f"{ident}: no social interactions detected."
-        header = f"{ident} — social interactions:"
-
-    elif qtype == 'when':
-        # Return all windows with a non-trivial activity field
-        windows = [w for w in windows if w.get('activity', '')]
-        header  = f"{ident} — activity timeline:"
-
-    else:
-        header = f"{ident}:"
-
-    field_map = {'motion': 'motion', 'activity': 'activity', 'social': 'social'}
-    fields = field_map.get(qtype, 'all')
-
-    summaries = '\n'.join(_fmt_window(w, fields) for w in windows)
-    return f"{header}\n{summaries}"
-
-
-# ---------------------------------------------------------------------------
-# Top-level answer function
-# ---------------------------------------------------------------------------
-
-def answer(query: str, data: Dict) -> str:
-    known_ids = set(data.keys())
-    mentioned = _find_ids(query, known_ids)
-    t_ref     = _find_time_ref(query)
-    qtype     = _question_type(query)
-
-    if not mentioned:
-        ids_hint = ', '.join(sorted(known_ids))
-        return f"No known identity found in query.\nKnown IDs: {ids_hint}"
-
-    parts = [
-        _answer_identity(ident, data[ident], qtype, t_ref)
-        for ident in mentioned
-    ]
-    return '\n\n'.join(parts)
+    return tokenizer.decode(generated).strip()
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Interactive query over pe_description_gen output JSON.",
+        description="Interactive QA over descriptions.json using PLM LLM.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     p.add_argument("--desc", required=True, metavar="PATH",
-                   help="Path to descriptions.json produced by pe_description_gen.py")
-    args = p.parse_args()
+                   help="descriptions.json from pe_description_gen.py")
+    p.add_argument("--plm-ckpt", default="facebook/Perception-LM-8B", metavar="CKPT",
+                   help="PLM checkpoint or HF model ID (default: facebook/Perception-LM-8B)")
+    p.add_argument("--ids", nargs="*", metavar="ID",
+                   help="Limit context to these identity IDs (default: all)")
+    p.add_argument("--max-new-tokens", type=int, default=300, metavar="N",
+                   help="Maximum tokens to generate per answer (default: 300)")
+    return p.parse_args()
 
-    data = _load(args.desc)
+
+def main() -> None:
+    args = _parse_args()
+
+    # Load descriptions
+    data = _load_desc(args.desc)
+    known_ids = set(data.keys())
     n_windows = sum(len(v) for v in data.values())
     print(f"Loaded {len(data)} identities, {n_windows} windows from {args.desc}")
-    print("Ask a question referencing an ID (e.g. 'd14717'). Ctrl-C or Ctrl-D to quit.\n")
+
+    # Load PLM
+    print(f"Loading PLM from {args.plm_ckpt} …")
+    from apps.plm.generate import (
+        load_consolidated_model_and_tokenizer,
+    )
+    from core.data.conversation import REGISTERED_CONVS
+
+    plm_model, plm_tokenizer, _ = load_consolidated_model_and_tokenizer(args.plm_ckpt)
+
+    # Override the system message with our domain-specific one
+    conv_template = deepcopy(REGISTERED_CONVS["plm_sft"])
+    conv_template.system = SYSTEM
+
+    print("Ready. Ask a question about any tracked person. Ctrl-C or Ctrl-D to quit.\n")
 
     while True:
         try:
@@ -199,7 +170,15 @@ def main() -> None:
             break
         if not query:
             continue
-        print(answer(query, data))
+
+        # Decide which IDs to include in context
+        mentioned = _find_mentioned_ids(query, known_ids)
+        context_ids = mentioned if mentioned else (args.ids or list(data.keys()))
+        context = _format_context(data, context_ids)
+
+        prompt = _build_prompt(conv_template, context, query)
+        answer = _generate(plm_model, plm_tokenizer, prompt, args.max_new_tokens)
+        print(answer)
         print()
 
 
