@@ -1,9 +1,9 @@
 """
 Interactive QA over pe_description_gen.py output JSON using PLM's LLM.
 
-The full descriptions JSON is formatted as text context and fed to the
-PLM language model (text-only, no images).  The LLM answers natural-language
-questions about any tracked identity, always citing specific timestamps.
+The descriptions JSON is formatted as text context and fed to the PLM
+language model (text-only, no images), using the built-in KV cache for
+efficient generation.
 
 Usage
 -----
@@ -28,10 +28,9 @@ Example queries
 
 import argparse
 import json
+import os
 import re
-import sys
 from copy import deepcopy
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
@@ -75,7 +74,7 @@ def _format_context(data: Dict, ids: Optional[List[str]] = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PLM text-only generation
+# PLM text-only generation with KV cache
 # ---------------------------------------------------------------------------
 
 SYSTEM = (
@@ -88,33 +87,66 @@ SYSTEM = (
 )
 
 
+def _load_text_generator(ckpt: str, max_new_tokens: int):
+    """
+    Load PLM and return a KV-cached generator for text-only inference.
+
+    PackedCausalTransformerGenerator.generate() takes text-only prompts
+    (plain strings, not (prompt, image) tuples) when the tokenizer is NOT
+    a PLMTokenizer.  We create a Llama3Tokenizer subclass that passes the
+    isinstance check correctly, then wire it up to the cached generator.
+    """
+    from apps.plm.generate import (
+        PackedCausalTransformerGenerator,
+        PackedCausalTransformerGeneratorArgs,
+        load_consolidated_model_and_tokenizer,
+    )
+    from apps.plm.tokenizer import Llama3Tokenizer
+    from core.data.conversation import REGISTERED_CONVS
+
+    plm_model, _, plm_config = load_consolidated_model_and_tokenizer(ckpt)
+
+    # Resolve tokenizer file path (mirrors load_consolidated_model_and_tokenizer logic)
+    if os.path.exists(ckpt):
+        ckpt_dir = ckpt
+    else:
+        from huggingface_hub import snapshot_download
+        ckpt_dir = os.path.join(snapshot_download(ckpt), "original")
+
+    tok_path = plm_config.data.tokenizer_path
+    if not os.path.exists(tok_path):
+        tok_path = os.path.join(ckpt_dir, tok_path)
+
+    # Subclass Llama3Tokenizer so isinstance(tok, PLMTokenizer) == False,
+    # which routes generate() through the text-only (KV-cached) code path.
+    class _TextTok(Llama3Tokenizer):
+        pass
+
+    text_tokenizer = _TextTok(tok_path)
+
+    gen_cfg = PackedCausalTransformerGeneratorArgs(
+        temperature=0.0,
+        max_gen_len=max_new_tokens,
+        dtype="bf16",
+        device="cuda",
+    )
+    generator = PackedCausalTransformerGenerator(gen_cfg, plm_model, text_tokenizer)
+
+    conv_template = deepcopy(REGISTERED_CONVS["plm_sft"])
+    conv_template.system = SYSTEM
+
+    return generator, text_tokenizer, conv_template
+
+
 def _build_prompt(conv_template, context: str, question: str) -> str:
     full_q = f"Tracking data:\n{context}\n\nQuestion: {question}"
-    # Use text-only mode: num_images=0, num_patches=0
     return conv_template.get_generation_prompt(full_q, num_images=0, num_patches=0)
 
 
-@torch.inference_mode()
-def _generate(
-    model,
-    tokenizer,
-    prompt: str,
-    max_new_tokens: int = 300,
-) -> str:
-    token_ids = tokenizer.encode(prompt, add_bos=False, add_eos=False)
-    input_ids = torch.tensor([token_ids], dtype=torch.long).cuda()
-    generated: List[int] = []
-
-    for _ in range(max_new_tokens):
-        logits = model(input_ids, attn_impl="sdpa")   # (1, seqlen, vocab)
-        next_tok = int(logits[0, -1, :].argmax())
-        if next_tok in (tokenizer.eos_id, tokenizer.eot_id):
-            break
-        generated.append(next_tok)
-        next_tensor = torch.tensor([[next_tok]], dtype=torch.long, device=input_ids.device)
-        input_ids = torch.cat([input_ids, next_tensor], dim=-1)
-
-    return tokenizer.decode(generated).strip()
+def _ask(generator, conv_template, context: str, question: str) -> str:
+    prompt = _build_prompt(conv_template, context, question)
+    responses, _, _ = generator.generate([prompt])
+    return responses[0].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -134,31 +166,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ids", nargs="*", metavar="ID",
                    help="Limit context to these identity IDs (default: all)")
     p.add_argument("--max-new-tokens", type=int, default=300, metavar="N",
-                   help="Maximum tokens to generate per answer (default: 300)")
+                   help="Max tokens to generate per answer (default: 300)")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
-    # Load descriptions
     data = _load_desc(args.desc)
     known_ids = set(data.keys())
     n_windows = sum(len(v) for v in data.values())
     print(f"Loaded {len(data)} identities, {n_windows} windows from {args.desc}")
 
-    # Load PLM
     print(f"Loading PLM from {args.plm_ckpt} …")
-    from apps.plm.generate import (
-        load_consolidated_model_and_tokenizer,
-    )
-    from core.data.conversation import REGISTERED_CONVS
-
-    plm_model, plm_tokenizer, _ = load_consolidated_model_and_tokenizer(args.plm_ckpt)
-
-    # Override the system message with our domain-specific one
-    conv_template = deepcopy(REGISTERED_CONVS["plm_sft"])
-    conv_template.system = SYSTEM
+    generator, _, conv_template = _load_text_generator(args.plm_ckpt, args.max_new_tokens)
 
     print("Ready. Ask a question about any tracked person. Ctrl-C or Ctrl-D to quit.\n")
 
@@ -171,13 +192,11 @@ def main() -> None:
         if not query:
             continue
 
-        # Decide which IDs to include in context
         mentioned = _find_mentioned_ids(query, known_ids)
         context_ids = mentioned if mentioned else (args.ids or list(data.keys()))
         context = _format_context(data, context_ids)
 
-        prompt = _build_prompt(conv_template, context, query)
-        answer = _generate(plm_model, plm_tokenizer, prompt, args.max_new_tokens)
+        answer = _ask(generator, conv_template, context, query)
         print(answer)
         print()
 
