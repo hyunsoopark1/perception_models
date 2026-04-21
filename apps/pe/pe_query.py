@@ -127,6 +127,7 @@ def _load_text_generator(ckpt: str, max_new_tokens: int):
     gen_cfg = PackedCausalTransformerGeneratorArgs(
         temperature=0.0,
         max_gen_len=max_new_tokens,
+        max_tokens=32768,   # large enough for full-video context
         dtype="bf16",
         device="cuda",
     )
@@ -143,10 +144,51 @@ def _build_prompt(conv_template, context: str, question: str) -> str:
     return conv_template.get_generation_prompt(full_q, num_images=0, num_patches=0)
 
 
-def _ask(generator, conv_template, context: str, question: str) -> str:
-    prompt = _build_prompt(conv_template, context, question)
+def _ask(generator, conv_template, data: Dict, context_ids: List[str],
+         question: str) -> str:
+    max_prompt_tokens = generator.max_tokens - generator.max_gen_len - 64
+
+    # Start with full context; if too long, drop oldest windows until it fits.
+    recent_windows = {ident: len(data[ident]) for ident in context_ids if ident in data}
+    while True:
+        context = _format_context_windowed(data, context_ids, recent_windows)
+        prompt  = _build_prompt(conv_template, context, question)
+        n_tok   = len(generator.tokenizer.encode(prompt, add_bos=False, add_eos=False))
+        if n_tok <= max_prompt_tokens:
+            break
+        # Drop the oldest window from the identity with the most windows
+        largest = max(recent_windows, key=lambda k: recent_windows[k])
+        recent_windows[largest] -= 1
+        if all(v <= 1 for v in recent_windows.values()):
+            break   # can't trim further
+
     responses, _, _ = generator.generate([prompt])
     return responses[0].strip()
+
+
+def _format_context_windowed(
+    data: Dict, ids: List[str], recent_windows: Dict[str, int]
+) -> str:
+    """Like _format_context but only shows the last N windows per identity."""
+    lines = []
+    for ident in ids:
+        if ident not in data:
+            continue
+        windows = data[ident][-recent_windows.get(ident, len(data[ident])):]
+        lines.append(f"Person {ident}:")
+        for w in windows:
+            t0, t1 = w.get("start_sec", "?"), w.get("end_sec", "?")
+            motion   = w.get("motion",   "") or "unclear"
+            activity = w.get("activity", "") or "unclear"
+            si       = w.get("social_interaction", {}) or {}
+            social   = (si.get("label", "") if isinstance(si, dict) else str(si)) or "none"
+            nearby   = si.get("nearby_ids", []) if isinstance(si, dict) else []
+            nb_str   = f"  nearby=[{', '.join(nearby)}]" if nearby else ""
+            lines.append(
+                f"  [{t0:.1f}s-{t1:.1f}s] "
+                f"motion={motion!r}  activity={activity!r}  social={social!r}{nb_str}"
+            )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -194,9 +236,8 @@ def main() -> None:
 
         mentioned = _find_mentioned_ids(query, known_ids)
         context_ids = mentioned if mentioned else (args.ids or list(data.keys()))
-        context = _format_context(data, context_ids)
 
-        answer = _ask(generator, conv_template, context, query)
+        answer = _ask(generator, conv_template, data, context_ids, query)
         print(answer)
         print()
 
