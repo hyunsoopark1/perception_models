@@ -292,9 +292,11 @@ def _parse_plm_response(text: str) -> Tuple[str, str, str]:
             m = re.match(rf"^{prefix}\s*[:–\-]\s*", low)
             if m:
                 val = stripped[m.end():].strip()
-                # Discard unanswered template placeholders like <...>
+                # Strip angle brackets if PLM answered inside <...>;
+                # discard only if it still looks like an unfilled template keyword.
                 if re.fullmatch(r"<[^>]*>", val):
-                    val = ""
+                    inner = val[1:-1].strip()
+                    val = "" if re.search(r"\b(how|what|IDs?|e\.g\.)\b", inner, re.I) else inner
                 if field == "motion":
                     motion = val
                 elif field == "social":
