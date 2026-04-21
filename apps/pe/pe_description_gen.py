@@ -422,8 +422,12 @@ def _draw_window_overlay(
     if motion:
         rows.append((f"M: {motion[:MAX_CHARS]}", color))
 
+    # Fallback: if PLM parsing produced nothing, show the raw response so
+    # something always appears above the box when a result exists.
     if not rows:
-        return
+        raw = win.get("description", "")
+        if raw:
+            rows.append((raw[:MAX_CHARS], _darken(color, 0.60)))
 
     y_bottom = max(y1, len(rows) * (th + 2 * pad) + 4)
     for text, bg in rows:
@@ -707,6 +711,8 @@ if __name__ == "__main__":
                 earlier = [k for k in wins if k <= wid]
                 wid = max(earlier) if earlier else None  # type: ignore[assignment]
             win_data = wins.get(wid) if wid is not None else None  # type: ignore[arg-type]
+            if win_data is None and frame_idx % window_frames == 0:
+                print(f"  [dbg] frame {frame_idx}: no window result for {ident}")
 
             _draw_window_overlay(
                 frame, x1, y1, x2, y2,
