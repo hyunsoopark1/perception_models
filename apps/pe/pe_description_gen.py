@@ -96,25 +96,28 @@ from PIL import Image as PILImage
 # Prompt builder — per identity, per window
 # ---------------------------------------------------------------------------
 
-def _make_prompt(ident: str) -> str:
+def _make_prompt(ident: str, nearby_ids: List[str]) -> str:
     """
     Build the PLM prompt for one identity + window.
 
-    Each frame in the clip has a colored bounding box drawn directly onto
-    the pixels marking the tracked person.  The prompt instructs the model
-    to use that visible box as its spatial anchor rather than relying on
-    numeric coordinates.
+    Each frame has a green rectangle drawn on the pixels marking the tracked
+    person.  nearby_ids are provided so PLM can reference specific people by
+    ID when reporting physical contact in the Social field.
     """
+    nearby_part = (
+        f"The following people are visible nearby: {', '.join(nearby_ids)}. "
+        if nearby_ids else ""
+    )
     return (
         f"Watch this video clip carefully. One person is highlighted with a "
         f"green rectangle that follows them across all frames (ID '{ident}'). "
-        f"Describe only that person. "
-        f"Reply in plain English words only — do not output any coordinates, "
-        f"numbers, or bounding boxes. "
-        f"Use the exact format below, filling each line with 2-5 words:\n"
-        f"Motion: <how this person is moving>\n"
-        f"Social: <who they are near or interacting with>\n"
-        f"Activity: <what they are doing>\n"
+        f"Describe only that person. {nearby_part}"
+        f"Reply in plain English words only — do not output any coordinates or numbers. "
+        f"Use this exact format:\n"
+        f"Motion: <how this person is moving, in 2-5 words>\n"
+        f"Social: <IDs of the nearby people this person is physically touching "
+        f"(e.g. hugging, holding hands, lifting), or 'none'>\n"
+        f"Activity: <what this person is doing, in 2-5 words>\n"
         f"If a field is not clearly visible write 'unclear'."
     )
 
@@ -567,8 +570,14 @@ if __name__ == "__main__":
                 pil_frames  = pil_frames  * 2   # PLM needs ≥ 2 frames
                 bbox_coords = bbox_coords * 2
 
-            # Prompt tells the model to attend to the drawn colored bbox
-            prompt = _make_prompt(ident)
+            # Nearby IDs computed first — passed into the prompt so PLM can
+            # reference specific people when reporting physical contact.
+            nearby_ids = _find_nearby_ids(
+                ident, wid, window_frames, tracks,
+                args.proximity_scale, max_frames,
+            )
+
+            prompt = _make_prompt(ident, nearby_ids)
 
             # Annotate each frame with its own per-frame bbox so PLM's visual
             # attention can follow the moving person across the clip.
@@ -586,16 +595,9 @@ if __name__ == "__main__":
             raw = responses[0].strip()
 
             motion, social, activity = _parse_plm_response(raw)
-
-            nearby_ids = _find_nearby_ids(
-                ident, wid, window_frames, tracks,
-                args.proximity_scale, max_frames,
-            )
-
-            # Embed nearby IDs directly into the social label so the
-            # association is explicit everywhere (JSON, overlay, description).
-            ids_str = f"({', '.join(nearby_ids)})" if nearby_ids else ""
-            social_with_ids = f"{social} {ids_str}".strip() if (social or ids_str) else ""
+            # social now contains the IDs PLM judged to be in physical contact
+            # (e.g. "d14709, d14713" or "none") — no separate appending needed.
+            social_with_ids = social
 
             win = {
                 "start_frame":        start_fr,
