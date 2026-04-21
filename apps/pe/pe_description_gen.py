@@ -110,7 +110,7 @@ def _make_prompt(ident: str) -> str:
         f"One person is highlighted with a colored rectangle across all frames. "
         f"All other tracked people are shown with grey rectangles and their ID labels. "
         f"Describe only the person inside the colored rectangle. "
-        f"Reply in plain English only — do not output coordinates or numbers. "
+        f"Reply in plain English only — do not output coordinates, frame numbers, or timestamps. "
         f"Use this exact format:\n"
         f"Motion: <how this person is moving, in 2-5 words>\n"
         f"Social: <IDs of people shown in grey that this person is physically "
