@@ -130,6 +130,65 @@ def _make_prompt(ident: str, nearby_ids: List[str]) -> str:
     )
 
 
+def _make_attn_bias_prompt(ident: str, nearby_ids: List[str]) -> str:
+    """
+    Prompt for attention-bias inference mode.
+    No visual annotation is drawn on the frames; PLM's attention is steered
+    to the target person's patch region via bias injection.
+    """
+    if nearby_ids:
+        nearby_text = ", ".join(nearby_ids)
+        social_instruction = (
+            f"Social: <from this list of nearby people [{nearby_text}], "
+            f"list only those that this person is physically touching "
+            f"(e.g. hugging, holding hands, lifting). "
+            f"Use their exact IDs. If none, write 'none'.>"
+        )
+    else:
+        social_instruction = "Social: none"
+
+    return (
+        f"Watch this video clip carefully. "
+        f"Focus on the highlighted person in the scene and describe only them. "
+        f"Reply in plain English only — do not output coordinates, frame numbers, or timestamps. "
+        f"Use this exact format:\n"
+        f"Motion: <how this person is moving, in 2-5 words>\n"
+        f"{social_instruction}\n"
+        f"Activity: <what this person is doing, in 2-5 words>\n"
+        f"If a field is not clearly visible write 'unclear'."
+    )
+
+
+def _make_attn_bias_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
+    """Taxonomy prompt for attention-bias mode — no visual annotation on frames."""
+    nearby_text = ", ".join(nearby_ids) if nearby_ids else "none"
+    bs_list = " | ".join(sorted(BODY_STATES))
+    ov_list = " | ".join(sorted(OBJ_VERBS))
+    on_list = " | ".join(sorted(OBJ_NOUNS_CORE)) + " | <other object if needed>"
+    sc_list = " | ".join(sorted(SOCIAL_TAX))
+    se_list = " | ".join(sorted(SAFETY_EVENTS))
+    return (
+        f"Watch this video clip. Focus on the highlighted person in the scene.\n"
+        f"Nearby people: {nearby_text}\n\n"
+        f"Classify ONLY the highlighted person. Pick exactly one label per slot:\n\n"
+        f"body_state:   {bs_list}\n"
+        f"obj_verb:     {ov_list}\n"
+        f"obj_noun:     {on_list}\n"
+        f"social:       {sc_list}\n"
+        f"              REQUIRED when not none: also list which nearby person ID(s)\n"
+        f"              are involved, e.g.  social: co_manipulate [d14709]\n"
+        f"safety_event: {se_list}\n"
+        f"other_text:   (free text only if none of the slots above apply; else leave blank)\n\n"
+        f"Reply ONLY in this format, one field per line:\n"
+        f"body_state: <label>\n"
+        f"obj_verb: <label>\n"
+        f"obj_noun: <label>\n"
+        f"social: <label> [<id1>, <id2>]  — or —  social: none\n"
+        f"safety_event: <label>\n"
+        f"other_text: <text or blank>"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Taxonomy — structured classification  (separate PLM call from M/S/A)
 # ---------------------------------------------------------------------------
@@ -288,6 +347,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-minutes", type=float, default=None, metavar="M",
                    help="Stop after this many minutes of video (default: all). "
                         "Overridden by --max-frames if both are given.")
+    # --- attention bias mode ---
+    p.add_argument("--attn-bias", action="store_true",
+                   help="Use attention bias instead of drawing boxes on frames. "
+                        "The image is unmodified; PLM attention is steered toward "
+                        "the target person's patch region via SDPA bias injection.")
+    p.add_argument("--bbox-bias", type=float, default=3.0, metavar="B",
+                   help="Additive logit bias for bbox patches in --attn-bias mode "
+                        "(default: 3.0 ≈ 20× relative attention weight).")
     # --- proximity ---
     p.add_argument("--proximity-scale", type=float, default=2.0, metavar="S",
                    help="Nearby threshold = this × avg_bbox_dim (default: 2.0).")
@@ -685,10 +752,26 @@ if __name__ == "__main__":
     )
     generator = PackedCausalTransformerGenerator(gen_cfg, plm_model, plm_tokenizer)
 
+    # Patch grid parameters (needed for attention-bias mode)
+    _vis_image_size  = plm_model.vision_model.image_size
+    _tok_patch_size  = getattr(plm_tokenizer, "patch_size",  14)
+    _tok_pool_ratio  = getattr(plm_tokenizer, "pooling_ratio", 1)
+    _n_patches_side  = _vis_image_size // _tok_patch_size // _tok_pool_ratio
+    _patches_per_frm = _n_patches_side ** 2
+
+    if args.attn_bias:
+        from apps.pe.pe_attn_bias import (
+            bbox_attention_bias,
+            compute_bbox_bias_mask,
+            get_image_patch_positions,
+        )
+        print(f"  attn-bias mode: patch_grid={_n_patches_side}×{_n_patches_side}  "
+              f"patches/frame={_patches_per_frm}  bbox_bias={args.bbox_bias}")
+
     print(f"  generator ready  (max_gen_len={args.max_gen_len}, "
           f"temperature={args.temperature})")
-    print(f"\nPrompt template per clip includes: identity ID, bbox (x1,y1,x2,y2) "
-          f"in the original frame, and Motion/Social/Activity questions.\n")
+    mode_desc = "attention-bias (no frame drawing)" if args.attn_bias else "bbox overlay (colored rectangle)"
+    print(f"  mode: {mode_desc}\n")
 
     # ------------------------------------------------------------------
     # 2. Load tracks
@@ -778,35 +861,82 @@ if __name__ == "__main__":
                 args.proximity_scale, max_frames,
             )
 
-            prompt = _make_prompt(ident, nearby_ids)
+            if args.attn_bias:
+                # ---- Attention-bias mode: raw frames, SDPA bias steers focus ----
+                prompt = _make_attn_bias_prompt(ident, nearby_ids)
+                tax_prompt = _make_attn_bias_taxonomy_prompt(ident, nearby_ids)
+                frames_tensor, _ = plm_transform._process_multiple_images_pil(pil_frames)
 
-            # Annotate: all others in grey with IDs, then target in color on top
-            ann_color = _identity_color(ident)
-            annotated = [
-                _annotate_frame_target(
-                    _annotate_frame_base(frame_cache[fidx],
-                                         other_frame_bboxes.get(fidx, {})),
-                    cx, cy, w, h, ann_color,
+                image_pos, seq_len = get_image_patch_positions(
+                    generator.tokenizer, prompt, frames_tensor
                 )
-                for fidx, (cx, cy, w, h) in zip(frame_indices, bbox_coords)
-            ]
+                bias_mask = compute_bbox_bias_mask(
+                    image_pos, bbox_coords,
+                    patches_per_frame=_patches_per_frm,
+                    n_patches_side=_n_patches_side,
+                    orig_w=frame_w, orig_h=frame_h,
+                    image_size=_vis_image_size,
+                    seq_len=seq_len,
+                    bias=args.bbox_bias,
+                )
+                n_bias_tokens = int((bias_mask > 0).sum().item())
+                print(f"    [{ident}]  attn-bias: {n_bias_tokens} bbox patches biased")
 
-            # Annotated frames → (N, 3, H, W) tensor
-            frames_tensor, _ = plm_transform._process_multiple_images_pil(annotated)
+                # PLM call 1 — M/S/A (optional)
+                if not args.no_msa:
+                    with bbox_attention_bias(bias_mask):
+                        responses, _, _ = generator.generate([(prompt, frames_tensor)])
+                    raw = responses[0].strip()
+                    motion, social, activity = _parse_plm_response(raw)
+                    print(f"      M:{motion!r}  S:{social!r}  A:{activity!r}")
+                    print(f"      raw → {raw!r}")
+                else:
+                    motion = social = activity = raw = ""
 
-            # PLM call 1 — M/S/A  (optional)
-            if not args.no_msa:
-                responses, _, _ = generator.generate([(prompt, frames_tensor)])
-                raw = responses[0].strip()
-                motion, social, activity = _parse_plm_response(raw)
-                print(f"    [{ident}]  M:{motion!r}  S:{social!r}  A:{activity!r}")
-                print(f"      raw → {raw!r}")
+                # PLM call 2 — taxonomy
+                # Recompute image_pos for the taxonomy prompt (different token count)
+                tax_image_pos, tax_seq_len = get_image_patch_positions(
+                    generator.tokenizer, tax_prompt, frames_tensor
+                )
+                tax_bias_mask = compute_bbox_bias_mask(
+                    tax_image_pos, bbox_coords,
+                    patches_per_frame=_patches_per_frm,
+                    n_patches_side=_n_patches_side,
+                    orig_w=frame_w, orig_h=frame_h,
+                    image_size=_vis_image_size,
+                    seq_len=tax_seq_len,
+                    bias=args.bbox_bias,
+                )
+                with bbox_attention_bias(tax_bias_mask):
+                    tax_responses, _, _ = generator.generate([(tax_prompt, frames_tensor)])
+
             else:
-                motion = social = activity = raw = ""
+                # ---- Default mode: draw colored box annotation on frames ----
+                prompt = _make_prompt(ident, nearby_ids)
+                tax_prompt = _make_taxonomy_prompt(ident, nearby_ids)
+                ann_color = _identity_color(ident)
+                annotated = [
+                    _annotate_frame_target(
+                        _annotate_frame_base(frame_cache[fidx],
+                                             other_frame_bboxes.get(fidx, {})),
+                        cx, cy, w, h, ann_color,
+                    )
+                    for fidx, (cx, cy, w, h) in zip(frame_indices, bbox_coords)
+                ]
+                frames_tensor, _ = plm_transform._process_multiple_images_pil(annotated)
 
-            # PLM call 2 — taxonomy
-            tax_prompt = _make_taxonomy_prompt(ident, nearby_ids)
-            tax_responses, _, _ = generator.generate([(tax_prompt, frames_tensor)])
+                # PLM call 1 — M/S/A (optional)
+                if not args.no_msa:
+                    responses, _, _ = generator.generate([(prompt, frames_tensor)])
+                    raw = responses[0].strip()
+                    motion, social, activity = _parse_plm_response(raw)
+                    print(f"    [{ident}]  M:{motion!r}  S:{social!r}  A:{activity!r}")
+                    print(f"      raw → {raw!r}")
+                else:
+                    motion = social = activity = raw = ""
+
+                tax_responses, _, _ = generator.generate([(tax_prompt, frames_tensor)])
+
             tax_raw = tax_responses[0].strip()
             taxonomy = _parse_taxonomy_response(tax_raw, nearby_ids)
 
