@@ -193,27 +193,67 @@ def _keyword_filter(data: Dict, query: str, top_k: int = 30) -> Dict:
     return filtered
 
 
-def _build_prompt(conv_template, context: str, question: str) -> str:
-    full_q = f"Tracking data:\n{context}\n\nQuestion: {question}"
+def _compute_interaction_stats(data: Dict, target_id: str) -> str:
+    """
+    For every person X in data, compute:
+      - windows where target_id appears in X's nearby_ids
+      - accumulated duration of those windows
+
+    Returns a pre-computed summary string to inject into the prompt so the
+    LLM never has to do arithmetic (which it reliably gets wrong).
+    """
+    rows = []
+    for ident, windows in data.items():
+        if ident == target_id:
+            continue
+        matching = [
+            w for w in windows
+            if target_id in (
+                (w.get("social_interaction") or {}).get("nearby_ids", [])
+            )
+        ]
+        if not matching:
+            continue
+        total_sec = sum(w.get("end_sec", 0) - w.get("start_sec", 0) for w in matching)
+        spans = ", ".join(f"{w['start_sec']:.1f}s-{w['end_sec']:.1f}s" for w in matching)
+        rows.append(f"  {ident}: {total_sec:.1f}s total  ({spans})")
+    if not rows:
+        return f"Pre-computed: no one has {target_id} in their nearby_ids.\n"
+    return "Pre-computed proximity stats with " + target_id + ":\n" + "\n".join(rows) + "\n"
+
+
+def _build_prompt(conv_template, context: str, question: str,
+                  stats: str = "") -> str:
+    full_q = f"{stats}Tracking data:\n{context}\n\nQuestion: {question}"
     return conv_template.get_generation_prompt(full_q, num_images=0, num_patches=0)
 
 
 def _ask(generator, conv_template, data: Dict, context_ids: List[str],
          question: str) -> str:
-    # Step 1: keyword pre-filter so only relevant windows reach the LLM.
+    # Step 1: Pre-compute interaction stats if a specific ID is mentioned.
+    mentioned = _find_mentioned_ids(question, set(data.keys()))
+    stats = ""
+    if mentioned and re.search(r"\binteract|accum|total time|how long|how much time\b",
+                               question, re.I):
+        for mid in mentioned:
+            stats += _compute_interaction_stats(data, mid)
+
+    # Step 2: keyword pre-filter so only relevant windows reach the LLM.
     scoped = {k: v for k, v in data.items() if k in context_ids}
     filtered = _keyword_filter(scoped, question)
 
-    # Step 2: Hard limit is the smaller of KV cache size and RoPE table size.
+    # Step 3: Hard limit is the smaller of KV cache size and RoPE table size.
     rope_limit = generator.model.max_seqlen
-    max_prompt_tokens = min(generator.max_tokens, rope_limit) - generator.max_gen_len - 64
+    max_prompt_tokens = (min(generator.max_tokens, rope_limit)
+                         - generator.max_gen_len - 64
+                         - len(generator.tokenizer.encode(stats, add_bos=False, add_eos=False)))
 
-    # Step 3: Trim if still too long (drop oldest windows from largest identity).
+    # Step 4: Trim if still too long (drop oldest windows from largest identity).
     recent_windows = {ident: len(wins) for ident, wins in filtered.items()}
     ids_ordered = list(filtered.keys())
     while True:
         context = _format_context_windowed(filtered, ids_ordered, recent_windows)
-        prompt  = _build_prompt(conv_template, context, question)
+        prompt  = _build_prompt(conv_template, context, question, stats)
         n_tok   = len(generator.tokenizer.encode(prompt, add_bos=False, add_eos=False))
         if n_tok <= max_prompt_tokens:
             break
