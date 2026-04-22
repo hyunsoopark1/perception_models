@@ -1,10 +1,9 @@
 """
 Interactive QA over pe_description_gen.py output JSON.
 
-The PLM LLM is used as a code generator: given the data schema and the
-user's question it writes Python code, which is then executed against the
-real `data` dict.  All arithmetic, aggregation, and lookups are done by
-the executed code — not by the LLM — so results are always exact.
+A regex router classifies each query as 'code' or 'language':
+  - code     → LLM writes Python, Python executes it (exact results)
+  - language → LLM reads relevant windows as text context (natural prose)
 
 Usage
 -----
@@ -14,11 +13,11 @@ Usage
 
 Example queries
 ---------------
-    > list all IDs
-    > find who puts a toy on the shelf and at what time
-    > list persons who interact with d14718 and their accumulated time
-    > who is near d14709 at 36 seconds?
-    > which person has the longest total activity duration?
+    > list all IDs                                        [code]
+    > find who puts a toy on the shelf and at what time   [code]
+    > list persons who interact with d14718               [code]
+    > summarize what d14717 was doing                     [language]
+    > describe the interactions between d14709 and d14718 [language]
 """
 
 import argparse
@@ -42,11 +41,40 @@ def _load_desc(path: str) -> Dict:
         return json.load(f)
 
 
+def _find_mentioned_ids(text: str, known_ids) -> List[str]:
+    candidates = re.findall(r'\b[a-zA-Z]\d{4,}\b', text)
+    return [c for c in candidates if c in known_ids]
+
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
+
+_CODE_RE = re.compile(
+    r'\b(list|find|count|total|sum|accumulated|how many|how long|how much|'
+    r'who|when|which|at what time|between|before|after|during|'
+    r'rank|sort|compare|average|longest|shortest|most|least|'
+    r'show all|show me|give me)\b',
+    re.I,
+)
+_LANG_RE = re.compile(
+    r'\b(summarize|summary|describe|explain|tell me about|'
+    r'what was|what were|what did|overview|analyze|analysis|'
+    r'narrative|report|elaborate|in detail)\b',
+    re.I,
+)
+
+def _classify(question: str) -> str:
+    """Return 'language' if the query asks for prose, else 'code'."""
+    if _LANG_RE.search(question):
+        return "language"
+    return "code"
+
+
 # ---------------------------------------------------------------------------
 # PLM loader  (text-only, KV-cached)
 # ---------------------------------------------------------------------------
 
-# System prompt: instruct LLM to produce only executable Python
 CODEGEN_SYSTEM = (
     "You are a Python programming assistant. "
     "You will receive a description of a Python variable called `data` "
@@ -60,7 +88,14 @@ CODEGEN_SYSTEM = (
     "  5. Never nest f-strings. Build complex strings in a separate variable first."
 )
 
-# Schema shown to the LLM every call (short enough to fit in context)
+LANGUAGE_SYSTEM = (
+    "You are an assistant analyzing person tracking and behavior data from a video. "
+    "Each person has a list of 6-second windows with fields: "
+    "motion (body movement), activity (what they are doing), "
+    "social (physical contact), and nearby (close proximity). "
+    "Answer in clear natural language. Always cite specific timestamps."
+)
+
 DATA_SCHEMA = """\
 # `data` structure
 # data[person_id] = list of windows  (chronological, 6 s each)
@@ -133,37 +168,34 @@ def _load_text_generator(ckpt: str, max_new_tokens: int):
     )
     generator = PackedCausalTransformerGenerator(gen_cfg, plm_model, text_tokenizer)
 
-    conv_template = deepcopy(REGISTERED_CONVS["plm_sft"])
-    conv_template.system = CODEGEN_SYSTEM
+    # Two conversation templates — one per mode
+    code_tmpl = deepcopy(REGISTERED_CONVS["plm_sft"])
+    code_tmpl.system = CODEGEN_SYSTEM
 
-    return generator, conv_template
+    lang_tmpl = deepcopy(REGISTERED_CONVS["plm_sft"])
+    lang_tmpl.system = LANGUAGE_SYSTEM
+
+    return generator, text_tokenizer, code_tmpl, lang_tmpl
 
 
 # ---------------------------------------------------------------------------
-# Code generation + execution
+# Code path
 # ---------------------------------------------------------------------------
 
-def _build_codegen_prompt(conv_template, ids: List[str], question: str) -> str:
+def _build_codegen_prompt(tmpl, ids: List[str], question: str) -> str:
     ids_line = "# Available person IDs: " + ", ".join(sorted(ids))
     full_q = f"{DATA_SCHEMA}\n{ids_line}\n\nQuestion: {question}\n\nPython code:"
-    return conv_template.get_generation_prompt(full_q, num_images=0, num_patches=0)
+    return tmpl.get_generation_prompt(full_q, num_images=0, num_patches=0)
 
 
 def _extract_code(text: str) -> str:
-    """Pull code out of the LLM response, stripping markdown fences if present."""
-    # ```python ... ``` or ``` ... ```
     m = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
     if m:
         return m.group(1).strip()
-    # No fences — treat the whole response as code
     return text.strip()
 
 
 def _execute_code(code: str, data: Dict) -> Tuple[str, Optional[str]]:
-    """
-    Execute *code* with `data` in scope.
-    Returns (stdout, error_message).  error_message is None on success.
-    """
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
@@ -173,26 +205,79 @@ def _execute_code(code: str, data: Dict) -> Tuple[str, Optional[str]]:
         return buf.getvalue().strip(), f"{type(exc).__name__}: {exc}"
 
 
-def _ask(generator, conv_template, data: Dict, question: str) -> str:
-    ids = list(data.keys())
-    prompt = _build_codegen_prompt(conv_template, ids, question)
+def _ask_code(generator, tmpl, data: Dict, question: str) -> str:
+    prompt = _build_codegen_prompt(tmpl, list(data.keys()), question)
+    responses, _, _ = generator.generate([prompt])
+    code = _extract_code(responses[0].strip())
+    print(f"  [code]\n{code}\n")
+    output, err = _execute_code(code, data)
+    if err:
+        return "\n".join(filter(None, [f"[exec error] {err}", output]))
+    return output or "(no output)"
+
+
+# ---------------------------------------------------------------------------
+# Language path
+# ---------------------------------------------------------------------------
+
+def _format_context(data: Dict, ids: List[str], max_windows: int = 10) -> str:
+    """Render the most recent max_windows per identity as plain text."""
+    lines = []
+    for ident in ids:
+        if ident not in data:
+            continue
+        lines.append(f"Person {ident}:")
+        for w in data[ident][-max_windows:]:
+            t0, t1 = w.get("start_sec", "?"), w.get("end_sec", "?")
+            motion   = w.get("motion", "")   or "unclear"
+            activity = w.get("activity", "") or "unclear"
+            si       = w.get("social_interaction", {}) or {}
+            social   = (si.get("label", "") if isinstance(si, dict) else str(si)) or "none"
+            nearby   = si.get("nearby_ids", []) if isinstance(si, dict) else []
+            nb       = f"  nearby=[{', '.join(nearby)}]" if nearby else ""
+            lines.append(
+                f"  [{t0:.1f}s-{t1:.1f}s] "
+                f"motion={motion!r}  activity={activity!r}  social={social!r}{nb}"
+            )
+    return "\n".join(lines)
+
+
+def _ask_language(generator, tmpl, data: Dict, known_ids,
+                  question: str, rope_limit: int, max_gen: int) -> str:
+    # Include mentioned IDs, or all IDs if none mentioned
+    mentioned = _find_mentioned_ids(question, known_ids)
+    ids = mentioned if mentioned else list(data.keys())
+
+    max_ctx_tokens = min(generator.max_tokens, rope_limit) - max_gen - 64
+
+    # Reduce windows per identity until the prompt fits
+    max_windows = 20
+    while max_windows > 1:
+        context = _format_context(data, ids, max_windows)
+        full_q  = f"Tracking data:\n{context}\n\nQuestion: {question}"
+        prompt  = tmpl.get_generation_prompt(full_q, num_images=0, num_patches=0)
+        n_tok   = len(generator.tokenizer.encode(prompt, add_bos=False, add_eos=False))
+        if n_tok <= max_ctx_tokens:
+            break
+        max_windows -= 2
 
     responses, _, _ = generator.generate([prompt])
-    raw = responses[0].strip()
-    code = _extract_code(raw)
+    return responses[0].strip()
 
-    print(f"  [code]\n{code}\n")
 
-    output, err = _execute_code(code, data)
+# ---------------------------------------------------------------------------
+# Unified entry point
+# ---------------------------------------------------------------------------
 
-    if err:
-        # On error show the problem so the user can diagnose
-        lines = [f"[exec error] {err}"]
-        if output:
-            lines.append(output)
-        return "\n".join(lines)
-
-    return output or "(no output)"
+def _ask(generator, code_tmpl, lang_tmpl, data: Dict, known_ids,
+         question: str, rope_limit: int, max_gen: int) -> str:
+    mode = _classify(question)
+    print(f"  [route → {mode}]")
+    if mode == "code":
+        return _ask_code(generator, code_tmpl, data, question)
+    else:
+        return _ask_language(generator, lang_tmpl, data, known_ids,
+                             question, rope_limit, max_gen)
 
 
 # ---------------------------------------------------------------------------
@@ -201,16 +286,13 @@ def _ask(generator, conv_template, data: Dict, question: str) -> str:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Interactive QA over descriptions.json — LLM writes code, Python runs it.",
+        description="Interactive QA over descriptions.json with code/language router.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--desc", required=True, metavar="PATH",
-                   help="descriptions.json from pe_description_gen.py")
-    p.add_argument("--plm-ckpt", default="facebook/Perception-LM-8B", metavar="CKPT",
-                   help="PLM checkpoint or HF model ID (default: facebook/Perception-LM-8B)")
-    p.add_argument("--max-new-tokens", type=int, default=512, metavar="N",
-                   help="Max tokens the LLM may generate per code snippet (default: 512)")
+    p.add_argument("--desc", required=True, metavar="PATH")
+    p.add_argument("--plm-ckpt", default="facebook/Perception-LM-8B", metavar="CKPT")
+    p.add_argument("--max-new-tokens", type=int, default=512, metavar="N")
     return p.parse_args()
 
 
@@ -218,13 +300,17 @@ def main() -> None:
     args = _parse_args()
 
     data = _load_desc(args.desc)
+    known_ids = set(data.keys())
     n_windows = sum(len(v) for v in data.values())
     print(f"Loaded {len(data)} identities, {n_windows} windows from {args.desc}")
 
     print(f"Loading PLM from {args.plm_ckpt} …")
-    generator, conv_template = _load_text_generator(args.plm_ckpt, args.max_new_tokens)
+    generator, _, code_tmpl, lang_tmpl = _load_text_generator(
+        args.plm_ckpt, args.max_new_tokens
+    )
+    rope_limit = generator.model.max_seqlen
 
-    print("Ready. Ask a question about the tracked persons. Ctrl-C or Ctrl-D to quit.\n")
+    print("Ready. Ctrl-C or Ctrl-D to quit.\n")
 
     while True:
         try:
@@ -235,7 +321,8 @@ def main() -> None:
         if not query:
             continue
 
-        answer = _ask(generator, conv_template, data, query)
+        answer = _ask(generator, code_tmpl, lang_tmpl, data, known_ids,
+                      query, rope_limit, args.max_new_tokens)
         print(answer)
         print()
 
