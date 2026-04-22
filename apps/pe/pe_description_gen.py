@@ -131,6 +131,110 @@ def _make_prompt(ident: str, nearby_ids: List[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Taxonomy — structured classification  (separate PLM call from M/S/A)
+# ---------------------------------------------------------------------------
+
+BODY_STATES = frozenset({
+    "idle_stand", "idle_sit", "walk", "walk_loaded", "run",
+    "bend", "squat", "kneel", "reach_overhead", "reach_low",
+    "twist", "crouch_sustained", "climb", "fall", "recover_balance",
+})
+OBJ_VERBS = frozenset({
+    "reach", "grasp", "lift", "lower", "carry", "place", "push",
+    "pull", "drag", "stack", "unstack", "pack", "unpack", "scan",
+    "inspect", "operate", "throw", "catch", "rotate", "none",
+})
+OBJ_NOUNS_CORE = frozenset({
+    "box", "pallet", "scanner", "cart", "forklift", "ladder",
+    "tool", "document", "shelf", "bin", "bag", "package",
+    "button", "screen", "door", "handle", "none",
+})
+SOCIAL_TAX = frozenset({
+    "none", "talk", "handover", "receive", "co_manipulate",
+    "gesture_instruct", "point",
+})
+SAFETY_EVENTS = frozenset({
+    "none", "zone_enter", "zone_exit", "ppe_don", "ppe_doff",
+    "near_miss", "hazard_response", "fall",
+})
+
+
+def _make_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
+    nearby_text = ", ".join(nearby_ids) if nearby_ids else "none"
+    bs_list = " | ".join(sorted(BODY_STATES))
+    ov_list = " | ".join(sorted(OBJ_VERBS))
+    on_list = " | ".join(sorted(OBJ_NOUNS_CORE)) + " | <other object if needed>"
+    sc_list = " | ".join(sorted(SOCIAL_TAX))
+    se_list = " | ".join(sorted(SAFETY_EVENTS))
+    return (
+        f"Watch this video clip. One person is highlighted with a colored rectangle.\n"
+        f"Nearby people: {nearby_text}\n\n"
+        f"Classify ONLY the highlighted person. Pick exactly one label per slot:\n\n"
+        f"body_state:   {bs_list}\n"
+        f"obj_verb:     {ov_list}\n"
+        f"obj_noun:     {on_list}\n"
+        f"social:       {sc_list}\n"
+        f"safety_event: {se_list}\n"
+        f"other_text:   (free text only if none of the slots above apply; else leave blank)\n\n"
+        f"Reply ONLY in this format, one field per line:\n"
+        f"body_state: <label>\n"
+        f"obj_verb: <label>\n"
+        f"obj_noun: <label>\n"
+        f"social: <label>\n"
+        f"safety_event: <label>\n"
+        f"other_text: <text or blank>"
+    )
+
+
+def _match_label(val: str, allowed: frozenset, default: str) -> str:
+    """Fuzzy match PLM output against allowed label set."""
+    v = val.lower().strip()
+    if v in allowed:
+        return v
+    v_norm = re.sub(r"[\s\-]+", "_", v)
+    if v_norm in allowed:
+        return v_norm
+    for a in sorted(allowed):
+        if a in v or v in a:
+            return a
+    return default
+
+
+def _parse_taxonomy_response(text: str) -> Dict:
+    """Parse structured taxonomy response; validate each slot against its allowed set."""
+    result: Dict[str, str] = {
+        "body_state":   "unknown",
+        "obj_verb":     "none",
+        "obj_noun":     "none",
+        "social":       "none",
+        "safety_event": "none",
+        "other_text":   "",
+    }
+    slot_cfg = {
+        "body_state":   (BODY_STATES,   "unknown"),
+        "obj_verb":     (OBJ_VERBS,     "none"),
+        "obj_noun":     (None,          "none"),   # free-form noun accepted
+        "social":       (SOCIAL_TAX,    "none"),
+        "safety_event": (SAFETY_EVENTS, "none"),
+        "other_text":   (None,          ""),
+    }
+    for line in text.splitlines():
+        stripped = line.strip().replace("**", "")
+        low = stripped.lower()
+        for key in slot_cfg:
+            m = re.match(rf"^{re.escape(key)}\s*[:–\-]\s*", low)
+            if m:
+                val = stripped[m.end():].strip()
+                allowed, default = slot_cfg[key]
+                if allowed is not None:
+                    result[key] = _match_label(val, allowed, default)
+                else:
+                    result[key] = val if val else default
+                break
+    return result
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -396,21 +500,23 @@ def _draw_window_overlay(
     font_scale: float,
 ) -> None:
     """
-    Draw bbox with identity badge + M/S/A rows above it:
+    Draw bbox with identity badge and label rows stacked above it (bottom → top):
 
-        M: <motion>                    ← topmost, identity color
-        S: <social> (id_2, id_5)       ← darker
-        A: <activity>                  ← darkest
-        ┌[id]──── bbox ───────────────┐
-        │                             │
-        └─────────────────────────────┘
+        BS:<body_state>  OBJ:<verb>→<noun>   ← taxonomy row 2 (topmost)
+        SC:<social_tax>  SE:<safety_event>   ← taxonomy row 1
+        M: <motion>                          ← identity color
+        S: <social_desc>                     ← darker
+        A: <activity>                        ← darkest, closest to box
+        ┌[id]──── bbox ───────────────────┐
+        │                                 │
+        └─────────────────────────────────┘
     """
     import cv2
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     ft   = 1
     pad  = 3
-    MAX_CHARS = 70   # truncate long text to prevent horizontal overflow
+    MAX_CHARS = 72   # truncate long text to prevent horizontal overflow
     (_, th), baseline = cv2.getTextSize("A", font, font_scale, ft)
 
     def _draw_row(y_bottom: int, text: str, bg: Tuple) -> int:
@@ -435,17 +541,17 @@ def _draw_window_overlay(
     if win is None:
         return
 
-    # --- collect field values ---
+    # --- collect M/S/A field values ---
     motion      = win.get("motion", "")
     social_dict = win.get("social_interaction", {})
     activity    = win.get("activity", "")
-    # label already has nearby IDs embedded (e.g. "looking at child (d14709)")
     social_lbl  = (social_dict.get("label", "")
                    if isinstance(social_dict, dict) else str(social_dict))
 
-    # Build rows bottom → top above the box.
-    # First item ends up closest to the box; last item is topmost.
+    # Build rows list (bottom → top; index 0 = closest to box = drawn first).
     rows: List[Tuple[str, Tuple]] = []
+
+    # M/S/A rows (identity-colored family)
     if activity:
         rows.append((f"A: {activity[:MAX_CHARS]}", _darken(color, 0.38)))
     if social_lbl:
@@ -453,14 +559,43 @@ def _draw_window_overlay(
     if motion:
         rows.append((f"M: {motion[:MAX_CHARS]}", color))
 
-    # Fallback: if PLM parsing produced nothing, show the raw response so
-    # something always appears above the box when a result exists.
+    # Fallback when PLM parsing produced nothing
     if not rows:
         raw = win.get("description", "")
         if raw:
             rows.append((raw[:MAX_CHARS], _darken(color, 0.60)))
 
-    y_bottom = max(y1, len(rows) * (th + 2 * pad) + 4)
+    # Taxonomy rows (grey-slate family, above M/S/A)
+    taxonomy = win.get("taxonomy", {})
+    if taxonomy:
+        bs  = taxonomy.get("body_state", "")
+        ov  = taxonomy.get("obj_verb", "none")
+        on_ = taxonomy.get("obj_noun", "none")
+        sc  = taxonomy.get("social", "none")
+        se  = taxonomy.get("safety_event", "none")
+        ot  = taxonomy.get("other_text", "")
+
+        # Row: social_taxonomy  |  safety_event  (omit "none" entries to save space)
+        sc_str = f"SC:{sc}" if sc != "none" else ""
+        se_str = f"SE:{se}" if se != "none" else ""
+        ot_str = f"[{ot[:28]}]" if ot else ""
+        row_sc_se = "  ".join(filter(None, [sc_str, se_str, ot_str])) or "SC:none  SE:none"
+        rows.append((row_sc_se[:MAX_CHARS], (55, 45, 45)))  # dark burgundy
+
+        # Row: body_state  |  obj_verb → obj_noun
+        if ov != "none" and on_ != "none":
+            obj_part = f"OBJ:{ov}→{on_}"
+        elif ov != "none":
+            obj_part = f"OBJ:{ov}"
+        elif on_ != "none":
+            obj_part = f"OBJ:{on_}"
+        else:
+            obj_part = ""
+        row_bs = f"BS:{bs}" + (f"  {obj_part}" if obj_part else "")
+        rows.append((row_bs[:MAX_CHARS], (45, 45, 65)))  # dark slate blue
+
+    n_rows = len(rows)
+    y_bottom = max(y1, n_rows * (th + 2 * pad) + 4)
     for text, bg in rows:
         y_bottom = _draw_row(y_bottom, text, bg)
 
@@ -629,14 +764,18 @@ if __name__ == "__main__":
             # Annotated frames → (N, 3, H, W) tensor
             frames_tensor, _ = plm_transform._process_multiple_images_pil(annotated)
 
-            # PLM generative inference
+            # PLM generative inference — M/S/A
             responses, _, _ = generator.generate([(prompt, frames_tensor)])
             raw = responses[0].strip()
 
             motion, social, activity = _parse_plm_response(raw)
-            # social now contains the IDs PLM judged to be in physical contact
-            # (e.g. "d14709, d14713" or "none") — no separate appending needed.
             social_with_ids = social
+
+            # PLM generative inference — taxonomy (second call, same frames)
+            tax_prompt = _make_taxonomy_prompt(ident, nearby_ids)
+            tax_responses, _, _ = generator.generate([(tax_prompt, frames_tensor)])
+            tax_raw = tax_responses[0].strip()
+            taxonomy = _parse_taxonomy_response(tax_raw)
 
             win = {
                 "start_frame":        start_fr,
@@ -650,12 +789,18 @@ if __name__ == "__main__":
                     "nearby_ids": nearby_ids,
                 },
                 "activity":           activity,
+                "taxonomy":           taxonomy,
                 "description":        raw,
             }
             identity_windows[ident][wid] = win
 
             print(f"    [{ident}]  M:{motion!r}  S:{social_with_ids!r}  A:{activity!r}")
             print(f"      raw → {raw!r}")
+            print(f"      taxonomy → BS:{taxonomy['body_state']}  "
+                  f"OV:{taxonomy['obj_verb']}  ON:{taxonomy['obj_noun']}  "
+                  f"SC:{taxonomy['social']}  SE:{taxonomy['safety_event']}"
+                  + (f"  other:{taxonomy['other_text']!r}" if taxonomy['other_text'] else ""))
+            print(f"      tax_raw → {tax_raw!r}")
 
     print(f"\nReading {args.video} and running PLM on 2-sec full-frame clips …")
     cap = cv2.VideoCapture(args.video)

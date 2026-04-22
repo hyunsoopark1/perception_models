@@ -107,6 +107,20 @@ DATA_SCHEMA = """\
 #   social_interaction : dict
 #       label      : str        physical contact description or "none"
 #       nearby_ids : list[str]  IDs of people within close proximity
+#   taxonomy : dict          structured classification (separate PLM call)
+#       body_state   : str   idle_stand|idle_sit|walk|walk_loaded|run|bend|squat|
+#                            kneel|reach_overhead|reach_low|twist|crouch_sustained|
+#                            climb|fall|recover_balance|unknown
+#       obj_verb     : str   reach|grasp|lift|lower|carry|place|push|pull|drag|
+#                            stack|unstack|pack|unpack|scan|inspect|operate|
+#                            throw|catch|rotate|none
+#       obj_noun     : str   box|pallet|scanner|cart|forklift|ladder|tool|
+#                            document|shelf|bin|bag|package|none|<other>
+#       social       : str   none|talk|handover|receive|co_manipulate|
+#                            gesture_instruct|point
+#       safety_event : str   none|zone_enter|zone_exit|ppe_don|ppe_doff|
+#                            near_miss|hazard_response|fall
+#       other_text   : str   free text when no slot applies (else "")
 #   description : str        full raw model output
 
 # --- EXAMPLES ---
