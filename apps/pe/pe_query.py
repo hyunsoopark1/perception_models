@@ -56,7 +56,8 @@ CODEGEN_SYSTEM = (
     "  1. Use print() to output the answer.\n"
     "  2. Output ONLY the Python code — no explanation, no markdown fences.\n"
     "  3. Do not import any modules.\n"
-    "  4. Keep the code concise."
+    "  4. Keep the code concise.\n"
+    "  5. Never nest f-strings. Build complex strings in a separate variable first."
 )
 
 # Schema shown to the LLM every call (short enough to fit in context)
@@ -81,8 +82,10 @@ DATA_SCHEMA = """\
 #     near = [w for w in windows if 'd14718' in w['social_interaction']['nearby_ids']]
 #     if near:
 #         total = sum(w['end_sec'] - w['start_sec'] for w in near)
-#         spans = ', '.join(f"{w['start_sec']:.1f}s-{w['end_sec']:.1f}s" for w in near)
-#         print(f"{pid}: {total:.1f}s  ({spans})")
+#         spans = []
+#         for w in near:
+#             spans.append(f"{w['start_sec']:.1f}s-{w['end_sec']:.1f}s")
+#         print(f"{pid}: {total:.1f}s  ({', '.join(spans)})")
 
 # Q: find who puts a toy on the shelf and when
 # for pid, windows in data.items():
