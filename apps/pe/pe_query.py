@@ -267,8 +267,8 @@ def _parse_args() -> argparse.Namespace:
                    help="PLM checkpoint or HF model ID (default: facebook/Perception-LM-8B)")
     p.add_argument("--ids", nargs="*", metavar="ID",
                    help="Limit context to these identity IDs (default: all)")
-    p.add_argument("--max-new-tokens", type=int, default=300, metavar="N",
-                   help="Max tokens to generate per answer (default: 300)")
+    p.add_argument("--max-new-tokens", type=int, default=512, metavar="N",
+                   help="Max tokens to generate per answer (default: 512)")
     return p.parse_args()
 
 
