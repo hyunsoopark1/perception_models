@@ -124,10 +124,17 @@ def _load_text_generator(ckpt: str, max_new_tokens: int):
 
     text_tokenizer = _TextTok(tok_path)
 
+    # max_tokens must not exceed the model's RoPE limit (max_seqlen).
+    # freq_cis is precomputed only up to max_seqlen; exceeding it causes
+    # a shape mismatch in apply_rotary_emb that explodes silently on GPU.
+    rope_limit = plm_model.max_seqlen
+    effective_max = min(rope_limit, 32768)
+    print(f"  model max_seqlen (RoPE limit): {rope_limit}")
+
     gen_cfg = PackedCausalTransformerGeneratorArgs(
         temperature=0.0,
         max_gen_len=max_new_tokens,
-        max_tokens=32768,   # large enough for full-video context
+        max_tokens=effective_max,
         dtype="bf16",
         device="cuda",
     )
@@ -146,7 +153,9 @@ def _build_prompt(conv_template, context: str, question: str) -> str:
 
 def _ask(generator, conv_template, data: Dict, context_ids: List[str],
          question: str) -> str:
-    max_prompt_tokens = generator.max_tokens - generator.max_gen_len - 64
+    # Hard limit is the smaller of KV cache size and RoPE table size.
+    rope_limit = generator.model.max_seqlen
+    max_prompt_tokens = min(generator.max_tokens, rope_limit) - generator.max_gen_len - 64
 
     # Start with full context; if too long, drop oldest windows until it fits.
     recent_windows = {ident: len(data[ident]) for ident in context_ids if ident in data}
