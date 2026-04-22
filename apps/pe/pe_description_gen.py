@@ -600,12 +600,14 @@ def _draw_window_overlay(
         A: <activity>                        ← darkest, closest to box
         ┌[id]──── bbox ───────────────────┐
 
-    Compare mode (win["compare_attn_bias"] present) adds an AB group:
-        BS:...  OBJ:...                      ← taxonomy (shared, topmost)
-        SC:...  SE:...
-        AB·M: <ab motion>  A: <ab activity> ← attn-bias row (steel blue)
+    Compare mode (win["compare_attn_bias"] present):
+        AB·BS:...  OBJ:...                   ← AB taxonomy  (teal-slate, topmost)
+        AB·SC:...  SE:...                    ← AB taxonomy
+        AB▸ M:...  A:...  S:...             ← AB M/S/A     (steel blue)
         ─────────────────────────────────── ← thin separator
-        M: <default motion>                  ← default rows (identity color)
+        BS:...  OBJ:...                      ← DEF taxonomy (dark slate)
+        SC:...  SE:...                       ← DEF taxonomy
+        M: <default motion>                  ← DEF M/S/A   (identity color)
         S: <default social>
         A: <default activity>
         ┌[id]──── bbox ───────────────────┐
@@ -658,28 +660,59 @@ def _draw_window_overlay(
     # Build rows list bottom → top (index 0 = closest to box).
     rows: List[Tuple] = []  # (text, bg)  or  ("__SEP__", None) for separator
 
-    # Default M/S/A rows (identity-colored)
-    if activity:
-        rows.append((f"A: {activity[:MAX_CHARS]}", _darken(color, 0.38), None))
-    if social_lbl:
-        rows.append((f"S: {social_lbl[:MAX_CHARS]}", _darken(color, 0.60), None))
-    if motion:
-        rows.append((f"M: {motion[:MAX_CHARS]}", color, None))
+    def _tax_to_rows(tax: Dict, prefix: str = "",
+                     bg_sc_se=(55, 45, 45), bg_bs_obj=(45, 45, 65)) -> None:
+        """Append two taxonomy display rows (SC/SE then BS/OBJ) to `rows`."""
+        bs      = tax.get("body_state", "")
+        ov      = tax.get("obj_verb", "none")
+        on_     = tax.get("obj_noun", "none")
+        sc_dict = tax.get("social", {"label": "none", "with_ids": []})
+        se      = tax.get("safety_event", "none")
+        ot      = tax.get("other_text", "")
+        if isinstance(sc_dict, dict):
+            sc_label = sc_dict.get("label", "none")
+            sc_with  = sc_dict.get("with_ids", [])
+        else:
+            sc_label, sc_with = str(sc_dict), []
+        sc_str = (f"SC:{sc_label}[{','.join(sc_with)}]" if sc_label != "none" else "")
+        se_str = f"SE:{se}" if se != "none" else ""
+        ot_str = f"[{ot[:28]}]" if ot else ""
+        row_sc_se = "  ".join(filter(None, [sc_str, se_str, ot_str])) or "SC:none  SE:none"
+        rows.append(((prefix + row_sc_se)[:MAX_CHARS], bg_sc_se, None))
+        obj_part = (f"OBJ:{ov}→{on_}" if ov != "none" and on_ != "none"
+                    else f"OBJ:{ov}" if ov != "none"
+                    else f"OBJ:{on_}" if on_ != "none" else "")
+        row_bs = f"{prefix}BS:{bs}" + (f"  {obj_part}" if obj_part else "")
+        rows.append((row_bs[:MAX_CHARS], bg_bs_obj, None))
 
-    if not (motion or social_lbl or activity):
-        raw = win.get("description", "")
-        if raw:
-            rows.append((raw[:MAX_CHARS], _darken(color, 0.60), None))
-
-    # Attn-bias comparison rows (steel-blue family), separated by a rule
     if compare:
+        # ----------------------------------------------------------------
+        # Compare mode layout (bottom → top):
+        #   DEF M/S/A rows  (identity color)
+        #   DEF taxonomy    (dark slate)
+        #   ─── separator ──
+        #   AB▸ M/S/A row   (steel blue)
+        #   AB taxonomy     (lighter teal-slate, topmost)
+        # ----------------------------------------------------------------
+        if activity:
+            rows.append((f"A: {activity[:MAX_CHARS]}", _darken(color, 0.38), None))
+        if social_lbl:
+            rows.append((f"S: {social_lbl[:MAX_CHARS]}", _darken(color, 0.60), None))
+        if motion:
+            rows.append((f"M: {motion[:MAX_CHARS]}", color, None))
+
+        taxonomy = win.get("taxonomy", {})
+        if taxonomy:
+            _tax_to_rows(taxonomy, prefix="", bg_sc_se=(55, 45, 45), bg_bs_obj=(45, 45, 65))
+
         rows.append(("__SEP__", None, None))
+
+        # AB M/S/A (condensed into one row)
         ab_m = compare.get("motion", "")
         ab_a = compare.get("activity", "")
         ab_s_dict = compare.get("social", {})
         ab_s = (ab_s_dict.get("label", "") if isinstance(ab_s_dict, dict)
-                else str(ab_s_dict)) if ab_s_dict else compare.get("social_str", "")
-        # Condense AB M+A into one row to save vertical space
+                else str(ab_s_dict)) if ab_s_dict else ""
         ab_parts = []
         if ab_m:
             ab_parts.append(f"M:{ab_m}")
@@ -688,37 +721,35 @@ def _draw_window_overlay(
         if ab_s:
             ab_parts.append(f"S:{ab_s}")
         if ab_parts:
-            rows.append((("AB▸ " + "  ".join(ab_parts))[:MAX_CHARS],
-                         (80, 60, 30), None))   # dark steel-blue (BGR)
+            rows.append((("AB▸ " + "  ".join(ab_parts))[:MAX_CHARS], (80, 60, 30), None))
 
-    # Taxonomy rows (grey-slate, topmost)
-    taxonomy = win.get("taxonomy", {})
-    if taxonomy:
-        bs      = taxonomy.get("body_state", "")
-        ov      = taxonomy.get("obj_verb", "none")
-        on_     = taxonomy.get("obj_noun", "none")
-        sc_dict = taxonomy.get("social", {"label": "none", "with_ids": []})
-        se      = taxonomy.get("safety_event", "none")
-        ot      = taxonomy.get("other_text", "")
+        # AB taxonomy (lighter teal-slate so it's visually distinct from DEF taxonomy)
+        ab_taxonomy = compare.get("taxonomy", {})
+        if ab_taxonomy:
+            _tax_to_rows(ab_taxonomy, prefix="AB·",
+                         bg_sc_se=(85, 65, 50), bg_bs_obj=(65, 65, 90))
 
-        if isinstance(sc_dict, dict):
-            sc_label = sc_dict.get("label", "none")
-            sc_with  = sc_dict.get("with_ids", [])
-        else:
-            sc_label, sc_with = str(sc_dict), []
+    else:
+        # ----------------------------------------------------------------
+        # Normal mode layout (bottom → top):
+        #   M/S/A rows  (identity color)
+        #   taxonomy    (dark slate, topmost)
+        # ----------------------------------------------------------------
+        if activity:
+            rows.append((f"A: {activity[:MAX_CHARS]}", _darken(color, 0.38), None))
+        if social_lbl:
+            rows.append((f"S: {social_lbl[:MAX_CHARS]}", _darken(color, 0.60), None))
+        if motion:
+            rows.append((f"M: {motion[:MAX_CHARS]}", color, None))
 
-        sc_str = (f"SC:{sc_label}[{','.join(sc_with)}]"
-                  if sc_label != "none" else "")
-        se_str = f"SE:{se}" if se != "none" else ""
-        ot_str = f"[{ot[:28]}]" if ot else ""
-        row_sc_se = "  ".join(filter(None, [sc_str, se_str, ot_str])) or "SC:none  SE:none"
-        rows.append((row_sc_se[:MAX_CHARS], (55, 45, 45), None))
+        if not (motion or social_lbl or activity):
+            raw = win.get("description", "")
+            if raw:
+                rows.append((raw[:MAX_CHARS], _darken(color, 0.60), None))
 
-        obj_part = (f"OBJ:{ov}→{on_}" if ov != "none" and on_ != "none"
-                    else f"OBJ:{ov}" if ov != "none"
-                    else f"OBJ:{on_}" if on_ != "none" else "")
-        row_bs = f"BS:{bs}" + (f"  {obj_part}" if obj_part else "")
-        rows.append((row_bs[:MAX_CHARS], (45, 45, 65), None))
+        taxonomy = win.get("taxonomy", {})
+        if taxonomy:
+            _tax_to_rows(taxonomy, prefix="", bg_sc_se=(55, 45, 45), bg_bs_obj=(45, 45, 65))
 
     n_real_rows = sum(1 for r in rows if r[0] != "__SEP__")
     y_bottom = max(y1, n_real_rows * (th + 2 * pad) + len(rows) + 4)
@@ -894,29 +925,7 @@ if __name__ == "__main__":
             )
 
             # ----------------------------------------------------------
-            # Helper: run one attn-bias M/S/A inference
-            # ----------------------------------------------------------
-            def _run_attn_bias_msa(ft):
-                ab_prompt = _make_attn_bias_prompt(ident, nearby_ids)
-                ip, sl = get_image_patch_positions(generator.tokenizer, ab_prompt, ft)
-                bm = compute_bbox_bias_mask(
-                    ip, bbox_coords,
-                    patches_per_frame=_patches_per_frm,
-                    n_patches_side=_n_patches_side,
-                    orig_w=frame_w, orig_h=frame_h,
-                    image_size=_vis_image_size,
-                    seq_len=sl, bias=args.bbox_bias,
-                )
-                with bbox_attention_bias(bm):
-                    ab_resp, _, _ = generator.generate([(ab_prompt, ft)])
-                ab_raw = ab_resp[0].strip()
-                ab_m, ab_s, ab_a = _parse_plm_response(ab_raw)
-                print(f"      [AB] M:{ab_m!r}  S:{ab_s!r}  A:{ab_a!r}")
-                print(f"      [AB] raw → {ab_raw!r}")
-                return ab_m, ab_s, ab_a, ab_raw
-
-            # ----------------------------------------------------------
-            # Build frame tensors for each mode
+            # Build frame tensors (done once, shared across helpers)
             # ----------------------------------------------------------
             ann_color = _identity_color(ident)
             annotated = [
@@ -927,78 +936,101 @@ if __name__ == "__main__":
                 )
                 for fidx, (cx, cy, w, h) in zip(frame_indices, bbox_coords)
             ]
-            frames_ann, _  = plm_transform._process_multiple_images_pil(annotated)
-            frames_raw, _  = plm_transform._process_multiple_images_pil(pil_frames)
+            frames_ann, _ = plm_transform._process_multiple_images_pil(annotated)
+            frames_raw, _ = plm_transform._process_multiple_images_pil(pil_frames)
 
             # ----------------------------------------------------------
-            # Compare mode — run both and store side-by-side results
+            # Helpers: one attn-bias M/S/A call, one attn-bias taxonomy call
             # ----------------------------------------------------------
-            if args.compare:
-                # Default M/S/A
-                def_prompt = _make_prompt(ident, nearby_ids)
-                def_resp, _, _ = generator.generate([(def_prompt, frames_ann)])
-                def_raw = def_resp[0].strip()
-                motion, social, activity = _parse_plm_response(def_raw)
-                print(f"    [{ident}] [DEF] M:{motion!r}  S:{social!r}  A:{activity!r}")
-                print(f"      [DEF] raw → {def_raw!r}")
-
-                # Attn-bias M/S/A
-                ab_motion, ab_social, ab_activity, ab_raw = _run_attn_bias_msa(frames_raw)
-
-                # Taxonomy (run once, default frames)
-                tax_prompt = _make_taxonomy_prompt(ident, nearby_ids)
-                tax_resp, _, _ = generator.generate([(tax_prompt, frames_ann)])
-                raw = def_raw
-                compare_msa = {
-                    "motion": ab_motion, "social": ab_social, "activity": ab_activity,
-                    "description": ab_raw,
-                }
-
-            elif args.attn_bias:
-                # ---- Attn-bias only ----
-                motion, social, activity, raw = ("", "", "", "") if args.no_msa else \
-                    _run_attn_bias_msa(frames_raw) + ("",)[-1:]  # unpack 4-tuple
-
-                # Re-run properly to avoid tuple confusion
-                if not args.no_msa:
-                    motion, social, activity, raw = _run_attn_bias_msa(frames_raw)
-                else:
-                    motion = social = activity = raw = ""
-
-                tax_prompt = _make_attn_bias_taxonomy_prompt(ident, nearby_ids)
-                tax_ip, tax_sl = get_image_patch_positions(
-                    generator.tokenizer, tax_prompt, frames_raw
-                )
-                tax_bm = compute_bbox_bias_mask(
-                    tax_ip, bbox_coords,
+            def _ab_bias_mask(prompt_str, ft):
+                ip, sl = get_image_patch_positions(generator.tokenizer, prompt_str, ft)
+                return compute_bbox_bias_mask(
+                    ip, bbox_coords,
                     patches_per_frame=_patches_per_frm,
                     n_patches_side=_n_patches_side,
                     orig_w=frame_w, orig_h=frame_h,
                     image_size=_vis_image_size,
-                    seq_len=tax_sl, bias=args.bbox_bias,
+                    seq_len=sl, bias=args.bbox_bias,
                 )
-                with bbox_attention_bias(tax_bm):
-                    tax_resp, _, _ = generator.generate([(tax_prompt, frames_raw)])
-                compare_msa = None
+
+            def _run_ab_msa(ft):
+                p = _make_attn_bias_prompt(ident, nearby_ids)
+                with bbox_attention_bias(_ab_bias_mask(p, ft)):
+                    r, _, _ = generator.generate([(p, ft)])
+                raw_ = r[0].strip()
+                m, s, a = _parse_plm_response(raw_)
+                print(f"      [AB] M:{m!r}  S:{s!r}  A:{a!r}")
+                print(f"      [AB] raw → {raw_!r}")
+                return m, s, a, raw_
+
+            def _run_ab_taxonomy(ft):
+                p = _make_attn_bias_taxonomy_prompt(ident, nearby_ids)
+                with bbox_attention_bias(_ab_bias_mask(p, ft)):
+                    r, _, _ = generator.generate([(p, ft)])
+                raw_ = r[0].strip()
+                tax_ = _parse_taxonomy_response(raw_, nearby_ids)
+                sc_d_ = tax_['social']
+                sc_s_ = (f"{sc_d_['label']} {sc_d_['with_ids']}"
+                         if isinstance(sc_d_, dict) else str(sc_d_))
+                print(f"      [AB] taxonomy → BS:{tax_['body_state']}  "
+                      f"OV:{tax_['obj_verb']}  ON:{tax_['obj_noun']}  "
+                      f"SC:{sc_s_}  SE:{tax_['safety_event']}")
+                return tax_
+
+            # ----------------------------------------------------------
+            # Dispatch by mode
+            # ----------------------------------------------------------
+            if args.compare:
+                # Default M/S/A
+                def_p = _make_prompt(ident, nearby_ids)
+                def_r, _, _ = generator.generate([(def_p, frames_ann)])
+                raw = def_r[0].strip()
+                motion, social, activity = _parse_plm_response(raw)
+                print(f"    [{ident}] [DEF] M:{motion!r}  S:{social!r}  A:{activity!r}")
+
+                # Default taxonomy
+                tax_p = _make_taxonomy_prompt(ident, nearby_ids)
+                tax_r, _, _ = generator.generate([(tax_p, frames_ann)])
+                tax_raw = tax_r[0].strip()
+                taxonomy = _parse_taxonomy_response(tax_raw, nearby_ids)
+
+                # Attn-bias M/S/A + taxonomy
+                ab_motion, ab_social, ab_activity, ab_raw = _run_ab_msa(frames_raw)
+                ab_taxonomy = _run_ab_taxonomy(frames_raw)
+
+                compare_ab = {
+                    "motion":    ab_motion,
+                    "social":    ab_social,
+                    "activity":  ab_activity,
+                    "taxonomy":  ab_taxonomy,
+                    "description": ab_raw,
+                }
+
+            elif args.attn_bias:
+                if not args.no_msa:
+                    motion, social, activity, raw = _run_ab_msa(frames_raw)
+                else:
+                    motion = social = activity = raw = ""
+                taxonomy  = _run_ab_taxonomy(frames_raw)
+                compare_ab = None
 
             else:
-                # ---- Default only ----
-                def_prompt = _make_prompt(ident, nearby_ids)
+                # Default only
+                def_p = _make_prompt(ident, nearby_ids)
                 if not args.no_msa:
-                    def_resp, _, _ = generator.generate([(def_prompt, frames_ann)])
-                    raw = def_resp[0].strip()
+                    def_r, _, _ = generator.generate([(def_p, frames_ann)])
+                    raw = def_r[0].strip()
                     motion, social, activity = _parse_plm_response(raw)
                     print(f"    [{ident}]  M:{motion!r}  S:{social!r}  A:{activity!r}")
                     print(f"      raw → {raw!r}")
                 else:
                     motion = social = activity = raw = ""
 
-                tax_prompt = _make_taxonomy_prompt(ident, nearby_ids)
-                tax_resp, _, _ = generator.generate([(tax_prompt, frames_ann)])
-                compare_msa = None
-
-            tax_raw = tax_resp[0].strip()
-            taxonomy = _parse_taxonomy_response(tax_raw, nearby_ids)
+                tax_p = _make_taxonomy_prompt(ident, nearby_ids)
+                tax_r, _, _ = generator.generate([(tax_p, frames_ann)])
+                tax_raw = tax_r[0].strip()
+                taxonomy = _parse_taxonomy_response(tax_raw, nearby_ids)
+                compare_ab = None
 
             sc_d = taxonomy['social']
             sc_str = (f"{sc_d['label']} {sc_d['with_ids']}"
@@ -1007,7 +1039,6 @@ if __name__ == "__main__":
                   f"OV:{taxonomy['obj_verb']}  ON:{taxonomy['obj_noun']}  "
                   f"SC:{sc_str}  SE:{taxonomy['safety_event']}"
                   + (f"  other:{taxonomy['other_text']!r}" if taxonomy['other_text'] else ""))
-            print(f"      tax_raw → {tax_raw!r}")
 
             win = {
                 "start_frame":        start_fr,
@@ -1024,8 +1055,8 @@ if __name__ == "__main__":
                 "taxonomy":           taxonomy,
                 "description":        raw,
             }
-            if compare_msa is not None:
-                win["compare_attn_bias"] = compare_msa
+            if compare_ab is not None:
+                win["compare_attn_bias"] = compare_ab
             identity_windows[ident][wid] = win
 
     print(f"\nReading {args.video} and running PLM on 2-sec full-frame clips …")
