@@ -96,25 +96,35 @@ from PIL import Image as PILImage
 # Prompt builder — per identity, per window
 # ---------------------------------------------------------------------------
 
-def _make_prompt(ident: str) -> str:
+def _make_prompt(ident: str, nearby_ids: List[str]) -> str:
     """
     Build the PLM prompt for one identity + window.
 
     Each frame has:
       - A colored rectangle following the target person (ID '{ident}').
-      - Grey rectangles with ID labels on all other tracked people.
-    PLM reads the IDs visually from the image to answer the Social field.
+      - Grey rectangles on all other tracked people in the vicinity.
+    nearby_ids are passed as text so PLM never needs to read image labels.
     """
+    if nearby_ids:
+        nearby_text = ", ".join(nearby_ids)
+        social_instruction = (
+            f"Social: <from this list of nearby people [{nearby_text}], "
+            f"list only those that this person is physically touching "
+            f"(e.g. hugging, holding hands, lifting). "
+            f"Use their exact IDs. If none, write 'none'.>"
+        )
+    else:
+        social_instruction = "Social: none"
+
     return (
         f"Watch this video clip carefully. "
         f"One person is highlighted with a colored rectangle across all frames. "
-        f"All other tracked people are shown with grey rectangles and their ID labels. "
+        f"All other nearby people are shown with grey rectangles. "
         f"Describe only the person inside the colored rectangle. "
         f"Reply in plain English only — do not output coordinates, frame numbers, or timestamps. "
         f"Use this exact format:\n"
         f"Motion: <how this person is moving, in 2-5 words>\n"
-        f"Social: <IDs of people shown in grey that this person is physically "
-        f"touching (e.g. hugging, holding hands, lifting), or 'none'>\n"
+        f"{social_instruction}\n"
         f"Activity: <what this person is doing, in 2-5 words>\n"
         f"If a field is not clearly visible write 'unclear'."
     )
@@ -603,7 +613,7 @@ if __name__ == "__main__":
                 args.proximity_scale, max_frames,
             )
 
-            prompt = _make_prompt(ident)
+            prompt = _make_prompt(ident, nearby_ids)
 
             # Annotate: all others in grey with IDs, then target in color on top
             ann_color = _identity_color(ident)
