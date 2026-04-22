@@ -90,9 +90,12 @@ CODEGEN_SYSTEM = (
 
 LANGUAGE_SYSTEM = (
     "You are an assistant analyzing person tracking and behavior data from a video. "
-    "Each person has a list of 6-second windows with fields: "
-    "motion (body movement), activity (what they are doing), "
-    "social (physical contact), and nearby (close proximity). "
+    "Each person has 6-second windows. Each window may contain:\n"
+    "  - motion/activity/social: free-text M/S/A fields (may be empty if not collected)\n"
+    "  - taxonomy: structured labels — body_state (pose), obj_verb+obj_noun (object interaction), "
+    "social {label, with_ids} (social interaction with named person IDs), "
+    "safety_event (safety classification)\n"
+    "When M/S/A fields are empty, rely on taxonomy. "
     "Answer in clear natural language. Always cite specific timestamps."
 )
 
@@ -143,6 +146,36 @@ DATA_SCHEMA = """\
 #     for w in windows:
 #         if 'shelf' in w['activity'].lower() or 'shelf' in w['motion'].lower():
 #             print(f"{pid}: {w['start_sec']:.1f}s-{w['end_sec']:.1f}s  {w['activity']}")
+
+# Q: list body state of d14717 over time
+# for w in data['d14717']:
+#     tax = w.get('taxonomy', {})
+#     print(f"{w['start_sec']:.1f}s: {tax.get('body_state', 'unknown')}")
+
+# Q: find all lifting events and who did them
+# for pid, windows in data.items():
+#     for w in windows:
+#         tax = w.get('taxonomy', {})
+#         if tax.get('obj_verb') == 'lift':
+#             on = tax.get('obj_noun', '')
+#             print(f"{pid}: {w['start_sec']:.1f}s-{w['end_sec']:.1f}s  obj={on}")
+
+# Q: find all co_manipulate interactions
+# for pid, windows in data.items():
+#     for w in windows:
+#         tax = w.get('taxonomy', {})
+#         sc = tax.get('social', {})
+#         if isinstance(sc, dict) and sc.get('label') == 'co_manipulate':
+#             with_str = ', '.join(sc.get('with_ids', []))
+#             print(f"{pid}: {w['start_sec']:.1f}s  with=[{with_str}]")
+
+# Q: list safety events
+# for pid, windows in data.items():
+#     for w in windows:
+#         tax = w.get('taxonomy', {})
+#         se = tax.get('safety_event', 'none')
+#         if se != 'none':
+#             print(f"{pid}: {w['start_sec']:.1f}s-{w['end_sec']:.1f}s  {se}")
 """
 
 
@@ -245,16 +278,54 @@ def _format_context(data: Dict, ids: List[str], max_windows: int = 10) -> str:
         lines.append(f"Person {ident}:")
         for w in data[ident][-max_windows:]:
             t0, t1 = w.get("start_sec", "?"), w.get("end_sec", "?")
-            motion   = w.get("motion", "")   or "unclear"
-            activity = w.get("activity", "") or "unclear"
+            motion   = w.get("motion", "")   or ""
+            activity = w.get("activity", "") or ""
             si       = w.get("social_interaction", {}) or {}
-            social   = (si.get("label", "") if isinstance(si, dict) else str(si)) or "none"
+            social   = (si.get("label", "") if isinstance(si, dict) else str(si)) or ""
             nearby   = si.get("nearby_ids", []) if isinstance(si, dict) else []
-            nb       = f"  nearby=[{', '.join(nearby)}]" if nearby else ""
-            lines.append(
-                f"  [{t0:.1f}s-{t1:.1f}s] "
-                f"motion={motion!r}  activity={activity!r}  social={social!r}{nb}"
-            )
+
+            # M/S/A fields (omit if empty — happens with --no-msa)
+            msa_parts = []
+            if motion:
+                msa_parts.append(f"motion={motion!r}")
+            if activity:
+                msa_parts.append(f"activity={activity!r}")
+            if social:
+                msa_parts.append(f"social={social!r}")
+            if nearby:
+                msa_parts.append(f"nearby=[{', '.join(nearby)}]")
+
+            # Taxonomy fields
+            tax = w.get("taxonomy", {}) or {}
+            tax_parts = []
+            bs  = tax.get("body_state", "")
+            ov  = tax.get("obj_verb", "none")
+            on_ = tax.get("obj_noun", "none")
+            sc  = tax.get("social", {})
+            se  = tax.get("safety_event", "none")
+            ot  = tax.get("other_text", "")
+            if bs:
+                tax_parts.append(f"BS={bs}")
+            if ov != "none":
+                tax_parts.append(f"OV={ov}")
+            if on_ != "none":
+                tax_parts.append(f"ON={on_}")
+            if isinstance(sc, dict) and sc.get("label", "none") != "none":
+                sc_str = sc["label"]
+                if sc.get("with_ids"):
+                    sc_str += f"[{','.join(sc['with_ids'])}]"
+                tax_parts.append(f"SC={sc_str}")
+            if se != "none":
+                tax_parts.append(f"SE={se}")
+            if ot:
+                tax_parts.append(f"other={ot!r}")
+
+            row = f"  [{t0:.1f}s-{t1:.1f}s]"
+            if msa_parts:
+                row += "  " + "  ".join(msa_parts)
+            if tax_parts:
+                row += "  taxonomy: " + "  ".join(tax_parts)
+            lines.append(row)
     return "\n".join(lines)
 
 
