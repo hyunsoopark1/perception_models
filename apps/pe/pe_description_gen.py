@@ -367,6 +367,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Skip the Motion/Social/Activity PLM call; run taxonomy only.")
     p.add_argument("--no-video", action="store_true",
                    help="Skip video rendering.")
+    p.add_argument("--compare", action="store_true",
+                   help="Run both default (colored-box) and attn-bias modes on every "
+                        "clip and render both result sets on the overlay video side-by-side "
+                        "for direct comparison. Implies --attn-bias is available.")
     p.add_argument("--font-scale", type=float, default=0.42,
                    help="cv2 font scale for overlay labels (default: 0.42).")
     p.add_argument("--pretty", action="store_true",
@@ -586,38 +590,53 @@ def _draw_window_overlay(
     font_scale: float,
 ) -> None:
     """
-    Draw bbox with identity badge and label rows stacked above it (bottom → top):
+    Draw bbox with identity badge and label rows stacked above it (bottom → top).
 
-        BS:<body_state>  OBJ:<verb>→<noun>   ← taxonomy row 2 (topmost)
-        SC:<social_tax>  SE:<safety_event>   ← taxonomy row 1
+    Normal mode:
+        BS:<body_state>  OBJ:<verb>→<noun>   ← taxonomy (topmost, dark slate)
+        SC:<social_tax>  SE:<safety_event>   ← taxonomy (dark burgundy)
         M: <motion>                          ← identity color
         S: <social_desc>                     ← darker
         A: <activity>                        ← darkest, closest to box
         ┌[id]──── bbox ───────────────────┐
-        │                                 │
-        └─────────────────────────────────┘
+
+    Compare mode (win["compare_attn_bias"] present) adds an AB group:
+        BS:...  OBJ:...                      ← taxonomy (shared, topmost)
+        SC:...  SE:...
+        AB·M: <ab motion>  A: <ab activity> ← attn-bias row (steel blue)
+        ─────────────────────────────────── ← thin separator
+        M: <default motion>                  ← default rows (identity color)
+        S: <default social>
+        A: <default activity>
+        ┌[id]──── bbox ───────────────────┐
     """
     import cv2
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     ft   = 1
     pad  = 3
-    MAX_CHARS = 72   # truncate long text to prevent horizontal overflow
+    MAX_CHARS = 72
     (_, th), baseline = cv2.getTextSize("A", font, font_scale, ft)
 
-    def _draw_row(y_bottom: int, text: str, bg: Tuple) -> int:
-        """Draw a filled label row; returns the top y of the drawn row."""
+    def _draw_row(y_bottom: int, text: str, bg: Tuple,
+                  text_color: Tuple = (255, 255, 255)) -> int:
         (tw, _), _ = cv2.getTextSize(text, font, font_scale, ft)
         y_top = y_bottom - th - 2 * pad
         cv2.rectangle(frame, (x1, y_top), (x1 + tw + 2 * pad, y_bottom), bg, -1)
         cv2.putText(frame, text, (x1 + pad, y_bottom - pad - baseline),
-                    font, font_scale, (255, 255, 255), ft, cv2.LINE_AA)
+                    font, font_scale, text_color, ft, cv2.LINE_AA)
         return y_top
+
+    def _draw_separator(y_bottom: int) -> int:
+        """Thin 1-px rule to visually separate compare groups."""
+        cv2.line(frame, (x1, y_bottom - 1), (x1 + 180, y_bottom - 1),
+                 (180, 180, 180), 1)
+        return y_bottom - 2
 
     # --- bounding box ---
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-    # --- identity badge pinned to top-left corner of box ---
+    # --- identity badge ---
     id_tag = f"[{ident}]"
     (tw, _), _ = cv2.getTextSize(id_tag, font, font_scale, ft)
     cv2.rectangle(frame, (x1, y1), (x1 + tw + 2 * pad, y1 + th + 2 * pad), color, -1)
@@ -627,74 +646,87 @@ def _draw_window_overlay(
     if win is None:
         return
 
-    # --- collect M/S/A field values ---
+    # --- collect field values ---
     motion      = win.get("motion", "")
     social_dict = win.get("social_interaction", {})
     activity    = win.get("activity", "")
     social_lbl  = (social_dict.get("label", "")
                    if isinstance(social_dict, dict) else str(social_dict))
 
-    # Build rows list (bottom → top; index 0 = closest to box = drawn first).
-    rows: List[Tuple[str, Tuple]] = []
+    compare = win.get("compare_attn_bias")  # present only in --compare mode
 
-    # M/S/A rows (identity-colored family)
+    # Build rows list bottom → top (index 0 = closest to box).
+    rows: List[Tuple] = []  # (text, bg)  or  ("__SEP__", None) for separator
+
+    # Default M/S/A rows (identity-colored)
     if activity:
-        rows.append((f"A: {activity[:MAX_CHARS]}", _darken(color, 0.38)))
+        rows.append((f"A: {activity[:MAX_CHARS]}", _darken(color, 0.38), None))
     if social_lbl:
-        rows.append((f"S: {social_lbl[:MAX_CHARS]}", _darken(color, 0.60)))
+        rows.append((f"S: {social_lbl[:MAX_CHARS]}", _darken(color, 0.60), None))
     if motion:
-        rows.append((f"M: {motion[:MAX_CHARS]}", color))
+        rows.append((f"M: {motion[:MAX_CHARS]}", color, None))
 
-    # Fallback when PLM parsing produced nothing
-    if not rows:
+    if not (motion or social_lbl or activity):
         raw = win.get("description", "")
         if raw:
-            rows.append((raw[:MAX_CHARS], _darken(color, 0.60)))
+            rows.append((raw[:MAX_CHARS], _darken(color, 0.60), None))
 
-    # Taxonomy rows (grey-slate family, above M/S/A)
+    # Attn-bias comparison rows (steel-blue family), separated by a rule
+    if compare:
+        rows.append(("__SEP__", None, None))
+        ab_m = compare.get("motion", "")
+        ab_a = compare.get("activity", "")
+        ab_s_dict = compare.get("social", {})
+        ab_s = (ab_s_dict.get("label", "") if isinstance(ab_s_dict, dict)
+                else str(ab_s_dict)) if ab_s_dict else compare.get("social_str", "")
+        # Condense AB M+A into one row to save vertical space
+        ab_parts = []
+        if ab_m:
+            ab_parts.append(f"M:{ab_m}")
+        if ab_a:
+            ab_parts.append(f"A:{ab_a}")
+        if ab_s:
+            ab_parts.append(f"S:{ab_s}")
+        if ab_parts:
+            rows.append((("AB▸ " + "  ".join(ab_parts))[:MAX_CHARS],
+                         (80, 60, 30), None))   # dark steel-blue (BGR)
+
+    # Taxonomy rows (grey-slate, topmost)
     taxonomy = win.get("taxonomy", {})
     if taxonomy:
-        bs       = taxonomy.get("body_state", "")
-        ov       = taxonomy.get("obj_verb", "none")
-        on_      = taxonomy.get("obj_noun", "none")
-        sc_dict  = taxonomy.get("social", {"label": "none", "with_ids": []})
-        se       = taxonomy.get("safety_event", "none")
-        ot       = taxonomy.get("other_text", "")
+        bs      = taxonomy.get("body_state", "")
+        ov      = taxonomy.get("obj_verb", "none")
+        on_     = taxonomy.get("obj_noun", "none")
+        sc_dict = taxonomy.get("social", {"label": "none", "with_ids": []})
+        se      = taxonomy.get("safety_event", "none")
+        ot      = taxonomy.get("other_text", "")
 
-        # Unpack social dict
         if isinstance(sc_dict, dict):
-            sc_label   = sc_dict.get("label", "none")
-            sc_with    = sc_dict.get("with_ids", [])
+            sc_label = sc_dict.get("label", "none")
+            sc_with  = sc_dict.get("with_ids", [])
         else:
             sc_label, sc_with = str(sc_dict), []
 
-        # Row: social_taxonomy (with IDs)  |  safety_event
-        if sc_label != "none":
-            ids_str = f"[{','.join(sc_with)}]" if sc_with else ""
-            sc_str  = f"SC:{sc_label}{ids_str}"
-        else:
-            sc_str = ""
+        sc_str = (f"SC:{sc_label}[{','.join(sc_with)}]"
+                  if sc_label != "none" else "")
         se_str = f"SE:{se}" if se != "none" else ""
         ot_str = f"[{ot[:28]}]" if ot else ""
         row_sc_se = "  ".join(filter(None, [sc_str, se_str, ot_str])) or "SC:none  SE:none"
-        rows.append((row_sc_se[:MAX_CHARS], (55, 45, 45)))  # dark burgundy
+        rows.append((row_sc_se[:MAX_CHARS], (55, 45, 45), None))
 
-        # Row: body_state  |  obj_verb → obj_noun
-        if ov != "none" and on_ != "none":
-            obj_part = f"OBJ:{ov}→{on_}"
-        elif ov != "none":
-            obj_part = f"OBJ:{ov}"
-        elif on_ != "none":
-            obj_part = f"OBJ:{on_}"
-        else:
-            obj_part = ""
+        obj_part = (f"OBJ:{ov}→{on_}" if ov != "none" and on_ != "none"
+                    else f"OBJ:{ov}" if ov != "none"
+                    else f"OBJ:{on_}" if on_ != "none" else "")
         row_bs = f"BS:{bs}" + (f"  {obj_part}" if obj_part else "")
-        rows.append((row_bs[:MAX_CHARS], (45, 45, 65)))  # dark slate blue
+        rows.append((row_bs[:MAX_CHARS], (45, 45, 65), None))
 
-    n_rows = len(rows)
-    y_bottom = max(y1, n_rows * (th + 2 * pad) + 4)
-    for text, bg in rows:
-        y_bottom = _draw_row(y_bottom, text, bg)
+    n_real_rows = sum(1 for r in rows if r[0] != "__SEP__")
+    y_bottom = max(y1, n_real_rows * (th + 2 * pad) + len(rows) + 4)
+    for text, bg, _ in rows:
+        if text == "__SEP__":
+            y_bottom = _draw_separator(y_bottom)
+        else:
+            y_bottom = _draw_row(y_bottom, text, bg)
 
 
 # ---------------------------------------------------------------------------
@@ -759,7 +791,7 @@ if __name__ == "__main__":
     _n_patches_side  = _vis_image_size // _tok_patch_size // _tok_pool_ratio
     _patches_per_frm = _n_patches_side ** 2
 
-    if args.attn_bias:
+    if args.attn_bias or args.compare:
         from apps.pe.pe_attn_bias import (
             bbox_attention_bias,
             compute_bbox_bias_mask,
@@ -861,83 +893,111 @@ if __name__ == "__main__":
                 args.proximity_scale, max_frames,
             )
 
-            if args.attn_bias:
-                # ---- Attention-bias mode: raw frames, SDPA bias steers focus ----
-                prompt = _make_attn_bias_prompt(ident, nearby_ids)
-                tax_prompt = _make_attn_bias_taxonomy_prompt(ident, nearby_ids)
-                frames_tensor, _ = plm_transform._process_multiple_images_pil(pil_frames)
-
-                image_pos, seq_len = get_image_patch_positions(
-                    generator.tokenizer, prompt, frames_tensor
-                )
-                bias_mask = compute_bbox_bias_mask(
-                    image_pos, bbox_coords,
+            # ----------------------------------------------------------
+            # Helper: run one attn-bias M/S/A inference
+            # ----------------------------------------------------------
+            def _run_attn_bias_msa(ft):
+                ab_prompt = _make_attn_bias_prompt(ident, nearby_ids)
+                ip, sl = get_image_patch_positions(generator.tokenizer, ab_prompt, ft)
+                bm = compute_bbox_bias_mask(
+                    ip, bbox_coords,
                     patches_per_frame=_patches_per_frm,
                     n_patches_side=_n_patches_side,
                     orig_w=frame_w, orig_h=frame_h,
                     image_size=_vis_image_size,
-                    seq_len=seq_len,
-                    bias=args.bbox_bias,
+                    seq_len=sl, bias=args.bbox_bias,
                 )
-                n_bias_tokens = int((bias_mask > 0).sum().item())
-                print(f"    [{ident}]  attn-bias: {n_bias_tokens} bbox patches biased")
+                with bbox_attention_bias(bm):
+                    ab_resp, _, _ = generator.generate([(ab_prompt, ft)])
+                ab_raw = ab_resp[0].strip()
+                ab_m, ab_s, ab_a = _parse_plm_response(ab_raw)
+                print(f"      [AB] M:{ab_m!r}  S:{ab_s!r}  A:{ab_a!r}")
+                print(f"      [AB] raw → {ab_raw!r}")
+                return ab_m, ab_s, ab_a, ab_raw
 
-                # PLM call 1 — M/S/A (optional)
+            # ----------------------------------------------------------
+            # Build frame tensors for each mode
+            # ----------------------------------------------------------
+            ann_color = _identity_color(ident)
+            annotated = [
+                _annotate_frame_target(
+                    _annotate_frame_base(frame_cache[fidx],
+                                         other_frame_bboxes.get(fidx, {})),
+                    cx, cy, w, h, ann_color,
+                )
+                for fidx, (cx, cy, w, h) in zip(frame_indices, bbox_coords)
+            ]
+            frames_ann, _  = plm_transform._process_multiple_images_pil(annotated)
+            frames_raw, _  = plm_transform._process_multiple_images_pil(pil_frames)
+
+            # ----------------------------------------------------------
+            # Compare mode — run both and store side-by-side results
+            # ----------------------------------------------------------
+            if args.compare:
+                # Default M/S/A
+                def_prompt = _make_prompt(ident, nearby_ids)
+                def_resp, _, _ = generator.generate([(def_prompt, frames_ann)])
+                def_raw = def_resp[0].strip()
+                motion, social, activity = _parse_plm_response(def_raw)
+                print(f"    [{ident}] [DEF] M:{motion!r}  S:{social!r}  A:{activity!r}")
+                print(f"      [DEF] raw → {def_raw!r}")
+
+                # Attn-bias M/S/A
+                ab_motion, ab_social, ab_activity, ab_raw = _run_attn_bias_msa(frames_raw)
+
+                # Taxonomy (run once, default frames)
+                tax_prompt = _make_taxonomy_prompt(ident, nearby_ids)
+                tax_resp, _, _ = generator.generate([(tax_prompt, frames_ann)])
+                raw = def_raw
+                compare_msa = {
+                    "motion": ab_motion, "social": ab_social, "activity": ab_activity,
+                    "description": ab_raw,
+                }
+
+            elif args.attn_bias:
+                # ---- Attn-bias only ----
+                motion, social, activity, raw = ("", "", "", "") if args.no_msa else \
+                    _run_attn_bias_msa(frames_raw) + ("",)[-1:]  # unpack 4-tuple
+
+                # Re-run properly to avoid tuple confusion
                 if not args.no_msa:
-                    with bbox_attention_bias(bias_mask):
-                        responses, _, _ = generator.generate([(prompt, frames_tensor)])
-                    raw = responses[0].strip()
-                    motion, social, activity = _parse_plm_response(raw)
-                    print(f"      M:{motion!r}  S:{social!r}  A:{activity!r}")
-                    print(f"      raw → {raw!r}")
+                    motion, social, activity, raw = _run_attn_bias_msa(frames_raw)
                 else:
                     motion = social = activity = raw = ""
 
-                # PLM call 2 — taxonomy
-                # Recompute image_pos for the taxonomy prompt (different token count)
-                tax_image_pos, tax_seq_len = get_image_patch_positions(
-                    generator.tokenizer, tax_prompt, frames_tensor
+                tax_prompt = _make_attn_bias_taxonomy_prompt(ident, nearby_ids)
+                tax_ip, tax_sl = get_image_patch_positions(
+                    generator.tokenizer, tax_prompt, frames_raw
                 )
-                tax_bias_mask = compute_bbox_bias_mask(
-                    tax_image_pos, bbox_coords,
+                tax_bm = compute_bbox_bias_mask(
+                    tax_ip, bbox_coords,
                     patches_per_frame=_patches_per_frm,
                     n_patches_side=_n_patches_side,
                     orig_w=frame_w, orig_h=frame_h,
                     image_size=_vis_image_size,
-                    seq_len=tax_seq_len,
-                    bias=args.bbox_bias,
+                    seq_len=tax_sl, bias=args.bbox_bias,
                 )
-                with bbox_attention_bias(tax_bias_mask):
-                    tax_responses, _, _ = generator.generate([(tax_prompt, frames_tensor)])
+                with bbox_attention_bias(tax_bm):
+                    tax_resp, _, _ = generator.generate([(tax_prompt, frames_raw)])
+                compare_msa = None
 
             else:
-                # ---- Default mode: draw colored box annotation on frames ----
-                prompt = _make_prompt(ident, nearby_ids)
-                tax_prompt = _make_taxonomy_prompt(ident, nearby_ids)
-                ann_color = _identity_color(ident)
-                annotated = [
-                    _annotate_frame_target(
-                        _annotate_frame_base(frame_cache[fidx],
-                                             other_frame_bboxes.get(fidx, {})),
-                        cx, cy, w, h, ann_color,
-                    )
-                    for fidx, (cx, cy, w, h) in zip(frame_indices, bbox_coords)
-                ]
-                frames_tensor, _ = plm_transform._process_multiple_images_pil(annotated)
-
-                # PLM call 1 — M/S/A (optional)
+                # ---- Default only ----
+                def_prompt = _make_prompt(ident, nearby_ids)
                 if not args.no_msa:
-                    responses, _, _ = generator.generate([(prompt, frames_tensor)])
-                    raw = responses[0].strip()
+                    def_resp, _, _ = generator.generate([(def_prompt, frames_ann)])
+                    raw = def_resp[0].strip()
                     motion, social, activity = _parse_plm_response(raw)
                     print(f"    [{ident}]  M:{motion!r}  S:{social!r}  A:{activity!r}")
                     print(f"      raw → {raw!r}")
                 else:
                     motion = social = activity = raw = ""
 
-                tax_responses, _, _ = generator.generate([(tax_prompt, frames_tensor)])
+                tax_prompt = _make_taxonomy_prompt(ident, nearby_ids)
+                tax_resp, _, _ = generator.generate([(tax_prompt, frames_ann)])
+                compare_msa = None
 
-            tax_raw = tax_responses[0].strip()
+            tax_raw = tax_resp[0].strip()
             taxonomy = _parse_taxonomy_response(tax_raw, nearby_ids)
 
             sc_d = taxonomy['social']
@@ -964,6 +1024,8 @@ if __name__ == "__main__":
                 "taxonomy":           taxonomy,
                 "description":        raw,
             }
+            if compare_msa is not None:
+                win["compare_attn_bias"] = compare_msa
             identity_windows[ident][wid] = win
 
     print(f"\nReading {args.video} and running PLM on 2-sec full-frame clips …")
