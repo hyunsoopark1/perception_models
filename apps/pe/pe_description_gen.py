@@ -174,7 +174,8 @@ def _make_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
         f"obj_verb:     {ov_list}\n"
         f"obj_noun:     {on_list}\n"
         f"social:       {sc_list}\n"
-        f"              If not none, also name which nearby person ID(s) are involved.\n"
+        f"              REQUIRED when not none: also list which nearby person ID(s)\n"
+        f"              are involved, e.g.  social: co_manipulate [d14709]\n"
         f"safety_event: {se_list}\n"
         f"other_text:   (free text only if none of the slots above apply; else leave blank)\n\n"
         f"Reply ONLY in this format, one field per line:\n"
@@ -201,11 +202,12 @@ def _match_label(val: str, allowed: frozenset, default: str) -> str:
     return default
 
 
-def _parse_taxonomy_response(text: str) -> Dict:
+def _parse_taxonomy_response(text: str, nearby_ids: Optional[List[str]] = None) -> Dict:
     """
     Parse structured taxonomy response; validate each slot against its allowed set.
-    The 'social' slot becomes {"label": str, "with_ids": list[str]} so the
-    interacting person IDs are preserved alongside the interaction label.
+    The 'social' slot becomes {"label": str, "with_ids": list[str]}.
+    If PLM omits IDs for a non-none social label, nearby_ids is used as fallback
+    because any social interaction must involve a co-present person.
     """
     result: Dict = {
         "body_state":   "unknown",
@@ -232,11 +234,14 @@ def _parse_taxonomy_response(text: str) -> Dict:
                 val = stripped[m.end():].strip()
                 allowed, default = slot_cfg[key]
                 if key == "social":
-                    # Extract IDs from brackets, e.g. "talk [d14709, d14718]"
+                    # Extract IDs from brackets, e.g. "co_manipulate [d14709]"
                     with_ids = re.findall(r'\b[a-zA-Z]\d{4,}\b', val)
-                    # Strip IDs and brackets to isolate the label word
                     label_part = re.sub(r'\[.*?\]', '', val).strip()
                     label = _match_label(label_part, SOCIAL_TAX, "none")
+                    # Fallback: any non-none interaction must involve someone —
+                    # use nearby_ids when PLM forgot to include brackets.
+                    if label != "none" and not with_ids and nearby_ids:
+                        with_ids = list(nearby_ids)
                     result["social"] = {"label": label, "with_ids": with_ids}
                 elif allowed is not None:
                     result[key] = _match_label(val, allowed, default)
@@ -803,7 +808,7 @@ if __name__ == "__main__":
             tax_prompt = _make_taxonomy_prompt(ident, nearby_ids)
             tax_responses, _, _ = generator.generate([(tax_prompt, frames_tensor)])
             tax_raw = tax_responses[0].strip()
-            taxonomy = _parse_taxonomy_response(tax_raw)
+            taxonomy = _parse_taxonomy_response(tax_raw, nearby_ids)
 
             sc_d = taxonomy['social']
             sc_str = (f"{sc_d['label']} {sc_d['with_ids']}"
