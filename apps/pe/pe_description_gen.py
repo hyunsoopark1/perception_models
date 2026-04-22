@@ -130,24 +130,12 @@ def _make_prompt(ident: str, nearby_ids: List[str]) -> str:
     )
 
 
-def _make_attn_bias_prompt(ident: str, nearby_ids: List[str],
-                           bbox_coords: Optional[List[Tuple]] = None) -> str:
+def _make_attn_bias_prompt(ident: str, nearby_ids: List[str]) -> str:
     """
     Prompt for attention-bias inference mode.
-    Frames are unmodified (no drawn boxes). The bbox centre is passed as text
-    so PLM has an explicit spatial reference; the attention bias handles the rest.
+    Frames are unmodified (no drawn boxes). No spatial hint is given in text —
+    the attention bias alone steers the model to the target person's patches.
     """
-    if bbox_coords:
-        # Average centre across sampled frames for a stable single reference
-        avg_cx = sum(c[0] for c in bbox_coords) / len(bbox_coords)
-        avg_cy = sum(c[1] for c in bbox_coords) / len(bbox_coords)
-        location_hint = (
-            f"Focus on the person located near pixel ({avg_cx:.0f}, {avg_cy:.0f}) "
-            f"in the frame and describe only that person. "
-        )
-    else:
-        location_hint = "Describe only the target person in the scene. "
-
     if nearby_ids:
         nearby_text = ", ".join(nearby_ids)
         social_instruction = (
@@ -161,7 +149,7 @@ def _make_attn_bias_prompt(ident: str, nearby_ids: List[str],
 
     return (
         f"Watch this video clip carefully. "
-        f"{location_hint}"
+        f"Describe the person of interest in the scene. "
         f"Reply in plain English only — do not output coordinates, frame numbers, or timestamps. "
         f"Use this exact format:\n"
         f"Motion: <how this person is moving, in 2-5 words>\n"
@@ -171,16 +159,11 @@ def _make_attn_bias_prompt(ident: str, nearby_ids: List[str],
     )
 
 
-def _make_attn_bias_taxonomy_prompt(ident: str, nearby_ids: List[str],
-                                    bbox_coords: Optional[List[Tuple]] = None) -> str:
-    """Taxonomy prompt for attention-bias mode — frames are unmodified."""
-    if bbox_coords:
-        avg_cx = sum(c[0] for c in bbox_coords) / len(bbox_coords)
-        avg_cy = sum(c[1] for c in bbox_coords) / len(bbox_coords)
-        location_hint = f"Focus on the person near pixel ({avg_cx:.0f}, {avg_cy:.0f})."
-    else:
-        location_hint = "Classify the target person in the scene."
-
+def _make_attn_bias_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
+    """
+    Taxonomy prompt for attention-bias mode — frames are unmodified.
+    No spatial hint in text; the attention bias identifies the target person.
+    """
     nearby_text = ", ".join(nearby_ids) if nearby_ids else "none"
     bs_list = " | ".join(sorted(BODY_STATES))
     ov_list = " | ".join(sorted(OBJ_VERBS))
@@ -188,7 +171,7 @@ def _make_attn_bias_taxonomy_prompt(ident: str, nearby_ids: List[str],
     sc_list = " | ".join(sorted(SOCIAL_TAX))
     se_list = " | ".join(sorted(SAFETY_EVENTS))
     return (
-        f"Watch this video clip. {location_hint}\n"
+        f"Watch this video clip. Classify the person of interest in the scene.\n"
         f"Nearby people: {nearby_text}\n\n"
         f"Classify ONLY that person. Pick exactly one label per slot:\n\n"
         f"body_state:   {bs_list}\n"
@@ -974,7 +957,7 @@ if __name__ == "__main__":
                 )
 
             def _run_ab_msa(ft):
-                p = _make_attn_bias_prompt(ident, nearby_ids, bbox_coords)
+                p = _make_attn_bias_prompt(ident, nearby_ids)
                 with bbox_attention_bias(_ab_bias_mask(p, ft)):
                     r, _, _ = generator.generate([(p, ft)])
                 raw_ = r[0].strip()
@@ -984,7 +967,7 @@ if __name__ == "__main__":
                 return m, s, a, raw_
 
             def _run_ab_taxonomy(ft):
-                p = _make_attn_bias_taxonomy_prompt(ident, nearby_ids, bbox_coords)
+                p = _make_attn_bias_taxonomy_prompt(ident, nearby_ids)
                 with bbox_attention_bias(_ab_bias_mask(p, ft)):
                     r, _, _ = generator.generate([(p, ft)])
                 raw_ = r[0].strip()
