@@ -291,6 +291,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Output JSON path (default: descriptions.json).")
     p.add_argument("--out-video", default="description_overlay.mp4", metavar="PATH",
                    help="Output annotated video path (default: description_overlay.mp4).")
+    p.add_argument("--no-msa", action="store_true",
+                   help="Skip the Motion/Social/Activity PLM call; run taxonomy only.")
     p.add_argument("--no-video", action="store_true",
                    help="Skip video rendering.")
     p.add_argument("--font-scale", type=float, default=0.42,
@@ -787,18 +789,30 @@ if __name__ == "__main__":
             # Annotated frames → (N, 3, H, W) tensor
             frames_tensor, _ = plm_transform._process_multiple_images_pil(annotated)
 
-            # PLM generative inference — M/S/A
-            responses, _, _ = generator.generate([(prompt, frames_tensor)])
-            raw = responses[0].strip()
+            # PLM call 1 — M/S/A  (optional)
+            if not args.no_msa:
+                responses, _, _ = generator.generate([(prompt, frames_tensor)])
+                raw = responses[0].strip()
+                motion, social, activity = _parse_plm_response(raw)
+                print(f"    [{ident}]  M:{motion!r}  S:{social!r}  A:{activity!r}")
+                print(f"      raw → {raw!r}")
+            else:
+                motion = social = activity = raw = ""
 
-            motion, social, activity = _parse_plm_response(raw)
-            social_with_ids = social
-
-            # PLM generative inference — taxonomy (second call, same frames)
+            # PLM call 2 — taxonomy
             tax_prompt = _make_taxonomy_prompt(ident, nearby_ids)
             tax_responses, _, _ = generator.generate([(tax_prompt, frames_tensor)])
             tax_raw = tax_responses[0].strip()
             taxonomy = _parse_taxonomy_response(tax_raw)
+
+            sc_d = taxonomy['social']
+            sc_str = (f"{sc_d['label']} {sc_d['with_ids']}"
+                      if isinstance(sc_d, dict) else str(sc_d))
+            print(f"    [{ident}]  taxonomy → BS:{taxonomy['body_state']}  "
+                  f"OV:{taxonomy['obj_verb']}  ON:{taxonomy['obj_noun']}  "
+                  f"SC:{sc_str}  SE:{taxonomy['safety_event']}"
+                  + (f"  other:{taxonomy['other_text']!r}" if taxonomy['other_text'] else ""))
+            print(f"      tax_raw → {tax_raw!r}")
 
             win = {
                 "start_frame":        start_fr,
@@ -808,7 +822,7 @@ if __name__ == "__main__":
                 "n_frames":           len(frame_indices),
                 "motion":             motion,
                 "social_interaction": {
-                    "label":      social_with_ids,
+                    "label":      social,
                     "nearby_ids": nearby_ids,
                 },
                 "activity":           activity,
@@ -816,17 +830,6 @@ if __name__ == "__main__":
                 "description":        raw,
             }
             identity_windows[ident][wid] = win
-
-            print(f"    [{ident}]  M:{motion!r}  S:{social_with_ids!r}  A:{activity!r}")
-            print(f"      raw → {raw!r}")
-            sc_d = taxonomy['social']
-            sc_str = (f"{sc_d['label']} {sc_d['with_ids']}"
-                      if isinstance(sc_d, dict) else str(sc_d))
-            print(f"      taxonomy → BS:{taxonomy['body_state']}  "
-                  f"OV:{taxonomy['obj_verb']}  ON:{taxonomy['obj_noun']}  "
-                  f"SC:{sc_str}  SE:{taxonomy['safety_event']}"
-                  + (f"  other:{taxonomy['other_text']!r}" if taxonomy['other_text'] else ""))
-            print(f"      tax_raw → {tax_raw!r}")
 
     print(f"\nReading {args.video} and running PLM on 2-sec full-frame clips …")
     cap = cv2.VideoCapture(args.video)
