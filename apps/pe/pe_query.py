@@ -348,6 +348,7 @@ def _ask_language(generator, tmpl, data: Dict, known_ids,
             break
         max_windows -= 2
 
+    print(f"  [context sent to LLM]\n{context}\n")
     responses, _, _ = generator.generate([prompt])
     return responses[0].strip()
 
