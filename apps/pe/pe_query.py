@@ -72,6 +72,23 @@ DATA_SCHEMA = """\
 #       label      : str        physical contact description or "none"
 #       nearby_ids : list[str]  IDs of people within close proximity
 #   description : str        full raw model output
+
+# --- EXAMPLES ---
+
+# Q: list persons near d14718 and their accumulated time
+# for pid, windows in data.items():
+#     if pid == 'd14718': continue
+#     near = [w for w in windows if 'd14718' in w['social_interaction']['nearby_ids']]
+#     if near:
+#         total = sum(w['end_sec'] - w['start_sec'] for w in near)
+#         spans = ', '.join(f"{w['start_sec']:.1f}s-{w['end_sec']:.1f}s" for w in near)
+#         print(f"{pid}: {total:.1f}s  ({spans})")
+
+# Q: find who puts a toy on the shelf and when
+# for pid, windows in data.items():
+#     for w in windows:
+#         if 'shelf' in w['activity'].lower() or 'shelf' in w['motion'].lower():
+#             print(f"{pid}: {w['start_sec']:.1f}s-{w['end_sec']:.1f}s  {w['activity']}")
 """
 
 
