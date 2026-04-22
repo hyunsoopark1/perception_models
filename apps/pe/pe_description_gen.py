@@ -174,13 +174,14 @@ def _make_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
         f"obj_verb:     {ov_list}\n"
         f"obj_noun:     {on_list}\n"
         f"social:       {sc_list}\n"
+        f"              If not none, also name which nearby person ID(s) are involved.\n"
         f"safety_event: {se_list}\n"
         f"other_text:   (free text only if none of the slots above apply; else leave blank)\n\n"
         f"Reply ONLY in this format, one field per line:\n"
         f"body_state: <label>\n"
         f"obj_verb: <label>\n"
         f"obj_noun: <label>\n"
-        f"social: <label>\n"
+        f"social: <label> [<id1>, <id2>]  — or —  social: none\n"
         f"safety_event: <label>\n"
         f"other_text: <text or blank>"
     )
@@ -201,12 +202,16 @@ def _match_label(val: str, allowed: frozenset, default: str) -> str:
 
 
 def _parse_taxonomy_response(text: str) -> Dict:
-    """Parse structured taxonomy response; validate each slot against its allowed set."""
-    result: Dict[str, str] = {
+    """
+    Parse structured taxonomy response; validate each slot against its allowed set.
+    The 'social' slot becomes {"label": str, "with_ids": list[str]} so the
+    interacting person IDs are preserved alongside the interaction label.
+    """
+    result: Dict = {
         "body_state":   "unknown",
         "obj_verb":     "none",
         "obj_noun":     "none",
-        "social":       "none",
+        "social":       {"label": "none", "with_ids": []},
         "safety_event": "none",
         "other_text":   "",
     }
@@ -214,7 +219,7 @@ def _parse_taxonomy_response(text: str) -> Dict:
         "body_state":   (BODY_STATES,   "unknown"),
         "obj_verb":     (OBJ_VERBS,     "none"),
         "obj_noun":     (None,          "none"),   # free-form noun accepted
-        "social":       (SOCIAL_TAX,    "none"),
+        "social":       (SOCIAL_TAX,    "none"),   # special-cased below
         "safety_event": (SAFETY_EVENTS, "none"),
         "other_text":   (None,          ""),
     }
@@ -226,7 +231,14 @@ def _parse_taxonomy_response(text: str) -> Dict:
             if m:
                 val = stripped[m.end():].strip()
                 allowed, default = slot_cfg[key]
-                if allowed is not None:
+                if key == "social":
+                    # Extract IDs from brackets, e.g. "talk [d14709, d14718]"
+                    with_ids = re.findall(r'\b[a-zA-Z]\d{4,}\b', val)
+                    # Strip IDs and brackets to isolate the label word
+                    label_part = re.sub(r'\[.*?\]', '', val).strip()
+                    label = _match_label(label_part, SOCIAL_TAX, "none")
+                    result["social"] = {"label": label, "with_ids": with_ids}
+                elif allowed is not None:
                     result[key] = _match_label(val, allowed, default)
                 else:
                     result[key] = val if val else default
@@ -568,15 +580,26 @@ def _draw_window_overlay(
     # Taxonomy rows (grey-slate family, above M/S/A)
     taxonomy = win.get("taxonomy", {})
     if taxonomy:
-        bs  = taxonomy.get("body_state", "")
-        ov  = taxonomy.get("obj_verb", "none")
-        on_ = taxonomy.get("obj_noun", "none")
-        sc  = taxonomy.get("social", "none")
-        se  = taxonomy.get("safety_event", "none")
-        ot  = taxonomy.get("other_text", "")
+        bs       = taxonomy.get("body_state", "")
+        ov       = taxonomy.get("obj_verb", "none")
+        on_      = taxonomy.get("obj_noun", "none")
+        sc_dict  = taxonomy.get("social", {"label": "none", "with_ids": []})
+        se       = taxonomy.get("safety_event", "none")
+        ot       = taxonomy.get("other_text", "")
 
-        # Row: social_taxonomy  |  safety_event  (omit "none" entries to save space)
-        sc_str = f"SC:{sc}" if sc != "none" else ""
+        # Unpack social dict
+        if isinstance(sc_dict, dict):
+            sc_label   = sc_dict.get("label", "none")
+            sc_with    = sc_dict.get("with_ids", [])
+        else:
+            sc_label, sc_with = str(sc_dict), []
+
+        # Row: social_taxonomy (with IDs)  |  safety_event
+        if sc_label != "none":
+            ids_str = f"[{','.join(sc_with)}]" if sc_with else ""
+            sc_str  = f"SC:{sc_label}{ids_str}"
+        else:
+            sc_str = ""
         se_str = f"SE:{se}" if se != "none" else ""
         ot_str = f"[{ot[:28]}]" if ot else ""
         row_sc_se = "  ".join(filter(None, [sc_str, se_str, ot_str])) or "SC:none  SE:none"
@@ -796,9 +819,12 @@ if __name__ == "__main__":
 
             print(f"    [{ident}]  M:{motion!r}  S:{social_with_ids!r}  A:{activity!r}")
             print(f"      raw → {raw!r}")
+            sc_d = taxonomy['social']
+            sc_str = (f"{sc_d['label']} {sc_d['with_ids']}"
+                      if isinstance(sc_d, dict) else str(sc_d))
             print(f"      taxonomy → BS:{taxonomy['body_state']}  "
                   f"OV:{taxonomy['obj_verb']}  ON:{taxonomy['obj_noun']}  "
-                  f"SC:{taxonomy['social']}  SE:{taxonomy['safety_event']}"
+                  f"SC:{sc_str}  SE:{taxonomy['safety_event']}"
                   + (f"  other:{taxonomy['other_text']!r}" if taxonomy['other_text'] else ""))
             print(f"      tax_raw → {tax_raw!r}")
 
