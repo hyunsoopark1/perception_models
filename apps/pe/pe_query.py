@@ -146,6 +146,53 @@ def _load_text_generator(ckpt: str, max_new_tokens: int):
     return generator, text_tokenizer, conv_template
 
 
+def _keyword_filter(data: Dict, query: str, top_k: int = 30) -> Dict:
+    """
+    Score every window by keyword overlap with the query and return the top_k
+    highest-scoring windows grouped by identity.
+
+    This runs before the LLM so:
+      - Only relevant windows reach the context (no trimming of key evidence)
+      - Unrelated identities are excluded, preventing identity confusion
+    """
+    STOP = {
+        "the", "a", "an", "is", "was", "who", "what", "when", "where",
+        "find", "show", "tell", "me", "and", "or", "of", "to", "in",
+        "at", "for", "its", "their", "his", "her", "he", "she", "they",
+        "did", "does", "do", "has", "have", "had", "with",
+    }
+    keywords = [
+        w.lower() for w in re.findall(r"\b\w+\b", query)
+        if w.lower() not in STOP and len(w) > 2
+    ]
+    if not keywords:
+        return data   # no keywords → return everything
+
+    scored: List[tuple] = []
+    for ident, windows in data.items():
+        for win in windows:
+            text = " ".join(filter(None, [
+                win.get("motion", ""),
+                win.get("activity", ""),
+                win.get("description", ""),
+            ])).lower()
+            score = sum(1 for kw in keywords if kw in text)
+            if score > 0:
+                scored.append((score, ident, win))
+
+    if not scored:
+        return data   # no matches → fall back to full context
+
+    scored.sort(key=lambda x: -x[0])
+
+    filtered: Dict[str, List] = {}
+    for _, ident, win in scored[:top_k]:
+        filtered.setdefault(ident, []).append(win)
+
+    print(f"  [filter] {len(scored)} matching windows → top {len(filtered)} identities")
+    return filtered
+
+
 def _build_prompt(conv_template, context: str, question: str) -> str:
     full_q = f"Tracking data:\n{context}\n\nQuestion: {question}"
     return conv_template.get_generation_prompt(full_q, num_images=0, num_patches=0)
@@ -153,23 +200,27 @@ def _build_prompt(conv_template, context: str, question: str) -> str:
 
 def _ask(generator, conv_template, data: Dict, context_ids: List[str],
          question: str) -> str:
-    # Hard limit is the smaller of KV cache size and RoPE table size.
+    # Step 1: keyword pre-filter so only relevant windows reach the LLM.
+    scoped = {k: v for k, v in data.items() if k in context_ids}
+    filtered = _keyword_filter(scoped, question)
+
+    # Step 2: Hard limit is the smaller of KV cache size and RoPE table size.
     rope_limit = generator.model.max_seqlen
     max_prompt_tokens = min(generator.max_tokens, rope_limit) - generator.max_gen_len - 64
 
-    # Start with full context; if too long, drop oldest windows until it fits.
-    recent_windows = {ident: len(data[ident]) for ident in context_ids if ident in data}
+    # Step 3: Trim if still too long (drop oldest windows from largest identity).
+    recent_windows = {ident: len(wins) for ident, wins in filtered.items()}
+    ids_ordered = list(filtered.keys())
     while True:
-        context = _format_context_windowed(data, context_ids, recent_windows)
+        context = _format_context_windowed(filtered, ids_ordered, recent_windows)
         prompt  = _build_prompt(conv_template, context, question)
         n_tok   = len(generator.tokenizer.encode(prompt, add_bos=False, add_eos=False))
         if n_tok <= max_prompt_tokens:
             break
-        # Drop the oldest window from the identity with the most windows
         largest = max(recent_windows, key=lambda k: recent_windows[k])
         recent_windows[largest] -= 1
         if all(v <= 1 for v in recent_windows.values()):
-            break   # can't trim further
+            break
 
     responses, _, _ = generator.generate([prompt])
     return responses[0].strip()
