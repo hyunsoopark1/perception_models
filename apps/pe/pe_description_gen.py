@@ -323,9 +323,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Use attention bias instead of drawing boxes on frames. "
                         "The image is unmodified; PLM attention is steered toward "
                         "the target person's patch region via SDPA bias injection.")
-    p.add_argument("--bbox-bias", type=float, default=100.0, metavar="B",
+    p.add_argument("--bbox-bias", type=float, default=10.0, metavar="B",
                    help="Suppression magnitude applied to non-bbox image patches "
-                        "(default: 100 → e^-100 ≈ 0, hard mask; text and bbox patches stay at 0).")
+                        "(default: 10 → e^-10 ≈ 4500x suppression; "
+                        "use higher values for harder masking, lower for softer).")
     # --- proximity ---
     p.add_argument("--proximity-scale", type=float, default=2.0, metavar="S",
                    help="Nearby threshold = this × avg_bbox_dim (default: 2.0).")
@@ -657,7 +658,7 @@ def _draw_window_overlay(
         ot_str = f"[{ot[:28]}]" if ot else ""
         row_sc_se = "  ".join(filter(None, [sc_str, se_str, ot_str])) or "SC:none  SE:none"
         rows.append(((prefix + row_sc_se)[:MAX_CHARS], bg_sc_se, None))
-        obj_part = (f"OBJ:{ov}→{on_}" if ov != "none" and on_ != "none"
+        obj_part = (f"OBJ:{ov}->{on_}" if ov != "none" and on_ != "none"
                     else f"OBJ:{ov}" if ov != "none"
                     else f"OBJ:{on_}" if on_ != "none" else "")
         row_bs = f"{prefix}BS:{bs}" + (f"  {obj_part}" if obj_part else "")

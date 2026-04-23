@@ -158,7 +158,7 @@ def compute_bbox_bias_mask(
     orig_h: int,
     image_size: int,
     seq_len: int,
-    bias: float = 100.0,
+    bias: float = 10.0,
 ) -> torch.Tensor:
     """
     Build the [1, 1, 1, seq_len] attention bias mask.
