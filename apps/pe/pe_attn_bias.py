@@ -24,8 +24,14 @@ query token (text + other patches) attends ~e^BBOX_BIAS ≈ 20× more strongly
 to the target-person patches.  No model weights are changed.
 
 The bias is automatically skipped for generation steps: during token-by-token
-generation the key dimension is the full KV-cache size (larger than seq_len),
-so the shape check `S_k == seq_len` fails and the original SDPA runs unmodified.
+generation the query dimension is 1 (one new token), which is always far smaller
+than `seq_len`, so the shape check `S_q == seq_len` fails and the original SDPA
+runs unmodified.
+
+KV-cache note: the model pre-allocates a fixed-size KV cache (max_tokens, e.g.
+11264).  KVCache.update() returns the full cache buffer, so S_k == max_tokens
+even during prefill.  The bias mask (length seq_len) is therefore zero-padded to
+S_k before being added; the zero-filled cache slots receive neutral (0) bias.
 
 Usage
 -----
@@ -65,18 +71,36 @@ _ORIG_SDPA = None
 def _biased_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, **kwargs):
     global _ACTIVE_BIAS
     if _ACTIVE_BIAS is not None:
-        sk = key.shape[2]  # [B, H, S, D] layout (after transpose in Attention.forward)
-        if _ACTIVE_BIAS.shape[-1] == sk:
+        sq = query.shape[2]   # [B, H, S, D] layout
+        sk = key.shape[2]
+        mask_len = _ACTIVE_BIAS.shape[-1]   # = len(text_ids) = actual prompt token count
+
+        # Detect prefill: query processes the full prompt at once (sq == prompt length).
+        # Generation steps have sq == 1 which is always << mask_len.
+        #
+        # Key note: the model uses a KV cache pre-sized to max_tokens (e.g. 11264).
+        # KVCache.update() returns the full cache buffer, so sk == max_tokens even
+        # during prefill.  The actual prompt keys occupy positions 0..mask_len-1;
+        # positions mask_len..sk-1 are zero-filled and must get neutral (0) bias.
+        if sq == mask_len:
             bias = _ACTIVE_BIAS.to(dtype=query.dtype, device=query.device)
+
+            # Pad bias to full key-cache dimension (zeros for zero-filled slots).
+            if sk > mask_len:
+                bias = torch.cat(
+                    [bias, bias.new_zeros(1, 1, 1, sk - mask_len)], dim=-1
+                )  # [1, 1, 1, sk]
+
             if is_causal:
-                # Materialise the causal mask and fold in the bbox bias so
-                # we can pass a single attn_mask without is_causal=True.
-                sq = query.shape[2]
-                causal_mask = torch.zeros(1, 1, sq, sk, dtype=query.dtype, device=query.device)
-                causal_mask = causal_mask.masked_fill(
-                    torch.ones(sq, sk, device=query.device, dtype=torch.bool).triu(1),
-                    float("-inf"),
+                # Materialise the causal mask and fold in the bbox bias.
+                # PyTorch convention for (sq, sk) with sq <= sk:
+                #   q[i] attends to k[j] iff j <= (sk - sq + i)
+                # → lower-triangular with diagonal offset (sk - sq).
+                causal_mask = torch.full(
+                    (1, 1, sq, sk), float("-inf"), dtype=query.dtype, device=query.device
                 )
+                attend = torch.ones(sq, sk, dtype=torch.bool, device=query.device).tril(sk - sq)
+                causal_mask.masked_fill_(attend.unsqueeze(0).unsqueeze(0), 0.0)
                 attn_mask = causal_mask + bias
                 is_causal = False
             else:
