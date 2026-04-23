@@ -158,36 +158,34 @@ def compute_bbox_bias_mask(
     orig_h: int,
     image_size: int,
     seq_len: int,
-    bias: float = 3.0,
+    bias: float = 100.0,
 ) -> torch.Tensor:
     """
     Build the [1, 1, 1, seq_len] attention bias mask.
 
-    Goal: suppress non-bbox image patches while preserving attention to
-    text tokens and bbox patches.
+    Goal: hard-suppress non-bbox image patches so the model attends only
+    to the target person's patches and the text tokens.
 
     Mask values
     -----------
-    text tokens       : +bias   (preserved — same level as bbox patches)
-    bbox patch tokens : +bias   (target person, boosted relative to non-bbox)
-    non-bbox patches  : 0       (relatively suppressed after softmax)
+    text tokens       : 0       (unmodified — compete on content similarity)
+    bbox patch tokens : 0       (unmodified — compete on content similarity)
+    non-bbox patches  : -bias   (suppressed; at -100, e^-100 ≈ 0 → zero attention)
 
-    Equivalent formulation: set everything to +bias, then zero out non-bbox
-    image patch positions.  After softmax only the relative differences matter,
-    so this is equivalent to -bias on non-bbox patches with text/bbox at 0.
+    With bias=100 this acts as a hard mask: the model effectively sees only
+    the bbox region of each frame plus the text prompt.
 
-    bbox_coords_per_frame : list of (cx, cy, w, h) — one entry per frame.
-    bias                  : 3.0 → e^3 ≈ 20× relative suppression of non-bbox patches.
+    bbox_coords_per_frame : list of (cx, cy, w, h) — one entry per sampled frame.
+    bias                  : suppression magnitude for non-bbox patches (default 100).
     """
     mask = torch.zeros(1, 1, 1, seq_len, dtype=torch.float32)
 
-    # 1. Boost all text token positions (every position not occupied by an image patch)
-    image_pos_set = set(image_pos)
-    for pos in range(seq_len):
-        if pos not in image_pos_set:
-            mask[0, 0, 0, pos] = bias
+    # 1. Suppress all image patch positions
+    for pos in image_pos:
+        if pos < seq_len:
+            mask[0, 0, 0, pos] = -bias
 
-    # 2. Boost bbox patch positions for each frame
+    # 2. Restore bbox patch positions to 0 (un-suppress target person)
     for frame_idx, (cx, cy, w, h) in enumerate(bbox_coords_per_frame):
         patch_idxs = bbox_to_patch_indices(
             cx, cy, w, h, orig_w, orig_h, image_size, n_patches_side,
@@ -198,7 +196,7 @@ def compute_bbox_bias_mask(
             if flat < len(image_pos):
                 seq_pos = image_pos[flat]
                 if seq_pos < seq_len:
-                    mask[0, 0, 0, seq_pos] = bias
+                    mask[0, 0, 0, seq_pos] = 0.0
 
     return mask
 

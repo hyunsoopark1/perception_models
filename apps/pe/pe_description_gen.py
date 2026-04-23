@@ -318,9 +318,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Use attention bias instead of drawing boxes on frames. "
                         "The image is unmodified; PLM attention is steered toward "
                         "the target person's patch region via SDPA bias injection.")
-    p.add_argument("--bbox-bias", type=float, default=5.0, metavar="B",
-                   help="Additive logit bias for bbox patches in --attn-bias mode "
-                        "(default: 5.0 ≈ 150× relative suppression of non-bbox patches).")
+    p.add_argument("--bbox-bias", type=float, default=100.0, metavar="B",
+                   help="Suppression magnitude applied to non-bbox image patches "
+                        "(default: 100 → e^-100 ≈ 0, hard mask; text and bbox patches stay at 0).")
     # --- proximity ---
     p.add_argument("--proximity-scale", type=float, default=2.0, metavar="S",
                    help="Nearby threshold = this × avg_bbox_dim (default: 2.0).")
