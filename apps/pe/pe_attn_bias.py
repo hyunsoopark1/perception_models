@@ -203,13 +203,16 @@ def make_attn_bias_debug_image(
     ------
     • Biased patches  — solid fill at *bias_color* blended with *alpha*.
     • Patch grid      — faint grey lines at every patch boundary (optional).
+                        Grid is n_patches_side × n_patches_side (e.g. 16×16
+                        when pooling_ratio=2, or 32×32 when pooling_ratio=1).
     • Bbox outline    — solid *bias_color* rectangle, 2 px thick.
+    • Patch count     — number of boosted tokens shown at bottom-left.
 
     Coordinate chain
     ----------------
-    original pixels  →  scale by (image_size/orig_dim)  →  PLM 448-px space
-    patch grid       →  14×14 cells in 448-px space
-    overlay patches  →  scale back by (orig_dim/image_size)  →  original pixels
+    original pixels  →  ×(image_size/orig_dim)  →  PLM 448-px space
+    patch grid cells    (image_size/n_patches_side) px each in PLM space
+    overlay patches  →  ×(orig_dim/image_size)  →  original pixels
     """
     import cv2
 
