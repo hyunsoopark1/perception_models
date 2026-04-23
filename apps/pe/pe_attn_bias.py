@@ -163,14 +163,31 @@ def compute_bbox_bias_mask(
     """
     Build the [1, 1, 1, seq_len] attention bias mask.
 
-    bbox_coords_per_frame : list of (cx, cy, w, h) — one entry per frame
-                            (after subsampling).  Length must equal n_frames.
-    image_pos             : from get_image_patch_positions().
-    patches_per_frame     : e.g. 1024 for 448px / patch_size=14.
-    bias                  : additive logit boost for bbox patches.
-                            3.0 → ~20× relative attention weight.
+    Goal: suppress non-bbox image patches while preserving attention to
+    text tokens and bbox patches.
+
+    Mask values
+    -----------
+    text tokens       : +bias   (preserved — same level as bbox patches)
+    bbox patch tokens : +bias   (target person, boosted relative to non-bbox)
+    non-bbox patches  : 0       (relatively suppressed after softmax)
+
+    Equivalent formulation: set everything to +bias, then zero out non-bbox
+    image patch positions.  After softmax only the relative differences matter,
+    so this is equivalent to -bias on non-bbox patches with text/bbox at 0.
+
+    bbox_coords_per_frame : list of (cx, cy, w, h) — one entry per frame.
+    bias                  : 3.0 → e^3 ≈ 20× relative suppression of non-bbox patches.
     """
     mask = torch.zeros(1, 1, 1, seq_len, dtype=torch.float32)
+
+    # 1. Boost all text token positions (every position not occupied by an image patch)
+    image_pos_set = set(image_pos)
+    for pos in range(seq_len):
+        if pos not in image_pos_set:
+            mask[0, 0, 0, pos] = bias
+
+    # 2. Boost bbox patch positions for each frame
     for frame_idx, (cx, cy, w, h) in enumerate(bbox_coords_per_frame):
         patch_idxs = bbox_to_patch_indices(
             cx, cy, w, h, orig_w, orig_h, image_size, n_patches_side,
@@ -182,6 +199,7 @@ def compute_bbox_bias_mask(
                 seq_pos = image_pos[flat]
                 if seq_pos < seq_len:
                     mask[0, 0, 0, seq_pos] = bias
+
     return mask
 
 
@@ -221,20 +239,30 @@ def make_attn_bias_debug_image(
     sx = W / image_size                             # scale patch→original x
     sy = H / image_size                             # scale patch→original y
 
-    patch_idxs = set(bbox_to_patch_indices(
+    bbox_patch_idxs = set(bbox_to_patch_indices(
         cx, cy, w, h, orig_w, orig_h, image_size, n_patches_side,
     ))
+    all_patch_idxs = set(range(n_patches_side * n_patches_side))
+    suppressed_idxs = all_patch_idxs - bbox_patch_idxs
 
-    # --- alpha-blend biased patches ---
+    # --- alpha-blend: green on bbox patches, dark red on suppressed patches ---
     overlay = frame_rgb.astype(np.float32).copy()
-    for p in patch_idxs:
+    for p in bbox_patch_idxs:
         row = p // n_patches_side
         col = p % n_patches_side
         ix1 = max(0, int(col * patch_size_f * sx))
         iy1 = max(0, int(row * patch_size_f * sy))
         ix2 = min(W, int((col + 1) * patch_size_f * sx))
         iy2 = min(H, int((row + 1) * patch_size_f * sy))
-        overlay[iy1:iy2, ix1:ix2] = bias_color
+        overlay[iy1:iy2, ix1:ix2] = bias_color          # boosted (green)
+    for p in suppressed_idxs:
+        row = p // n_patches_side
+        col = p % n_patches_side
+        ix1 = max(0, int(col * patch_size_f * sx))
+        iy1 = max(0, int(row * patch_size_f * sy))
+        ix2 = min(W, int((col + 1) * patch_size_f * sx))
+        iy2 = min(H, int((row + 1) * patch_size_f * sy))
+        overlay[iy1:iy2, ix1:ix2] = (80, 0, 0)          # suppressed (dark red)
 
     out = (frame_rgb.astype(np.float32) * (1 - alpha) + overlay * alpha)
     out = out.clip(0, 255).astype(np.uint8)
@@ -254,7 +282,7 @@ def make_attn_bias_debug_image(
     cv2.rectangle(out, (bx1, by1), (bx2, by2), bias_color, 2)
 
     # --- patch-count label ---
-    label = f"{len(patch_idxs)} biased patches"
+    label = f"boosted={len(bbox_patch_idxs)}  suppressed={len(suppressed_idxs)}"
     cv2.putText(out, label, (6, H - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, bias_color, 1, cv2.LINE_AA)
 
