@@ -313,6 +313,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-minutes", type=float, default=None, metavar="M",
                    help="Stop after this many minutes of video (default: all). "
                         "Overridden by --max-frames if both are given.")
+    p.add_argument("--no-pool", action="store_true",
+                   help="Bypass the vision projector's 2×2 average pooling, giving a "
+                        "32×32 patch grid (1024 tokens/frame) instead of 16×16 (256). "
+                        "Finer attention targeting for --attn-bias at the cost of 4× "
+                        "longer context. Model was trained with pooling; quality may vary.")
     # --- attention bias mode ---
     p.add_argument("--attn-bias", action="store_true",
                    help="Use attention bias instead of drawing boxes on frames. "
@@ -789,6 +794,12 @@ if __name__ == "__main__":
     generator = PackedCausalTransformerGenerator(gen_cfg, plm_model, plm_tokenizer)
 
     # Patch grid parameters (needed for attention-bias mode)
+    # Bypass vision projector pooling → 32×32 patch grid
+    if args.no_pool:
+        plm_model.vision_projector.adaptive_avg_pool = None
+        plm_tokenizer.pooling_ratio = 1
+        print("  --no-pool: bypassed AdaptiveAvgPooling → 32×32 grid (1024 tokens/frame)")
+
     _vis_image_size  = plm_model.vision_model.image_size
     _tok_patch_size  = getattr(plm_tokenizer, "patch_size",  14)
     _tok_pool_ratio  = getattr(plm_tokenizer, "pooling_ratio", 1)
