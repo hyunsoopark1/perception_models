@@ -318,9 +318,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Use attention bias instead of drawing boxes on frames. "
                         "The image is unmodified; PLM attention is steered toward "
                         "the target person's patch region via SDPA bias injection.")
-    p.add_argument("--bbox-bias", type=float, default=3.0, metavar="B",
+    p.add_argument("--bbox-bias", type=float, default=5.0, metavar="B",
                    help="Additive logit bias for bbox patches in --attn-bias mode "
-                        "(default: 3.0 ≈ 20× relative attention weight).")
+                        "(default: 5.0 ≈ 150× relative suppression of non-bbox patches).")
     # --- proximity ---
     p.add_argument("--proximity-scale", type=float, default=2.0, metavar="S",
                    help="Nearby threshold = this × avg_bbox_dim (default: 2.0).")
@@ -574,9 +574,9 @@ def _draw_window_overlay(
         ┌[id]──── bbox ───────────────────┐
 
     Compare mode (win["compare_attn_bias"] present):
-        AB·BS:...  OBJ:...                   ← AB taxonomy  (teal-slate, topmost)
-        AB·SC:...  SE:...                    ← AB taxonomy
-        AB▸ M:...  A:...  S:...             ← AB M/S/A     (steel blue)
+        AB.BS:...  OBJ:...                   ← AB taxonomy  (teal-slate, topmost)
+        AB.SC:...  SE:...                    ← AB taxonomy
+        AB> M:...  A:...  S:...             ← AB M/S/A     (steel blue)
         ─────────────────────────────────── ← thin separator
         BS:...  OBJ:...                      ← DEF taxonomy (dark slate)
         SC:...  SE:...                       ← DEF taxonomy
@@ -694,12 +694,12 @@ def _draw_window_overlay(
         if ab_s:
             ab_parts.append(f"S:{ab_s}")
         if ab_parts:
-            rows.append((("AB▸ " + "  ".join(ab_parts))[:MAX_CHARS], (80, 60, 30), None))
+            rows.append((("AB> " + "  ".join(ab_parts))[:MAX_CHARS], (80, 60, 30), None))
 
         # AB taxonomy (lighter teal-slate so it's visually distinct from DEF taxonomy)
         ab_taxonomy = compare.get("taxonomy", {})
         if ab_taxonomy:
-            _tax_to_rows(ab_taxonomy, prefix="AB·",
+            _tax_to_rows(ab_taxonomy, prefix="AB.",
                          bg_sc_se=(85, 65, 50), bg_bs_obj=(65, 65, 90))
 
     else:
