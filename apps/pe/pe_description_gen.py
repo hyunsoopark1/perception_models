@@ -115,11 +115,13 @@ def _make_msa_prompt(target_phrase: str, nearby_ids: List[str]) -> str:
     return (
         f"Watch this video clip carefully. "
         f"{target_phrase} "
-        f"Reply in plain English only — do not output coordinates, frame numbers, or timestamps. "
-        f"Use this exact format:\n"
-        f"Motion: <how this person is moving, in 2-5 words>\n"
+        f"Reply in plain English only — no coordinates, no frame numbers, no timestamps. "
+        f"Do NOT write 'Person 1:' or any other person label. "
+        f"Start your response with 'Motion:' and use ONLY this exact three-line format:\n"
+        f"Motion: <2-5 words>\n"
         f"{social_instruction}\n"
-        f"Activity: <what this person is doing, in 2-5 words>\n"
+        f"Activity: <2-5 words>\n"
+        f"Each answer must be 2-5 words only — no sentences, no extra lines. "
         f"If a field is not clearly visible write 'unclear'."
     )
 
@@ -448,12 +450,14 @@ def _parse_plm_response(text: str) -> Tuple[str, str, str]:
       - "**Motion:** sitting still"   (markdown bold)
       - "Motion - sitting still"      (dash separator)
       - lowercase / mixed case
+      - "Person 1: ..." prefix (stripped before matching)
     Returns empty string for any field the model didn't fill in.
     """
     motion = social = activity = ""
     for line in text.splitlines():
-        # Strip markdown bold markers before matching
+        # Strip markdown bold markers and leading "Person N:" labels
         stripped = line.strip().replace("**", "")
+        stripped = re.sub(r"^person\s*\d+\s*[:–\-]\s*", "", stripped, flags=re.I)
         low = stripped.lower()
         for prefix, field in (
             ("motion",   "motion"),
@@ -468,6 +472,8 @@ def _parse_plm_response(text: str) -> Tuple[str, str, str]:
                 if re.fullmatch(r"<[^>]*>", val):
                     inner = val[1:-1].strip()
                     val = "" if re.search(r"\b(how|what|IDs?|e\.g\.)\b", inner, re.I) else inner
+                # Truncate to first sentence to handle paragraph-style answers
+                val = re.split(r"(?<=[.!?])\s+", val)[0].strip()
                 if field == "motion":
                     motion = val
                 elif field == "social":
