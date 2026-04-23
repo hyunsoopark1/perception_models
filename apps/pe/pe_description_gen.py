@@ -96,14 +96,10 @@ from PIL import Image as PILImage
 # Prompt builder — per identity, per window
 # ---------------------------------------------------------------------------
 
-def _make_prompt(ident: str, nearby_ids: List[str]) -> str:
+def _make_msa_prompt(target_phrase: str, nearby_ids: List[str]) -> str:
     """
-    Build the PLM prompt for one identity + window.
-
-    Each frame has:
-      - A colored rectangle following the target person (ID '{ident}').
-      - Grey rectangles on all other tracked people in the vicinity.
-    nearby_ids are passed as text so PLM never needs to read image labels.
+    Shared M/S/A prompt template.  Only *target_phrase* differs between
+    default (colored-box) and attn-bias modes.
     """
     if nearby_ids:
         nearby_text = ", ".join(nearby_ids)
@@ -118,51 +114,36 @@ def _make_prompt(ident: str, nearby_ids: List[str]) -> str:
 
     return (
         f"Watch this video clip carefully. "
-        f"One person is highlighted with a colored rectangle across all frames. "
-        f"All other nearby people are shown with grey rectangles. "
-        f"Describe only the person inside the colored rectangle. "
+        f"{target_phrase} "
         f"Reply in plain English only — do not output coordinates, frame numbers, or timestamps. "
         f"Use this exact format:\n"
         f"Motion: <how this person is moving, in 2-5 words>\n"
         f"{social_instruction}\n"
         f"Activity: <what this person is doing, in 2-5 words>\n"
         f"If a field is not clearly visible write 'unclear'."
+    )
+
+
+def _make_prompt(ident: str, nearby_ids: List[str]) -> str:
+    return _make_msa_prompt(
+        "One person is highlighted with a colored rectangle across all frames. "
+        "All other nearby people are shown with grey rectangles. "
+        "Describe only the person inside the colored rectangle.",
+        nearby_ids,
     )
 
 
 def _make_attn_bias_prompt(ident: str, nearby_ids: List[str]) -> str:
-    """
-    Prompt for attention-bias inference mode.
-    Frames are unmodified (no drawn boxes). No spatial hint is given in text —
-    the attention bias alone steers the model to the target person's patches.
-    """
-    if nearby_ids:
-        nearby_text = ", ".join(nearby_ids)
-        social_instruction = (
-            f"Social: <from this list of nearby people [{nearby_text}], "
-            f"list only those that this person is physically touching "
-            f"(e.g. hugging, holding hands, lifting). "
-            f"Use their exact IDs. If none, write 'none'.>"
-        )
-    else:
-        social_instruction = "Social: none"
-
-    return (
-        f"Watch this video clip carefully. "
-        f"Describe the person of interest in the scene. "
-        f"Reply in plain English only — do not output coordinates, frame numbers, or timestamps. "
-        f"Use this exact format:\n"
-        f"Motion: <how this person is moving, in 2-5 words>\n"
-        f"{social_instruction}\n"
-        f"Activity: <what this person is doing, in 2-5 words>\n"
-        f"If a field is not clearly visible write 'unclear'."
+    return _make_msa_prompt(
+        "Describe the person of interest in the scene.",
+        nearby_ids,
     )
 
 
-def _make_attn_bias_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
+def _make_taxonomy_prompt_base(target_phrase: str, nearby_ids: List[str]) -> str:
     """
-    Taxonomy prompt for attention-bias mode — frames are unmodified.
-    No spatial hint in text; the attention bias identifies the target person.
+    Shared taxonomy prompt template.  Only *target_phrase* differs between
+    default (colored-box) and attn-bias modes.
     """
     nearby_text = ", ".join(nearby_ids) if nearby_ids else "none"
     bs_list = " | ".join(sorted(BODY_STATES))
@@ -171,9 +152,9 @@ def _make_attn_bias_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
     sc_list = " | ".join(sorted(SOCIAL_TAX))
     se_list = " | ".join(sorted(SAFETY_EVENTS))
     return (
-        f"Watch this video clip. Classify the person of interest in the scene.\n"
+        f"Watch this video clip. {target_phrase}\n"
         f"Nearby people: {nearby_text}\n\n"
-        f"Classify ONLY that person. Pick exactly one label per slot:\n\n"
+        f"Classify ONLY the target person. Pick exactly one label per slot:\n\n"
         f"body_state:   {bs_list}\n"
         f"obj_verb:     {ov_list}\n"
         f"obj_noun:     {on_list}\n"
@@ -192,9 +173,18 @@ def _make_attn_bias_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Taxonomy — structured classification  (separate PLM call from M/S/A)
-# ---------------------------------------------------------------------------
+def _make_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
+    return _make_taxonomy_prompt_base(
+        "One person is highlighted with a colored rectangle.",
+        nearby_ids,
+    )
+
+
+def _make_attn_bias_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
+    return _make_taxonomy_prompt_base(
+        "Focus on the person of interest in the scene.",
+        nearby_ids,
+    )
 
 BODY_STATES = frozenset({
     "idle_stand", "idle_sit", "walk", "walk_loaded", "run",
@@ -219,35 +209,6 @@ SAFETY_EVENTS = frozenset({
     "none", "zone_enter", "zone_exit", "ppe_don", "ppe_doff",
     "near_miss", "hazard_response", "fall",
 })
-
-
-def _make_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
-    nearby_text = ", ".join(nearby_ids) if nearby_ids else "none"
-    bs_list = " | ".join(sorted(BODY_STATES))
-    ov_list = " | ".join(sorted(OBJ_VERBS))
-    on_list = " | ".join(sorted(OBJ_NOUNS_CORE)) + " | <other object if needed>"
-    sc_list = " | ".join(sorted(SOCIAL_TAX))
-    se_list = " | ".join(sorted(SAFETY_EVENTS))
-    return (
-        f"Watch this video clip. One person is highlighted with a colored rectangle.\n"
-        f"Nearby people: {nearby_text}\n\n"
-        f"Classify ONLY the highlighted person. Pick exactly one label per slot:\n\n"
-        f"body_state:   {bs_list}\n"
-        f"obj_verb:     {ov_list}\n"
-        f"obj_noun:     {on_list}\n"
-        f"social:       {sc_list}\n"
-        f"              REQUIRED when not none: also list which nearby person ID(s)\n"
-        f"              are involved, e.g.  social: co_manipulate [d14709]\n"
-        f"safety_event: {se_list}\n"
-        f"other_text:   (free text only if none of the slots above apply; else leave blank)\n\n"
-        f"Reply ONLY in this format, one field per line:\n"
-        f"body_state: <label>\n"
-        f"obj_verb: <label>\n"
-        f"obj_noun: <label>\n"
-        f"social: <label> [<id1>, <id2>]  — or —  social: none\n"
-        f"safety_event: <label>\n"
-        f"other_text: <text or blank>"
-    )
 
 
 def _match_label(val: str, allowed: frozenset, default: str) -> str:
