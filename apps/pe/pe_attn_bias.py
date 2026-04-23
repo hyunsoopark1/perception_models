@@ -50,6 +50,7 @@ Usage
 import contextlib
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -182,6 +183,79 @@ def compute_bbox_bias_mask(
                 if seq_pos < seq_len:
                     mask[0, 0, 0, seq_pos] = bias
     return mask
+
+
+def make_attn_bias_debug_image(
+    frame_rgb: np.ndarray,
+    cx: float, cy: float, w: float, h: float,
+    orig_w: int, orig_h: int,
+    image_size: int = 448,
+    n_patches_side: int = 32,
+    bias_color: Tuple[int, int, int] = (0, 220, 100),
+    alpha: float = 0.45,
+    draw_grid: bool = True,
+) -> np.ndarray:
+    """
+    Return a copy of *frame_rgb* (H×W×3 uint8) with the attention-bias
+    patch overlay drawn on it.
+
+    Layout
+    ------
+    • Biased patches  — solid fill at *bias_color* blended with *alpha*.
+    • Patch grid      — faint grey lines at every patch boundary (optional).
+    • Bbox outline    — solid *bias_color* rectangle, 2 px thick.
+
+    Coordinate chain
+    ----------------
+    original pixels  →  scale by (image_size/orig_dim)  →  PLM 448-px space
+    patch grid       →  14×14 cells in 448-px space
+    overlay patches  →  scale back by (orig_dim/image_size)  →  original pixels
+    """
+    import cv2
+
+    H, W = frame_rgb.shape[:2]
+    patch_size_f = image_size / n_patches_side      # 14.0 in the 448-px space
+    sx = W / image_size                             # scale patch→original x
+    sy = H / image_size                             # scale patch→original y
+
+    patch_idxs = set(bbox_to_patch_indices(
+        cx, cy, w, h, orig_w, orig_h, image_size, n_patches_side,
+    ))
+
+    # --- alpha-blend biased patches ---
+    overlay = frame_rgb.astype(np.float32).copy()
+    for p in patch_idxs:
+        row = p // n_patches_side
+        col = p % n_patches_side
+        ix1 = max(0, int(col * patch_size_f * sx))
+        iy1 = max(0, int(row * patch_size_f * sy))
+        ix2 = min(W, int((col + 1) * patch_size_f * sx))
+        iy2 = min(H, int((row + 1) * patch_size_f * sy))
+        overlay[iy1:iy2, ix1:ix2] = bias_color
+
+    out = (frame_rgb.astype(np.float32) * (1 - alpha) + overlay * alpha)
+    out = out.clip(0, 255).astype(np.uint8)
+
+    # --- faint patch grid ---
+    # out is RGB; cv2 drawing writes tuple values directly into the array
+    if draw_grid:
+        for i in range(1, n_patches_side):
+            gx = int(i * patch_size_f * sx)
+            gy = int(i * patch_size_f * sy)
+            cv2.line(out, (gx, 0), (gx, H - 1), (60, 60, 60), 1, cv2.LINE_AA)
+            cv2.line(out, (0, gy), (W - 1, gy), (60, 60, 60), 1, cv2.LINE_AA)
+
+    # --- bbox outline ---
+    bx1 = max(0, int(cx - w / 2));  by1 = max(0, int(cy - h / 2))
+    bx2 = min(W, int(cx + w / 2));  by2 = min(H, int(cy + h / 2))
+    cv2.rectangle(out, (bx1, by1), (bx2, by2), bias_color, 2)
+
+    # --- patch-count label ---
+    label = f"{len(patch_idxs)} biased patches"
+    cv2.putText(out, label, (6, H - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, bias_color, 1, cv2.LINE_AA)
+
+    return out
 
 
 @contextlib.contextmanager

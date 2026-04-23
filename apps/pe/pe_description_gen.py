@@ -370,6 +370,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Skip the Motion/Social/Activity PLM call; run taxonomy only.")
     p.add_argument("--no-video", action="store_true",
                    help="Skip video rendering.")
+    p.add_argument("--debug-attn-bias-dir", default=None, metavar="DIR",
+                   help="Save one attention-bias debug image per identity per window "
+                        "into this directory (requires --attn-bias or --compare).")
     p.add_argument("--compare", action="store_true",
                    help="Run both default (colored-box) and attn-bias modes on every "
                         "clip and render both result sets on the overlay video side-by-side "
@@ -830,7 +833,14 @@ if __name__ == "__main__":
             bbox_attention_bias,
             compute_bbox_bias_mask,
             get_image_patch_positions,
+            make_attn_bias_debug_image,
         )
+
+    _debug_ab_dir = None
+    if args.debug_attn_bias_dir:
+        _debug_ab_dir = Path(args.debug_attn_bias_dir)
+        _debug_ab_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  debug attn-bias images → {_debug_ab_dir}")
         print(f"  attn-bias mode: patch_grid={_n_patches_side}×{_n_patches_side}  "
               f"patches/frame={_patches_per_frm}  bbox_bias={args.bbox_bias}")
 
@@ -941,6 +951,26 @@ if __name__ == "__main__":
             ]
             frames_ann, _ = plm_transform._process_multiple_images_pil(annotated)
             frames_raw, _ = plm_transform._process_multiple_images_pil(pil_frames)
+
+            # ----------------------------------------------------------
+            # Debug: save attn-bias overlay for the middle sampled frame
+            # ----------------------------------------------------------
+            if _debug_ab_dir is not None and (args.attn_bias or args.compare):
+                mid = len(frame_indices) // 2
+                mid_fidx = frame_indices[mid]
+                mid_cx, mid_cy, mid_w, mid_h = bbox_coords[mid]
+                mid_rgb = np.array(frame_cache[mid_fidx])
+                debug_img = make_attn_bias_debug_image(
+                    mid_rgb,
+                    mid_cx, mid_cy, mid_w, mid_h,
+                    orig_w=frame_w, orig_h=frame_h,
+                    image_size=_vis_image_size,
+                    n_patches_side=_n_patches_side,
+                )
+                debug_path = _debug_ab_dir / f"{ident}_w{wid:04d}_f{mid_fidx:05d}.jpg"
+                import cv2 as _cv2
+                _cv2.imwrite(str(debug_path),
+                             _cv2.cvtColor(debug_img, _cv2.COLOR_RGB2BGR))
 
             # ----------------------------------------------------------
             # Helpers: one attn-bias M/S/A call, one attn-bias taxonomy call
