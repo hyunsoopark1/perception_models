@@ -92,15 +92,18 @@ def _biased_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=Fal
                 )  # [1, 1, 1, sk]
 
             if is_causal:
-                # Materialise the causal mask and fold in the bbox bias.
-                # PyTorch convention for (sq, sk) with sq <= sk:
-                #   q[i] attends to k[j] iff j <= (sk - sq + i)
-                # → lower-triangular with diagonal offset (sk - sq).
-                causal_mask = torch.full(
-                    (1, 1, sq, sk), float("-inf"), dtype=query.dtype, device=query.device
+                # Materialise the standard lower-triangular causal mask:
+                #   q[i] attends to k[j] iff j <= i  (upper-triangle → -inf)
+                # This matches PyTorch's is_causal=True behaviour and the
+                # training distribution (sq==sk, j<=i).  Zero-padded cache
+                # slots at positions j > i are automatically excluded.
+                causal_mask = torch.zeros(
+                    1, 1, sq, sk, dtype=query.dtype, device=query.device
                 )
-                attend = torch.ones(sq, sk, dtype=torch.bool, device=query.device).tril(sk - sq)
-                causal_mask.masked_fill_(attend.unsqueeze(0).unsqueeze(0), 0.0)
+                causal_mask.masked_fill_(
+                    torch.ones(sq, sk, dtype=torch.bool, device=query.device).triu(1),
+                    float("-inf"),
+                )
                 attn_mask = causal_mask + bias
                 is_causal = False
             else:
