@@ -137,7 +137,9 @@ def _make_prompt(ident: str, nearby_ids: List[str]) -> str:
 
 def _make_attn_bias_prompt(ident: str, nearby_ids: List[str]) -> str:
     return _make_msa_prompt(
-        "Describe the person of interest in the scene.",
+        "One specific person is the subject of this analysis. "
+        "Ignore all other people. "
+        "Describe ONLY that individual person's body movement and what they are doing.",
         nearby_ids,
     )
 
@@ -184,7 +186,8 @@ def _make_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
 
 def _make_attn_bias_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
     return _make_taxonomy_prompt_base(
-        "Focus on the person of interest in the scene.",
+        "One specific person is the subject of this analysis — ignore all others. "
+        "Classify ONLY that individual's body state and object interaction.",
         nearby_ids,
     )
 
@@ -323,10 +326,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Use attention bias instead of drawing boxes on frames. "
                         "The image is unmodified; PLM attention is steered toward "
                         "the target person's patch region via SDPA bias injection.")
-    p.add_argument("--bbox-bias", type=float, default=10.0, metavar="B",
+    p.add_argument("--bbox-bias", type=float, default=5.0, metavar="B",
                    help="Suppression magnitude applied to non-bbox image patches "
-                        "(default: 10 → e^-10 ≈ 4500x suppression; "
-                        "use higher values for harder masking, lower for softer).")
+                        "(default: 5 → e^-5 ≈ 150x suppression; "
+                        "higher = harder person isolation but loses full-body pose context).")
     # --- proximity ---
     p.add_argument("--proximity-scale", type=float, default=2.0, metavar="S",
                    help="Nearby threshold = this × avg_bbox_dim (default: 2.0).")

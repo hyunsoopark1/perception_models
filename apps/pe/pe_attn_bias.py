@@ -188,25 +188,27 @@ def compute_bbox_bias_mask(
     orig_h: int,
     image_size: int,
     seq_len: int,
-    bias: float = 10.0,
+    bias: float = 5.0,
 ) -> torch.Tensor:
     """
     Build the [1, 1, 1, seq_len] attention bias mask.
 
-    Goal: hard-suppress non-bbox image patches so the model attends only
-    to the target person's patches and the text tokens.
+    Suppresses non-bbox image patches so the model primarily attends to the
+    target person's patches and the text tokens.
 
     Mask values
     -----------
-    text tokens       : 0       (unmodified — compete on content similarity)
-    bbox patch tokens : 0       (unmodified — compete on content similarity)
-    non-bbox patches  : -bias   (suppressed; at -100, e^-100 ≈ 0 → zero attention)
+    text tokens       : 0      (unmodified)
+    bbox patch tokens : 0      (unmodified)
+    non-bbox patches  : -bias  (suppressed; e^-5 ≈ 150x less attention than bbox)
 
-    With bias=100 this acts as a hard mask: the model effectively sees only
-    the bbox region of each frame plus the text prompt.
+    The default bias=5 is a soft suppress: the model still has access to global
+    scene context (needed for pose estimation) but attends ~150x more to the
+    bbox region.  Use higher values (10+) for harder person isolation at the
+    cost of losing full-body pose context.
 
     bbox_coords_per_frame : list of (cx, cy, w, h) — one entry per sampled frame.
-    bias                  : suppression magnitude for non-bbox patches (default 100).
+    bias                  : suppression magnitude for non-bbox patches (default 5).
     """
     mask = torch.zeros(1, 1, 1, seq_len, dtype=torch.float32)
 
