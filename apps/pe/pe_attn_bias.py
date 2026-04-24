@@ -66,6 +66,7 @@ import torch.nn.functional as F
 
 _ACTIVE_BIAS: Optional[torch.Tensor] = None  # shape [1, 1, 1, seq_len]
 _ORIG_SDPA = None
+_bias_applied_count = 0   # incremented each time the bias actually fires (for diagnostics)
 
 
 def _biased_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, **kwargs):
@@ -83,6 +84,8 @@ def _biased_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=Fal
         # during prefill.  The actual prompt keys occupy positions 0..mask_len-1;
         # positions mask_len..sk-1 are zero-filled and must get neutral (0) bias.
         if sq == mask_len:
+            global _bias_applied_count
+            _bias_applied_count += 1
             bias = _ACTIVE_BIAS.to(dtype=query.dtype, device=query.device)
 
             # Pad bias to full key-cache dimension (zeros for zero-filled slots).
@@ -323,13 +326,18 @@ def bbox_attention_bias(mask: torch.Tensor):
     Only affects prefill (key seq dim == mask seq dim).
     Generation steps (KV-cache dim > mask dim) are automatically skipped.
     """
-    global _ACTIVE_BIAS, _ORIG_SDPA
+    global _ACTIVE_BIAS, _ORIG_SDPA, _bias_applied_count
     _ACTIVE_BIAS = mask
     _ORIG_SDPA = F.scaled_dot_product_attention
     F.scaled_dot_product_attention = _biased_sdpa
+    _bias_applied_count = 0
+    n_suppressed = int((mask < 0).sum())
+    n_active = mask.shape[-1] - n_suppressed  # text tokens + bbox patches (bias=0)
     try:
         yield
     finally:
         F.scaled_dot_product_attention = _ORIG_SDPA
         _ORIG_SDPA = None
         _ACTIVE_BIAS = None
+        print(f"        [AB-dbg] bias fired {_bias_applied_count}x  "
+              f"active={n_active} suppressed={n_suppressed} / {mask.shape[-1]} tokens")
