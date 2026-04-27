@@ -188,27 +188,31 @@ def compute_bbox_bias_mask(
     orig_h: int,
     image_size: int,
     seq_len: int,
-    bias: float = 5.0,
+    bias: float = 10.0,
+    bbox_expand: float = 1.5,
 ) -> torch.Tensor:
     """
     Build the [1, 1, 1, seq_len] attention bias mask.
 
-    Suppresses non-bbox image patches so the model primarily attends to the
-    target person's patches and the text tokens.
-
     Mask values
     -----------
-    text tokens       : 0      (unmodified)
-    bbox patch tokens : 0      (unmodified)
-    non-bbox patches  : -bias  (suppressed; e^-5 ≈ 150x less attention than bbox)
+    text tokens              : 0      (unmodified)
+    expanded-bbox patches    : 0      (unmodified — the model's "viewing region")
+    all other image patches  : -bias  (suppressed; e^-10 ≈ 22000x exclusion)
 
-    The default bias=5 is a soft suppress: the model still has access to global
-    scene context (needed for pose estimation) but attends ~150x more to the
-    bbox region.  Use higher values (10+) for harder person isolation at the
-    cost of losing full-body pose context.
+    bbox_expand controls how much the tight tracking bbox is grown before
+    computing the active patch set.  1.5 (default) expands width and height
+    by 50%, giving the model full-body context and a small margin of
+    surrounding scene — enough for pose estimation — while still hard-excluding
+    other people standing/walking far from the target.
+
+    With bias=10 (default) the exclusion is near-total (e^-10 ≈ 0.00005).
+    For a highly salient distractor (e.g. a walking adult) even bias=5 is
+    insufficient because raw Q·K scores can exceed 5; use 10+ to be safe.
 
     bbox_coords_per_frame : list of (cx, cy, w, h) — one entry per sampled frame.
-    bias                  : suppression magnitude for non-bbox patches (default 5).
+    bias                  : suppression magnitude for non-active patches.
+    bbox_expand           : multiplicative expansion of w and h (default 1.5).
     """
     mask = torch.zeros(1, 1, 1, seq_len, dtype=torch.float32)
 
@@ -217,10 +221,11 @@ def compute_bbox_bias_mask(
         if pos < seq_len:
             mask[0, 0, 0, pos] = -bias
 
-    # 2. Restore bbox patch positions to 0 (un-suppress target person)
+    # 2. Restore expanded-bbox patch positions to 0 (un-suppress target person)
     for frame_idx, (cx, cy, w, h) in enumerate(bbox_coords_per_frame):
         patch_idxs = bbox_to_patch_indices(
-            cx, cy, w, h, orig_w, orig_h, image_size, n_patches_side,
+            cx, cy, w * bbox_expand, h * bbox_expand,
+            orig_w, orig_h, image_size, n_patches_side,
         )
         frame_offset = frame_idx * patches_per_frame
         for p in patch_idxs:

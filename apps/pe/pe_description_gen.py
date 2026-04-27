@@ -326,10 +326,14 @@ def _parse_args() -> argparse.Namespace:
                    help="Use attention bias instead of drawing boxes on frames. "
                         "The image is unmodified; PLM attention is steered toward "
                         "the target person's patch region via SDPA bias injection.")
-    p.add_argument("--bbox-bias", type=float, default=5.0, metavar="B",
+    p.add_argument("--bbox-bias", type=float, default=10.0, metavar="B",
                    help="Suppression magnitude applied to non-bbox image patches "
-                        "(default: 5 → e^-5 ≈ 150x suppression; "
-                        "higher = harder person isolation but loses full-body pose context).")
+                        "(default: 10 → e^-10 ≈ 22000x suppression; "
+                        "lower values let salient distractors leak through).")
+    p.add_argument("--bbox-expand", type=float, default=1.5, metavar="E",
+                   help="Multiplicative expansion of the tracking bbox before "
+                        "computing active patches (default: 1.5 = 50%% wider+taller). "
+                        "Gives the model full-body context without exposing other people.")
     # --- proximity ---
     p.add_argument("--proximity-scale", type=float, default=2.0, metavar="S",
                    help="Nearby threshold = this × avg_bbox_dim (default: 2.0).")
@@ -944,7 +948,8 @@ if __name__ == "__main__":
                 mid_rgb = np.array(frame_cache[mid_fidx])
                 debug_img = make_attn_bias_debug_image(
                     mid_rgb,
-                    mid_cx, mid_cy, mid_w, mid_h,
+                    mid_cx, mid_cy,
+                    mid_w * args.bbox_expand, mid_h * args.bbox_expand,
                     orig_w=frame_w, orig_h=frame_h,
                     image_size=_vis_image_size,
                     n_patches_side=_n_patches_side,
@@ -966,6 +971,7 @@ if __name__ == "__main__":
                     orig_w=frame_w, orig_h=frame_h,
                     image_size=_vis_image_size,
                     seq_len=sl, bias=args.bbox_bias,
+                    bbox_expand=args.bbox_expand,
                 )
 
             def _run_ab_msa(ft):
