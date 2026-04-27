@@ -35,11 +35,18 @@ reliable person isolation.
 
 No model weights are changed.
 
-Prefill-only guard
-------------------
-The bias fires only during prefill, detected by sq == mask_len:
-  - Prefill:    sq = len(text_ids) = mask_len   → bias applied
-  - Generation: sq = 1 << mask_len              → bias skipped
+Prefill + generation guard
+--------------------------
+The bias fires during BOTH prefill and generation:
+  - Prefill:    sq = len(text_ids) = mask_len   → bias applied (is_causal=True path)
+  - Generation: sq = 1                          → bias applied (boolean mask path)
+  - Other:      sq ∉ {mask_len, 1}              → skipped (unused in practice)
+
+Applying during generation is essential: non-bbox patch keys remain in the KV
+cache after prefill and carry visual features from the initial ViT embeddings.
+Without generation suppression, each newly generated query token freely attends
+to those keys — causing the model to describe the wrong person even when the
+prefill bias was extreme (e.g. -100).
 
 KV-cache note: KVCache.update() returns the full pre-allocated buffer (max_tokens,
 e.g. 11264), so sk >> seq_len even during prefill.  The bias is zero-padded from
@@ -96,43 +103,53 @@ def _biased_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=Fal
     if _ACTIVE_BIAS is not None:
         sq = query.shape[2]   # [B, H, S, D] layout
         sk = key.shape[2]
-        mask_len = _ACTIVE_BIAS.shape[-1]   # = len(text_ids) = actual prompt token count
+        mask_len = _ACTIVE_BIAS.shape[-1]
 
-        # Detect prefill: query processes the full prompt at once (sq == prompt length).
-        # Generation steps have sq == 1 which is always << mask_len.
+        # Apply during BOTH prefill (sq == mask_len) AND generation (sq == 1).
         #
-        # Key note: the model uses a KV cache pre-sized to max_tokens (e.g. 11264).
-        # KVCache.update() returns the full cache buffer, so sk == max_tokens even
-        # during prefill.  The actual prompt keys occupy positions 0..mask_len-1;
-        # positions mask_len..sk-1 are zero-filled and must get neutral (0) bias.
-        if sq == mask_len:
+        # Why generation matters:
+        #   During prefill the bias prevents text/bbox tokens from attending to
+        #   non-bbox (e.g. teacher) patches.  But those patch keys remain in the
+        #   KV cache, and during token-by-token generation there is NO bias —
+        #   every newly generated query token can freely attend to the teacher's
+        #   cached keys, which still carry visual features from the initial ViT
+        #   embeddings.  Result: the model describes the teacher even when the
+        #   prefill bias was extreme (e.g. -100).
+        #   Applying the suppression during generation closes this loophole.
+        if sq == mask_len or sq == 1:
             global _bias_applied_count
             _bias_applied_count += 1
             bias = _ACTIVE_BIAS.to(dtype=query.dtype, device=query.device)
 
-            # Pad bias to full key-cache dimension (zeros for zero-filled slots).
+            # Pad bias to full key-cache size.
+            # Positions 0..mask_len-1 : prompt tokens (bbox/text bias already set).
+            # Positions mask_len..sk-1: generated tokens + cache tail → 0 (no suppression).
             if sk > mask_len:
                 bias = torch.cat(
                     [bias, bias.new_zeros(1, 1, 1, sk - mask_len)], dim=-1
                 )  # [1, 1, 1, sk]
 
             if is_causal:
-                # Materialise the standard lower-triangular causal mask:
-                #   q[i] attends to k[j] iff j <= i  (upper-triangle → -inf)
-                # This matches PyTorch's is_causal=True behaviour and the
-                # training distribution (sq==sk, j<=i).  Zero-padded cache
-                # slots at positions j > i are automatically excluded.
-                causal_mask = torch.zeros(
-                    1, 1, sq, sk, dtype=query.dtype, device=query.device
-                )
+                # Prefill path: materialise standard lower-triangular causal mask
+                # (j > i → -inf) and fold in the bbox bias.
+                causal_mask = torch.zeros(1, 1, sq, sk, dtype=query.dtype, device=query.device)
                 causal_mask.masked_fill_(
                     torch.ones(sq, sk, dtype=torch.bool, device=query.device).triu(1),
                     float("-inf"),
                 )
                 attn_mask = causal_mask + bias
                 is_causal = False
+            elif attn_mask is not None and attn_mask.dtype == torch.bool:
+                # Generation path: attn_mask is the boolean doc×causal mask
+                # [n_seqs, max_tokens] produced by generate_next_token().
+                # Convert: True (attend) → 0.0, False (block) → -inf, then add bias.
+                float_mask = torch.zeros_like(attn_mask, dtype=bias.dtype)
+                float_mask.masked_fill_(~attn_mask, float("-inf"))
+                # unsqueeze to [1, 1, n_seqs, sk] for broadcast with bias [1,1,1,sk]
+                attn_mask = float_mask.unsqueeze(0).unsqueeze(0) + bias
             else:
                 attn_mask = bias if attn_mask is None else attn_mask + bias
+
     return _ORIG_SDPA(query, key, value,
                       attn_mask=attn_mask, dropout_p=dropout_p,
                       is_causal=is_causal, **kwargs)
@@ -368,5 +385,6 @@ def bbox_attention_bias(mask: torch.Tensor):
         F.scaled_dot_product_attention = _ORIG_SDPA
         _ORIG_SDPA = None
         _ACTIVE_BIAS = None
-        print(f"        [AB-dbg] bias fired {_bias_applied_count}x  "
-              f"active={n_active} suppressed={n_suppressed} / {mask.shape[-1]} tokens")
+        # _bias_applied_count = n_layers × (1 prefill-pass + n_gen_steps)
+        print(f"        [AB-dbg] bias fired {_bias_applied_count}x (prefill+gen)  "
+              f"active={n_active} suppressed={n_suppressed} / {mask.shape[-1]} prompt tokens")
