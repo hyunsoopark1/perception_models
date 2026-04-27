@@ -135,9 +135,10 @@ def _make_prompt(ident: str, nearby_ids: List[str]) -> str:
     )
 
 
-def _make_attn_bias_prompt(ident: str, nearby_ids: List[str]) -> str:
+def _make_attn_bias_prompt(ident: str, nearby_ids: List[str],
+                           coord_hint: str = "") -> str:
     return _make_msa_prompt(
-        "One specific person is the subject of this analysis. "
+        f"One specific person is the subject of this analysis.{coord_hint} "
         "Ignore all other people. "
         "Describe ONLY that individual person's body movement and what they are doing.",
         nearby_ids,
@@ -184,9 +185,10 @@ def _make_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
     )
 
 
-def _make_attn_bias_taxonomy_prompt(ident: str, nearby_ids: List[str]) -> str:
+def _make_attn_bias_taxonomy_prompt(ident: str, nearby_ids: List[str],
+                                    coord_hint: str = "") -> str:
     return _make_taxonomy_prompt_base(
-        "One specific person is the subject of this analysis — ignore all others. "
+        f"One specific person is the subject of this analysis — ignore all others.{coord_hint} "
         "Classify ONLY that individual's body state and object interaction.",
         nearby_ids,
     )
@@ -960,6 +962,19 @@ if __name__ == "__main__":
                              _cv2.cvtColor(debug_img, _cv2.COLOR_RGB2BGR))
 
             # ----------------------------------------------------------
+            # Coordinate hint for AB prompts: give the model a text anchor
+            # so it knows WHICH person is the subject (attention bias steers
+            # visual attention, but the model also needs a language cue about
+            # the person's location to produce person-specific descriptions).
+            # ----------------------------------------------------------
+            _avg_cx = sum(c[0] for c in bbox_coords) / len(bbox_coords)
+            _avg_cy = sum(c[1] for c in bbox_coords) / len(bbox_coords)
+            _coord_hint = (
+                f" The subject person is located near pixel"
+                f" ({int(_avg_cx)}, {int(_avg_cy)}) in each frame."
+            )
+
+            # ----------------------------------------------------------
             # Helpers: one attn-bias M/S/A call, one attn-bias taxonomy call
             # ----------------------------------------------------------
             def _ab_bias_mask(prompt_str, ft):
@@ -975,7 +990,7 @@ if __name__ == "__main__":
                 )
 
             def _run_ab_msa(ft):
-                p = _make_attn_bias_prompt(ident, nearby_ids)
+                p = _make_attn_bias_prompt(ident, nearby_ids, _coord_hint)
                 with bbox_attention_bias(_ab_bias_mask(p, ft)):
                     r, _, _ = generator.generate([(p, ft)])
                 raw_ = r[0].strip()
@@ -985,7 +1000,7 @@ if __name__ == "__main__":
                 return m, s, a, raw_
 
             def _run_ab_taxonomy(ft):
-                p = _make_attn_bias_taxonomy_prompt(ident, nearby_ids)
+                p = _make_attn_bias_taxonomy_prompt(ident, nearby_ids, _coord_hint)
                 with bbox_attention_bias(_ab_bias_mask(p, ft)):
                     r, _, _ = generator.generate([(p, ft)])
                 raw_ = r[0].strip()

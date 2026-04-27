@@ -369,8 +369,12 @@ def bbox_attention_bias(mask: torch.Tensor):
     Context manager that injects *mask* as an additive attention bias into
     every F.scaled_dot_product_attention call for the duration of the block.
 
-    Only affects prefill (key seq dim == mask seq dim).
-    Generation steps (KV-cache dim > mask dim) are automatically skipped.
+    Fires on BOTH prefill (sq == seq_len, is_causal=True) and every
+    token-generation step (sq == 1, boolean doc×causal mask).  Applying
+    the suppression during generation is essential: without it, each newly
+    generated query token freely attends to non-bbox patch keys sitting in
+    the KV cache, causing the model to describe the wrong person even when
+    the prefill bias is extreme.
     """
     global _ACTIVE_BIAS, _ORIG_SDPA, _bias_applied_count
     _ACTIVE_BIAS = mask
