@@ -7,10 +7,14 @@ PLM is LLaVA-style: image patch tokens (CLS stripped, then projected) are
 stitched directly into the self-attention token sequence at positions given
 by `image_pos` (returned by PLMTokenizer._tokenize_for_generation).
 
-For a 448-px image with patch_size=14 and pooling_ratio=1:
-    n_patches_side  = 448 // 14 = 32
+For a 448-px image with patch_size=14 and pooling_ratio=2 (default):
+    n_patches_side   = 448 // 14 // 2 = 16
+    patches_per_frame = 16 × 16 = 256
+    image_pos[f * 256 + row * 16 + col] = sequence position of patch (f, row, col)
+
+With --no-pool (pooling_ratio=1):
+    n_patches_side   = 448 // 14 = 32
     patches_per_frame = 32 × 32 = 1024
-    image_pos[f * 1024 + row * 32 + col] = sequence position of patch (f, row, col)
 
 Bias injection
 --------------
@@ -19,19 +23,37 @@ We monkey-patch torch.nn.functional.scaled_dot_product_attention to add a
 
     effective_score[q, k] = (Q[q] · K[k]) / sqrt(d) + bias[k]
 
-Setting bias[k] = BBOX_BIAS for k ∈ bbox-patch positions means every
-query token (text + other patches) attends ~e^BBOX_BIAS ≈ 20× more strongly
-to the target-person patches.  No model weights are changed.
+The mask has two values:
+    expanded-bbox patches  →  0      (no bias; compete normally)
+    all other image patches →  -bias  (suppressed; e^-10 ≈ 22000× less attention)
 
-The bias is automatically skipped for generation steps: during token-by-token
-generation the query dimension is 1 (one new token), which is always far smaller
-than `seq_len`, so the shape check `S_q == seq_len` fails and the original SDPA
-runs unmodified.
+The bbox is expanded by bbox_expand (default 1.5×) before selecting active patches.
+This gives the model full-body context (needed for pose/motion estimation) while
+still hard-excluding other people farther away.  A raw Q·K score of ≥5 is common
+for salient distractors (walking adults, etc.), so bias ≥ 10 is required for
+reliable person isolation.
 
-KV-cache note: the model pre-allocates a fixed-size KV cache (max_tokens, e.g.
-11264).  KVCache.update() returns the full cache buffer, so S_k == max_tokens
-even during prefill.  The bias mask (length seq_len) is therefore zero-padded to
-S_k before being added; the zero-filled cache slots receive neutral (0) bias.
+No model weights are changed.
+
+Prefill-only guard
+------------------
+The bias fires only during prefill, detected by sq == mask_len:
+  - Prefill:    sq = len(text_ids) = mask_len   → bias applied
+  - Generation: sq = 1 << mask_len              → bias skipped
+
+KV-cache note: KVCache.update() returns the full pre-allocated buffer (max_tokens,
+e.g. 11264), so sk >> seq_len even during prefill.  The bias is zero-padded from
+seq_len to sk so zero-filled cache slots receive neutral (0) bias.
+
+Token-sequence layout (plm_sft template)
+-----------------------------------------
+BOS + system + <|eot_id|> + user-header
++ <|image|> × (n_frames × patches_per_frame)   ← image tokens come first
++ question text + <|eot_id|> + assistant-header
+
+image_pos[f * patches_per_frame + row * n_patches_side + col]
+    = sequence position of patch at (frame f, row, col) in PLM patch grid.
+Patches are row-major (left→right, top→bottom), matching ViT output order.
 
 Usage
 -----
@@ -44,10 +66,10 @@ Usage
     image_pos, seq_len = get_image_patch_positions(generator.tokenizer, prompt, frames_tensor)
     mask = compute_bbox_bias_mask(
         image_pos, bbox_coords_per_frame,
-        patches_per_frame=1024, n_patches_side=32,
+        patches_per_frame=256, n_patches_side=16,
         orig_w=frame_w, orig_h=frame_h,
         image_size=448, seq_len=seq_len,
-        bias=3.0,
+        bias=10.0, bbox_expand=1.5,
     )
     with bbox_attention_bias(mask):
         responses, _, _ = generator.generate([(prompt, frames_tensor)])
