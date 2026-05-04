@@ -860,14 +860,17 @@ if __name__ == "__main__":
             get_image_patch_positions,
             make_attn_bias_debug_image,
         )
+    elif args.debug_attn_bias_dir:
+        # Debug images work in any mode — just need the visualiser.
+        from apps.pe.pe_attn_bias import make_attn_bias_debug_image
 
     _debug_ab_dir = None
     if args.debug_attn_bias_dir:
         _debug_ab_dir = Path(args.debug_attn_bias_dir)
         _debug_ab_dir.mkdir(parents=True, exist_ok=True)
-        print(f"  debug attn-bias images → {_debug_ab_dir}")
-        print(f"  attn-bias mode: patch_grid={_n_patches_side}×{_n_patches_side}  "
-              f"patches/frame={_patches_per_frm}  bbox_bias={args.bbox_bias}")
+        print(f"  debug attn-bias images → {_debug_ab_dir}"
+              f"  (patch_grid={_n_patches_side}×{_n_patches_side},"
+              f" {_patches_per_frm} tokens/frame)")
 
     print(f"  generator ready  (max_gen_len={args.max_gen_len}, "
           f"temperature={args.temperature})")
@@ -980,7 +983,7 @@ if __name__ == "__main__":
             # ----------------------------------------------------------
             # Debug: save attn-bias overlay for the middle sampled frame
             # ----------------------------------------------------------
-            if _debug_ab_dir is not None and (args.attn_bias or args.compare):
+            if _debug_ab_dir is not None:
                 mid = len(frame_indices) // 2
                 mid_fidx = frame_indices[mid]
                 mid_cx, mid_cy, mid_w, mid_h = bbox_coords[mid]
