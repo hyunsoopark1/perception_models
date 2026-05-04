@@ -830,23 +830,28 @@ if __name__ == "__main__":
     _n_patches_side  = _vis_image_size // _tok_patch_size // _tok_pool_ratio
     _patches_per_frm = _n_patches_side ** 2
 
-    # KV-cache overflow guard: warn when image tokens alone exceed the cache.
-    # max_tokens=11264 (default); ~600 tokens reserved for prompt text.
+    # KV-cache overflow guard: auto-clamp num_plm_frames so that
+    #   prompt_tokens  ≤  max_tokens − max_gen_len
+    # We reserve 600 tokens for the text prompt (generous; typical is ~400-500).
+    # Without this clamp, KVCache.index_copy_ triggers an out-of-bounds CUDA
+    # assert because padded_lengths overflows the pre-allocated cache buffer.
     _max_tokens = generator.max_tokens
     _img_tokens_total = _patches_per_frm * args.num_plm_frames
     _max_safe_frames = max(1, (_max_tokens - 600) // _patches_per_frm)
+    grid_label = f"{_n_patches_side}×{_n_patches_side}"
+    pool_label = "no-pool" if args.no_pool else f"pool×{_tok_pool_ratio}"
     if _img_tokens_total > _max_tokens - 600:
         print(
             f"\n  WARNING: {args.num_plm_frames} frames × {_patches_per_frm} tokens/frame"
             f" = {_img_tokens_total} image tokens exceeds KV cache ({_max_tokens} max).\n"
-            f"  Reduce --num-plm-frames to {_max_safe_frames} or results will be corrupted.\n"
+            f"  Auto-clamping --num-plm-frames {args.num_plm_frames} → {_max_safe_frames}."
+            f"  Pass --num-plm-frames {_max_safe_frames} to silence this warning.\n"
         )
-    else:
-        grid_label = f"{_n_patches_side}×{_n_patches_side}"
-        pool_label = "no-pool" if args.no_pool else f"pool×{_tok_pool_ratio}"
-        print(f"  patch grid: {grid_label} ({_patches_per_frm} tokens/frame, {pool_label})"
-              f"  —  {args.num_plm_frames} frames × {_patches_per_frm} = {_img_tokens_total}"
-              f" image tokens  (KV cache: {_max_tokens})")
+        args.num_plm_frames = _max_safe_frames
+        _img_tokens_total = _patches_per_frm * args.num_plm_frames
+    print(f"  patch grid: {grid_label} ({_patches_per_frm} tokens/frame, {pool_label})"
+          f"  —  {args.num_plm_frames} frames × {_patches_per_frm} = {_img_tokens_total}"
+          f" image tokens  (KV cache: {_max_tokens})")
 
     if args.attn_bias or args.compare:
         from apps.pe.pe_attn_bias import (

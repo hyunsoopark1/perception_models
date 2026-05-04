@@ -7,14 +7,22 @@ PLM is LLaVA-style: image patch tokens (CLS stripped, then projected) are
 stitched directly into the self-attention token sequence at positions given
 by `image_pos` (returned by PLMTokenizer._tokenize_for_generation).
 
-For a 448-px image with patch_size=14 and pooling_ratio=2 (default):
+The actual pooling_ratio is read from the model checkpoint (params.json).
+PLM-8B ships with pooling_ratio=1 (no spatial pooling), giving:
+
+    n_patches_side   = 448 // 14 // 1 = 32
+    patches_per_frame = 32 × 32 = 1024
+    image_pos[f * 1024 + row * 32 + col] = sequence position of patch (f, row, col)
+
+With a checkpoint that uses pooling_ratio=2 (older variants), or --no-pool
+forced off, the projector halves each spatial dimension:
+
     n_patches_side   = 448 // 14 // 2 = 16
     patches_per_frame = 16 × 16 = 256
-    image_pos[f * 256 + row * 16 + col] = sequence position of patch (f, row, col)
 
-With --no-pool (pooling_ratio=1):
-    n_patches_side   = 448 // 14 = 32
-    patches_per_frame = 32 × 32 = 1024
+KV-cache constraint (max_tokens=11264 default):
+    32×32 grid: 1024 tokens/frame → max ~10 frames (16 overflows the cache)
+    16×16 grid:  256 tokens/frame → max ~42 frames (no practical limit)
 
 Bias injection
 --------------
@@ -73,7 +81,7 @@ Usage
     image_pos, seq_len = get_image_patch_positions(generator.tokenizer, prompt, frames_tensor)
     mask = compute_bbox_bias_mask(
         image_pos, bbox_coords_per_frame,
-        patches_per_frame=256, n_patches_side=16,
+        patches_per_frame=1024, n_patches_side=32,   # PLM-8B defaults (pooling_ratio=1)
         orig_w=frame_w, orig_h=frame_h,
         image_size=448, seq_len=seq_len,
         bias=10.0, bbox_expand=1.5,
