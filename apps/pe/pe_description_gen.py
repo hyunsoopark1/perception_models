@@ -322,7 +322,16 @@ def _parse_args() -> argparse.Namespace:
                    help="Bypass the vision projector's 2×2 average pooling, giving a "
                         "32×32 patch grid (1024 tokens/frame) instead of 16×16 (256). "
                         "Finer attention targeting for --attn-bias at the cost of 4× "
-                        "longer context. Model was trained with pooling; quality may vary.")
+                        "longer context. Model was trained with pooling; quality may vary. "
+                        "IMPORTANT: reduces max safe frames to ~10 (KV cache limit).")
+    p.add_argument("--vis-image-size", type=int, default=None, metavar="PX",
+                   help="Override the image resize resolution fed to the ViT "
+                        "(default: model's native size, 448 for PLM-8B). "
+                        "The ViT supports arbitrary input sizes via position-embedding "
+                        "interpolation. Use with --no-pool for higher patch grids: "
+                        "  448 + no-pool → 32×32 (1024 tokens/frame, max ~10 frames); "
+                        "  896 + no-pool → 64×64 (4096 tokens/frame, max ~2 frames). "
+                        "Reduce --num-plm-frames to stay within the 11264-token KV cache.")
     # --- attention bias mode ---
     p.add_argument("--attn-bias", action="store_true",
                    help="Use attention bias instead of drawing boxes on frames. "
@@ -791,8 +800,15 @@ if __name__ == "__main__":
     plm_model, plm_tokenizer, plm_config = load_consolidated_model_and_tokenizer(
         args.plm_ckpt
     )
-    plm_transform = get_video_transform(image_res=plm_model.vision_model.image_size)
-    print(f"  vision input size: {plm_model.vision_model.image_size}px")
+
+    # --vis-image-size overrides the resize resolution fed to the ViT.
+    # The ViT supports arbitrary sizes: abs-posemb is bilinearly interpolated
+    # and RoPE-2D is rebuilt dynamically. The tokenizer counts tokens from the
+    # actual tensor dimensions, so no tokenizer patching is needed.
+    _vis_image_size = args.vis_image_size or plm_model.vision_model.image_size
+    plm_transform = get_video_transform(image_res=_vis_image_size)
+    print(f"  vision input size: {_vis_image_size}px"
+          + (" (overridden)" if args.vis_image_size else " (model default)"))
 
     gen_cfg = PackedCausalTransformerGeneratorArgs(
         temperature=args.temperature,
@@ -804,17 +820,33 @@ if __name__ == "__main__":
     generator = PackedCausalTransformerGenerator(gen_cfg, plm_model, plm_tokenizer)
 
     # Patch grid parameters (needed for attention-bias mode)
-    # Bypass vision projector pooling → 32×32 patch grid
+    # Bypass vision projector pooling → 32×32 patch grid (or 64×64 with --vis-image-size 896)
     if args.no_pool:
         plm_model.vision_projector.adaptive_avg_pool = None
         plm_tokenizer.pooling_ratio = 1
-        print("  --no-pool: bypassed AdaptiveAvgPooling → 32×32 grid (1024 tokens/frame)")
 
-    _vis_image_size  = plm_model.vision_model.image_size
     _tok_patch_size  = getattr(plm_tokenizer, "patch_size",  14)
     _tok_pool_ratio  = getattr(plm_tokenizer, "pooling_ratio", 1)
     _n_patches_side  = _vis_image_size // _tok_patch_size // _tok_pool_ratio
     _patches_per_frm = _n_patches_side ** 2
+
+    # KV-cache overflow guard: warn when image tokens alone exceed the cache.
+    # max_tokens=11264 (default); ~600 tokens reserved for prompt text.
+    _max_tokens = generator.max_tokens
+    _img_tokens_total = _patches_per_frm * args.num_plm_frames
+    _max_safe_frames = max(1, (_max_tokens - 600) // _patches_per_frm)
+    if _img_tokens_total > _max_tokens - 600:
+        print(
+            f"\n  WARNING: {args.num_plm_frames} frames × {_patches_per_frm} tokens/frame"
+            f" = {_img_tokens_total} image tokens exceeds KV cache ({_max_tokens} max).\n"
+            f"  Reduce --num-plm-frames to {_max_safe_frames} or results will be corrupted.\n"
+        )
+    else:
+        grid_label = f"{_n_patches_side}×{_n_patches_side}"
+        pool_label = "no-pool" if args.no_pool else f"pool×{_tok_pool_ratio}"
+        print(f"  patch grid: {grid_label} ({_patches_per_frm} tokens/frame, {pool_label})"
+              f"  —  {args.num_plm_frames} frames × {_patches_per_frm} = {_img_tokens_total}"
+              f" image tokens  (KV cache: {_max_tokens})")
 
     if args.attn_bias or args.compare:
         from apps.pe.pe_attn_bias import (
