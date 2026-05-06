@@ -210,6 +210,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Skip video rendering.")
     p.add_argument("--font-scale",  type=float, default=0.42,
                    help="cv2 font scale for overlay (default: 0.42).")
+    p.add_argument("--debug",       action="store_true",
+                   help="Debug mode: process first 1 minute only and pretty-print JSON.")
     p.add_argument("--pretty",      action="store_true",
                    help="Pretty-print JSON output.")
     return p.parse_args()
@@ -617,7 +619,11 @@ if __name__ == "__main__":
 
     fps           = args.fps or vid_fps_probe
     window_frames = max(1, int(args.window_sec * fps))
-    if args.max_frames is not None:
+    if args.debug:
+        max_frames = int(1 * 60 * fps)
+        args.pretty = True
+        print("  [debug] clamping to first 1 minute")
+    elif args.max_frames is not None:
         max_frames = args.max_frames
     elif args.max_minutes is not None:
         max_frames = int(args.max_minutes * 60 * fps)
