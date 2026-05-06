@@ -90,6 +90,11 @@ OBJ_VERBS = [
     "pull", "drag", "stack", "unstack", "pack", "unpack", "scan",
     "inspect", "operate", "throw", "catch", "rotate", "none",
 ]
+OBJ_NOUNS = [
+    "box", "pallet", "scanner", "cart", "forklift", "ladder",
+    "tool", "document", "shelf", "bin", "bag", "package",
+    "button", "screen", "door", "handle", "none",
+]
 SOCIAL_TAX = [
     "none", "talk", "handover", "receive", "co_manipulate",
     "gesture_instruct", "point",
@@ -148,6 +153,25 @@ _SOCIAL_PHRASES = {
     "gesture_instruct": "a person gesturing to instruct another person",
     "point":            "a person pointing at something to direct attention",
 }
+_OBJ_NOUN_PHRASES = {
+    "box":       "a person handling a cardboard box",
+    "pallet":    "a person handling a wooden pallet",
+    "scanner":   "a person using a barcode scanner",
+    "cart":      "a person pushing or pulling a cart",
+    "forklift":  "a person operating a forklift",
+    "ladder":    "a person using a ladder",
+    "tool":      "a person using a hand tool",
+    "document":  "a person handling papers or documents",
+    "shelf":     "a person interacting with a storage shelf",
+    "bin":       "a person handling a storage bin or tote",
+    "bag":       "a person handling a bag",
+    "package":   "a person handling a wrapped package",
+    "button":    "a person pressing a button or switch",
+    "screen":    "a person looking at or touching a screen",
+    "door":      "a person opening or closing a door",
+    "handle":    "a person gripping a handle or bar",
+    "none":      "a person not interacting with any specific object",
+}
 _SAFETY_PHRASES = {
     "none":             "a normal safe working situation",
     "zone_enter":       "a person entering a restricted or hazardous zone",
@@ -162,6 +186,7 @@ _SAFETY_PHRASES = {
 _SLOT_CONFIG = {
     "body_state":   (BODY_STATES,   _BODY_STATE_PHRASES),
     "obj_verb":     (OBJ_VERBS,     _OBJ_VERB_PHRASES),
+    "obj_noun":     (OBJ_NOUNS,     _OBJ_NOUN_PHRASES),
     "social":       (SOCIAL_TAX,    _SOCIAL_PHRASES),
     "safety_event": (SAFETY_EVENTS, _SAFETY_PHRASES),
 }
@@ -424,6 +449,7 @@ def _draw_window_overlay(
 
     bs  = win.get("body_state", "")
     ov  = win.get("obj_verb", "")
+    on_ = win.get("obj_noun", "")
     sc  = win.get("social", "")
     se  = win.get("safety_event", "")
 
@@ -449,11 +475,11 @@ def _draw_window_overlay(
         sc_str += f"  {_topk_str('social')}"
     rows.append((sc_str[:MAX_CHARS], _darken(color, 0.40)))
 
-    # obj_verb
-    ov_str = f"OBJ:{ov}"
+    # obj_verb + obj_noun combined
+    obj_label = f"OBJ:{ov}→{on_}" if on_ and on_ != "none" else f"OBJ:{ov}"
     if top_k > 1:
-        ov_str += f"  {_topk_str('obj_verb')}"
-    rows.append((ov_str[:MAX_CHARS], _darken(color, 0.55)))
+        obj_label += f"  {_topk_str('obj_verb')} / {_topk_str('obj_noun')}"
+    rows.append((obj_label[:MAX_CHARS], _darken(color, 0.55)))
 
     # body_state (topmost)
     bs_str = f"BS:{bs}"
@@ -519,7 +545,8 @@ def _process_window(
         cls = _classify(win_feat, slot_embeddings, args.top_k)
 
         print(f"    [{ident}]  BS:{cls['body_state']}  "
-              f"OBJ:{cls['obj_verb']}  SC:{cls['social']}  SE:{cls['safety_event']}")
+              f"OBJ:{cls['obj_verb']}→{cls['obj_noun']}  "
+              f"SC:{cls['social']}  SE:{cls['safety_event']}")
 
         win_result = {
             "start_frame":  start_fr,
@@ -529,11 +556,13 @@ def _process_window(
             "n_frames":     len(crops),
             "body_state":   cls["body_state"],
             "obj_verb":     cls["obj_verb"],
+            "obj_noun":     cls["obj_noun"],
             "social":       cls["social"],
             "safety_event": cls["safety_event"],
             "top_k": {
                 "body_state":   cls.get("body_state_topk", []),
                 "obj_verb":     cls.get("obj_verb_topk", []),
+                "obj_noun":     cls.get("obj_noun_topk", []),
                 "social":       cls.get("social_topk", []),
                 "safety_event": cls.get("safety_event_topk", []),
             },
