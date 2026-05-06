@@ -91,8 +91,8 @@ OBJ_VERBS = [
     "inspect", "operate", "throw", "catch", "rotate", "none",
 ]
 OBJ_NOUNS = [
-    # COCO 80 categories
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+    # COCO 80 categories (excluding "person" — crops are always of a person)
+    "bicycle", "car", "motorcycle", "airplane", "bus", "train",
     "truck", "boat", "traffic light", "fire hydrant", "stop sign",
     "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep",
     "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
@@ -158,11 +158,10 @@ _OBJ_VERB_PHRASES = {
     "throw":   "throwing an object",
     "catch":   "catching a thrown object",
     "rotate":  "rotating an object",
-    "none":    "hands free, not touching anything",
+    "none":    "empty hands, not touching anything",
 }
 _OBJ_NOUN_PHRASES = {
-    # COCO 80
-    "person":           "a person",
+    # COCO 80 (no "person" entry — removed from label list)
     "bicycle":          "a bicycle",
     "car":              "a car",
     "motorcycle":       "a motorcycle",
@@ -256,10 +255,10 @@ _OBJ_NOUN_PHRASES = {
     "package":          "a wrapped package",
     "document":         "papers or documents",
     "handle":           "a handle or bar",
-    "none":             "no object",
+    "none":             "nothing, no visible object",
 }
 _SOCIAL_PHRASES = {
-    "none":             "working alone",
+    "none":             "alone, no interaction with anyone",
     "talk":             "talking with another person",
     "handover":         "handing an object to someone",
     "receive":          "receiving an object from someone",
@@ -268,7 +267,7 @@ _SOCIAL_PHRASES = {
     "point":            "pointing to direct attention",
 }
 _SAFETY_PHRASES = {
-    "none":             "normal safe work",
+    "none":             "nothing unusual happening",
     "zone_enter":       "entering a restricted zone",
     "zone_exit":        "exiting a restricted zone",
     "ppe_don":          "putting on safety equipment",
