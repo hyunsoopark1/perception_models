@@ -584,8 +584,9 @@ if __name__ == "__main__":
     ).to(device).eval()
 
     img_transform = get_image_transform(pe_model.visual.image_size)
-    tokenizer     = SimpleTokenizer(context_length=77)
-    print(f"  image size: {pe_model.visual.image_size}px  device: {device}")
+    tokenizer     = SimpleTokenizer(context_length=pe_model.context_length)
+    print(f"  image size: {pe_model.visual.image_size}px  "
+          f"text ctx_len: {pe_model.context_length}  device: {device}")
 
     # ------------------------------------------------------------------
     # 2. Pre-compute label embeddings
