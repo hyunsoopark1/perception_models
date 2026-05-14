@@ -52,7 +52,7 @@ aws s3 ls --recursive "${S3_ROOT}/" \
             continue
         fi
         ts=$(printf "00:%02d:00" "$minute")
-        ffmpeg -hide_banner -loglevel error -ss "$ts" -i "$local_mp4" \
+        ffmpeg -nostdin -hide_banner -loglevel error -ss "$ts" -i "$local_mp4" \
             -frames:v 1 -q:v 2 -y "$out_file"
     done
 
