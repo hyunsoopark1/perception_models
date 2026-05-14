@@ -5,7 +5,7 @@
 # S3 layout (under the given root):
 #   <yyyy-mm-dd>/processed/sync<NNN>/1.MP4
 #
-# Output: <out_dir>/<yyyy-mm-dd>_sync<NNN>_<minute>.jpg
+# Output: <out_dir>/<yyyy-mm-dd>/sync<NNN>_<minute>.jpg
 #
 # Usage: ./extract_frames_from_s3.sh s3://my-bucket/root-folder ./frames
 #
@@ -46,8 +46,9 @@ aws s3 ls --recursive "${S3_ROOT}/" \
     echo "Processing ${date} ${sync}"
     aws s3 cp "${S3_BUCKET_URI}/${key}" "$local_mp4" --only-show-errors
 
+    mkdir -p "${OUT_DIR}/${date}"
     for minute in "${FRAME_MINUTES[@]}"; do
-        out_file="${OUT_DIR}/${date}_${sync}_${minute}.jpg"
+        out_file="${OUT_DIR}/${date}/${sync}_${minute}.jpg"
         if [[ -f "$out_file" ]]; then
             continue
         fi
